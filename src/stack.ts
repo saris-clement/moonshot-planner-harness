@@ -367,6 +367,7 @@ export async function startVariantStack(
   imageTag: string,
   environment: NodeJS.ProcessEnv,
   trustedPlannerPath: string,
+  scope = 'evaluation',
 ): Promise<StackHandle> {
   const ports = await Promise.all([availablePort(), availablePort(), availablePort(), availablePort(), availablePort()]);
   const [plannerPort, redisPort, s3Port, s3ConsolePort, ddbPort] = ports as [
@@ -376,7 +377,7 @@ export async function startVariantStack(
     number,
     number,
   ];
-  const composeProject = safeName(`eval-${campaign.id}-${variant.ordinal}`);
+  const composeProject = safeName(`eval-${campaign.id}-${variant.ordinal}-${scope}`);
   const generatedEnvironmentFile = path.join(artifactDirectory, 'stack.env');
   const generatedEnvironment = {
     PLANNER_IMAGE: imageTag,
@@ -391,7 +392,7 @@ export async function startVariantStack(
     PLANNER_MINIO_VOLUME: `${composeProject}-minio`,
     PLANNER_DDB_TABLE: composeProject,
     PLANNER_S3_BUCKET: composeProject,
-    PLANNER_S3_KEY_PREFIX: variant.id,
+    PLANNER_S3_KEY_PREFIX: `${variant.id}/${scope}`,
     PLANNER_SOURCE_REF: campaign.workflowsSha,
     PLANNER_SOURCE_REMOTE_URL: campaign.workflowsRemoteUrl,
   };

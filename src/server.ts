@@ -20,6 +20,22 @@ const LabelInputSchema = z.object({
   rationale: z.string().min(1).max(4_000),
 });
 
+const TargetExcludedConfigInputSchema = z.object({
+  baselineVariantId: z.string().min(1).max(256),
+  targetImplementationWorkflow: z
+    .string()
+    .min(3)
+    .max(512)
+    .regex(/^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)+$/),
+});
+
+const TargetExcludedLabelInputSchema = LabelInputSchema.omit({ benchmark: true });
+
+const TargetExcludedAnswerInputSchema = z.object({
+  answer: z.string().min(1).max(20_000),
+  selectedOptionId: z.string().min(1).max(256).optional(),
+});
+
 const REQUIREMENTS_ZIP_MAX_BYTES = 512 * 1_024 * 1_024;
 
 function sendJson(response: ServerResponse, status: number, value: unknown): void {
@@ -226,7 +242,12 @@ export function startDashboard(input: {
         const relativePath = url.searchParams.get('path');
         if (!relativePath) throw new Error('source path is required');
         const ranges = parseSourceLineRanges(url.searchParams.get('lines'));
-        const sourceRoot = path.join(input.orchestrator.paths.worktrees, campaign.id, 'frozen-workflows');
+        const targetExcluded = url.searchParams.get('scope') === 'target-excluded';
+        const sourceRoot = path.join(
+          input.orchestrator.paths.worktrees,
+          campaign.id,
+          targetExcluded ? 'target-excluded-workflows' : 'frozen-workflows',
+        );
         const source = await readFrozenSourceFile(sourceRoot, relativePath);
         sendHtml(
           response,
@@ -237,6 +258,9 @@ export function startDashboard(input: {
             relativePath,
             source,
             ranges,
+            sourceLabel: targetExcluded
+              ? 'Target-excluded workflows source'
+              : 'Frozen workflows source',
           }),
           request.method === 'HEAD',
         );
@@ -297,6 +321,8 @@ export function startDashboard(input: {
           input.database.listCampaigns().map((campaign) => ({
             ...campaign,
             variants: input.database.listVariants(campaign.id),
+            targetExcludedConfig: input.database.getTargetExcludedConfig(campaign.id),
+            targetExcludedEvaluations: input.database.listTargetExcludedEvaluations(campaign.id),
           })),
         );
         return;
@@ -313,6 +339,9 @@ export function startDashboard(input: {
             campaign: input.database.getCampaign(campaignId),
             variants,
             labels: input.database.listLabels(campaignId),
+            targetExcludedConfig: input.database.getTargetExcludedConfig(campaignId),
+            targetExcludedEvaluations: input.database.listTargetExcludedEvaluations(campaignId),
+            targetExcludedLabels: input.database.listTargetExcludedLabels(campaignId),
             eventCursor,
           });
           return;
@@ -380,6 +409,91 @@ export function startDashboard(input: {
           }
           background(input.database, campaignId, () => input.orchestrator.runBaseline(campaignId));
           sendJson(response, 202, { accepted: true });
+          return;
+        }
+        if (request.method === 'POST' && segments[3] === 'target-excluded' && segments.length === 4) {
+          requireSameOriginJson(request);
+          if (input.orchestrator.isActive(campaignId)) {
+            sendJson(response, 409, { error: 'CampaignAlreadyActive' });
+            return;
+          }
+          const target = TargetExcludedConfigInputSchema.parse(await readJson(request));
+          const config = await input.orchestrator.configureTargetExcluded(
+            campaignId,
+            target.baselineVariantId,
+            target.targetImplementationWorkflow,
+          );
+          sendJson(response, 201, config);
+          return;
+        }
+        if (
+          request.method === 'POST' &&
+          segments[3] === 'variants' &&
+          segments[4] &&
+          segments[5] === 'diagnose' &&
+          segments.length === 6
+        ) {
+          requireSameOriginJson(request);
+          if (input.orchestrator.isActive(campaignId)) {
+            sendJson(response, 409, { error: 'CampaignAlreadyActive' });
+            return;
+          }
+          const variantId = segments[4];
+          background(input.database, campaignId, () =>
+            input.orchestrator.diagnoseVariant(campaignId, variantId),
+          );
+          sendJson(response, 202, { accepted: true });
+          return;
+        }
+        if (
+          request.method === 'POST' &&
+          segments[3] === 'variants' &&
+          segments[4] &&
+          segments[5] === 'target-excluded' &&
+          segments.length === 6
+        ) {
+          requireSameOriginJson(request);
+          if (input.orchestrator.isActive(campaignId)) {
+            sendJson(response, 409, { error: 'CampaignAlreadyActive' });
+            return;
+          }
+          const variantId = segments[4];
+          background(input.database, campaignId, () =>
+            input.orchestrator.runTargetExcluded(campaignId, variantId),
+          );
+          sendJson(response, 202, { accepted: true });
+          return;
+        }
+        if (
+          request.method === 'PUT' &&
+          segments[3] === 'variants' &&
+          segments[4] &&
+          segments[5] === 'target-excluded' &&
+          segments[6] === 'questions' &&
+          segments[7] &&
+          segments[8] === 'answer'
+        ) {
+          requireSameOriginJson(request);
+          const answer = TargetExcludedAnswerInputSchema.parse(await readJson(request));
+          input.orchestrator.answerTargetExcludedQuestion(
+            campaignId,
+            segments[4],
+            segments[7],
+            answer.answer,
+            answer.selectedOptionId,
+          );
+          sendJson(response, 200, { saved: true });
+          return;
+        }
+        if (
+          request.method === 'PUT' &&
+          segments[3] === 'target-excluded' &&
+          segments[4] === 'label'
+        ) {
+          requireSameOriginJson(request);
+          const label = TargetExcludedLabelInputSchema.parse(await readJson(request));
+          await input.orchestrator.saveTargetExcludedVerifiedLabel({ campaignId, ...label });
+          sendJson(response, 200, { saved: true });
           return;
         }
         if (request.method === 'POST' && segments[3] === 'round') {

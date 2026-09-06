@@ -69,9 +69,18 @@ export function langfuseUrlForVariant(variant) {
 
 export function replicateMatrix(campaign, variant) {
   const rows = [];
-  const replicateCount = campaign.config.evaluation.replicates;
   for (const benchmark of campaign.config.benchmarks) {
     const finalFacts = replicateFactsForBenchmark(variant, benchmark);
+    const observedCount = Math.max(
+      finalFacts.length,
+      ...executionsFor(variant)
+        .filter((execution) => execution.benchmark === benchmark.name)
+        .map((execution) => execution.replicateCount ?? execution.replicate),
+    );
+    const replicateCount = observedCount ||
+      (campaign.targetExcludedConfig && variant.round > 0
+        ? campaign.targetExcludedConfig.replicates
+        : campaign.config.evaluation.replicates);
     for (let replicate = 1; replicate <= replicateCount; replicate += 1) {
       const execution = executionsFor(variant).find(
         (candidate) =>
@@ -226,6 +235,16 @@ export function isPromotionEligible(campaign, variants, variant) {
     !variant.score ||
     variant.score.cohortMismatches.includes('requirement units')
   ) return false;
+  if (campaign.targetExcludedConfig) {
+    const targetEvaluation = (campaign.targetExcludedEvaluations ?? []).find(
+      (candidate) => candidate.variantId === variant.id,
+    );
+    if (
+      targetEvaluation?.status !== 'completed' ||
+      !targetEvaluation.artifactCollectionComplete ||
+      !['passed', 'warning'].includes(targetEvaluation.gate?.status)
+    ) return false;
+  }
   const latestRound = Math.max(...variants.map((candidate) => candidate.round));
   if (variant.round !== latestRound) return false;
   const requiredHoldouts = campaign.config.benchmarks

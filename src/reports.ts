@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { CampaignRecord, LabelRecord, VariantRecord } from './types.js';
+import type {
+  CampaignRecord,
+  LabelRecord,
+  TargetExcludedConfig,
+  TargetExcludedEvaluationRecord,
+  VariantRecord,
+} from './types.js';
 import type { HarnessPaths } from './paths.js';
 import { campaignReportDirectory } from './paths.js';
 
@@ -33,9 +39,16 @@ export async function writeVariantReport(
   campaign: CampaignRecord,
   variant: VariantRecord,
   labels: readonly LabelRecord[],
+  targetExcluded?: TargetExcludedEvaluationRecord | null,
 ): Promise<string> {
   const facts = variant.facts;
   const score = variant.score;
+  const diagnosisFindings = variant.diagnosis?.findings
+    .map(
+      (finding) =>
+        `### ${markdown(finding.id)}: ${markdown(finding.category)}\n\nConfidence: \`${finding.confidence}\`\n\n${quote(finding.causalMechanism)}\n\nSupporting evidence: ${finding.supportingEvidenceRefs.map((id) => `\`${id}\``).join(', ')}\n\nCounterevidence: ${finding.counterEvidenceRefs.map((id) => `\`${id}\``).join(', ')}\n\nFalsification: ${finding.falsificationTest}`,
+    )
+    .join('\n\n');
   const decisionRows = facts
     ? Object.entries(facts.decisions)
         .map(([decision, count]) => `| ${decision} | ${count} |`)
@@ -117,6 +130,18 @@ This section is model-generated interpretation, not verified fact. Per-unit sugg
 
 ${quote(variant.judgment?.summary ?? 'No blind-judge result is available.')}
 
+## Model-Generated Diagnosis
+
+This diagnosis is unverified model interpretation. It is shown separately from measured output, blind-judge suggestions, and human labels, and it does not contribute to numeric scoring.
+
+Status: \`${variant.diagnosisStatus}\`
+
+Input hash: ${variant.diagnosisInputHash ? `\`${variant.diagnosisInputHash}\`` : 'unavailable'}
+
+${quote(variant.diagnosis?.summary ?? variant.diagnosisError ?? 'No model-generated diagnosis is available.')}
+
+${diagnosisFindings || 'No diagnosis findings are available.'}
+
 ## Requirements Questions
 
 ${
@@ -176,6 +201,28 @@ ${
       : 'Not run for this variant.'
   }
 
+## Target-Excluded Guard
+
+${
+  targetExcluded
+    ? `Status: \`${targetExcluded.status}\`
+
+Gate: \`${targetExcluded.gate?.status ?? 'pending'}\`
+
+Baseline mean build rate: ${percentage(targetExcluded.gate?.baselineMeanBuildRate ?? null)}
+
+Candidate mean build rate: ${percentage(targetExcluded.gate?.candidateMeanBuildRate ?? null)}
+
+Build-rate drop: ${percentage(targetExcluded.gate?.buildDropRatio ?? null)}
+
+Pair validity: ${targetExcluded.comparisons?.every((comparison) => comparison.valid) ? 'valid' : 'invalid or pending'}
+
+Leakage paths: ${targetExcluded.comparisons?.reduce((total, comparison) => total + comparison.leakagePaths.length, 0) ?? 0}
+
+This arm is a promotion guard, not a fitness reward. Target-blind labels and suggestions remain separate from normal evaluation truth.`
+    : 'Not configured or not run for this variant.'
+}
+
 ## Failure
 
 ${variant.error ? `\`${markdown(variant.error)}\`` : 'None recorded.'}
@@ -192,6 +239,8 @@ export async function writeCampaignIndex(
   paths: HarnessPaths,
   campaign: CampaignRecord,
   variants: readonly VariantRecord[],
+  targetConfig?: TargetExcludedConfig | null,
+  targetEvaluations: readonly TargetExcludedEvaluationRecord[] = [],
 ): Promise<string> {
   const directory = campaignReportDirectory(paths, campaign.id);
   const filePath = path.join(directory, 'README.md');
@@ -216,6 +265,22 @@ ${campaign.config.goal.trim()}
 - Concurrency: ${campaign.config.limits.concurrency}
 - Replicate concurrency: ${campaign.config.evaluation.replicateConcurrency ?? 2}
 - Maximum generated variants: ${campaign.config.limits.maxVariants}
+- Effective replicate protocol: ${targetConfig ? `${targetConfig.replicates} runs at concurrency ${targetConfig.concurrency}` : `${campaign.config.evaluation.replicates} runs`}
+- Target-excluded workflow: ${targetConfig ? `\`${targetConfig.targetImplementationWorkflow}\`` : 'not configured'}
+- Target-excluded baseline: ${targetConfig?.baselineVariantId ?? 'not configured'}
+
+## Target-Excluded Evaluations
+
+${
+  targetEvaluations.length
+    ? targetEvaluations
+        .map(
+          (evaluation) =>
+            `- ${evaluation.variantId}: ${evaluation.status}; gate=${evaluation.gate?.status ?? 'pending'}; build drop=${percentage(evaluation.gate?.buildDropRatio ?? null)}`,
+        )
+        .join('\n')
+    : 'No target-excluded evaluation has run.'
+}
 
 ## Experiments
 
@@ -233,6 +298,7 @@ export async function writeAgentHistory(
   campaign: CampaignRecord,
   variants: readonly VariantRecord[],
   labels: readonly LabelRecord[],
+  targetEvaluations: readonly TargetExcludedEvaluationRecord[] = [],
 ): Promise<void> {
   const historicalExperiments = await Promise.all(
     (await readdir(experimentsRoot, { withFileTypes: true }).catch(() => []))
@@ -257,7 +323,8 @@ export async function writeAgentHistory(
       benchmarks: campaign.config.benchmarks.map(({ name, role, sha256 }) => ({ name, role, sha256 })),
     },
     historicalExperiments,
-    labels: labels.map(({ unitKey, expectedDecision, classification, rationale, status }) => ({
+    labels: labels.map(({ benchmark, unitKey, expectedDecision, classification, rationale, status }) => ({
+      benchmark,
       unitKey,
       expectedDecision,
       classification,
@@ -276,6 +343,74 @@ export async function writeAgentHistory(
       score: variant.score,
       questionResolutions: variant.questionResolutions,
       judgeSummary: variant.judgment?.summary,
+      diagnosis: {
+        status: variant.diagnosisStatus,
+        inputSha256: variant.diagnosisInputHash,
+        interpretationStatus: variant.diagnosis?.interpretationStatus ?? null,
+        summary: variant.diagnosis?.summary ?? null,
+        findings:
+          variant.diagnosis?.findings.map(
+            ({
+              id,
+              category,
+              affectedUnitKeys,
+              causalMechanism,
+              supportingEvidenceRefs,
+              counterEvidenceRefs,
+              confidence,
+              genericIntervention,
+              falsificationTest,
+              limitations,
+            }) => ({
+              id,
+              category,
+              affectedUnitKeys,
+              causalMechanism,
+              supportingEvidenceRefs,
+              counterEvidenceRefs,
+              confidence,
+              genericIntervention,
+              falsificationTest,
+              limitations,
+              unverified: true,
+            }),
+          ) ?? [],
+        error: variant.diagnosisError,
+      },
+      holdouts: Object.fromEntries(
+        Object.entries(variant.holdoutFacts ?? {}).map(([name, facts]) => [
+          name,
+          {
+            sampleSize: facts.sampleSize,
+            decisionAgreement: facts.decisionAgreement,
+            decisions: facts.decisions,
+            evidence: facts.evidence,
+            score: variant.holdoutScores?.[name] ?? null,
+          },
+        ]),
+      ),
+      targetExcluded: (() => {
+        const evaluation = targetEvaluations.find((item) => item.variantId === variant.id);
+        return evaluation
+          ? {
+              status: evaluation.status,
+              artifactCollectionComplete: evaluation.artifactCollectionComplete,
+              gate: evaluation.gate,
+              comparisons: evaluation.comparisons?.map(
+                ({ replicate, valid, mismatches, leakagePaths, reportHash }) => ({
+                  replicate,
+                  valid,
+                  mismatches,
+                  leakagePaths,
+                  reportHash,
+                }),
+              ),
+              controlDecisions: evaluation.controlFacts?.decisions ?? null,
+              excludedDecisions: evaluation.excludedFacts?.decisions ?? null,
+              score: evaluation.score,
+            }
+          : null;
+      })(),
       error: variant.error,
     })),
   };

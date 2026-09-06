@@ -96,6 +96,10 @@ Question resolution did not run.
 
 Not run for this variant.
 
+## Target-Excluded Guard
+
+Not configured or not run for this variant.
+
 ## Failure
 
 `blocking question 01M1Q2R1VHAKDZHSQ7TQDBA8B2 remains unresolved: Source proves deployment to Saris environment `trumark-live` and read-only Symitar behavior, but does not identify the production Symitar/SymXchange endpoint, region, credentials, or approved credential policy. Deployment must provide those values. Required reads cover member/account data, Tracking 50/51/52/53, deposits and transactions, loans and transactions, and Visa/external loans; no Symitar write permission is required.`

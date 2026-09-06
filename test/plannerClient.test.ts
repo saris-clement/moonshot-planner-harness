@@ -220,3 +220,74 @@ test('PlannerClient answers a planner question and follows the successor run', a
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('PlannerClient creates and validates an explicit target-excluded case', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'planner-client-excluded-'));
+  const zipPath = path.join(directory, 'pack.zip');
+  const bytes = Buffer.from('fixed-pack');
+  await writeFile(zipPath, bytes);
+  const artifactSha = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+  let createdBody: unknown;
+  const sourcePolicy = {
+    workflow: 'trumark/deceased-accounts',
+    root: 'src/customers/trumark/deceased-accounts/',
+    targetSelection: 'explicit_override',
+  };
+  const server = createServer(async (request, response) => {
+    const body: Buffer[] = [];
+    for await (const chunk of request) body.push(Buffer.from(chunk));
+    response.setHeader('Content-Type', 'application/json');
+    if (request.url === '/api/requirements-packs') {
+      response.end(JSON.stringify({ metadata: { artifactSha256: artifactSha } }));
+    } else if (request.url === '/api/planning-cases' && request.method === 'POST') {
+      createdBody = JSON.parse(Buffer.concat(body).toString('utf8'));
+      response.end(JSON.stringify({
+        case: { id: 'case-excluded', mode: 'greenfield' },
+        resolvedInputSet: { inputSet: {
+          caseOptions: ['exclude-target-implementation'],
+          sourcePolicy,
+          workflowPlanningView: {
+            status: 'new',
+            implementationStatus: 'absent_by_policy',
+            harnessStatus: 'missing_by_policy',
+            requiresWorkflowEstablishment: true,
+          },
+        } },
+      }));
+    } else if (request.url?.endsWith('/analysis-readiness')) response.end('{"ready":true}');
+    else if (request.url?.endsWith('/runs') && request.method === 'POST') {
+      response.end('{"run":{"id":"run-excluded"},"runtime":{"status":"completed","pins":{"source":"sha"},"aggregateUsage":{"calls":1,"inputTokens":10,"outputTokens":2,"totalTokens":12,"costUsd":0.1,"durationMs":25}}}');
+    } else if (request.url?.endsWith('/analysis')) {
+      response.end('{"analysis":{"requirementUnits":[{"id":"unit-a","ref":{"entity":"workflow","anchor":"a"},"kind":"field","semantics":"Capture A"}],"adjudications":[{"requirementUnitId":"unit-a","result":"build","confidence":"high","rationale":"Target absent","selectedCandidateIds":[],"sourceRefs":[],"uncoveredSemantics":["A"],"shortlist":{"candidates":[]}}]}}');
+    } else if (request.url?.endsWith('/events')) response.end('{"events":[]}');
+    else if (request.url?.endsWith('/analyses')) response.end('{"analyses":[]}');
+    else if (request.url?.endsWith('/runs')) response.end('{"runs":[]}');
+    else response.end(JSON.stringify({ case: { id: 'case-excluded' } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('test server did not bind');
+  try {
+    const client = new PlannerClient(`http://127.0.0.1:${address.port}`, directory);
+    const result = await client.runPhase2(
+      zipPath,
+      'excluded-test',
+      10_000,
+      artifactSha,
+      undefined,
+      undefined,
+      { targetImplementationWorkflow: 'trumark/deceased-accounts' },
+    );
+    assert.equal(result.caseId, 'case-excluded');
+    assert.deepEqual(createdBody, {
+      requirementsArtifactSha256: artifactSha,
+      caseOptions: ['exclude-target-implementation'],
+      targetImplementationWorkflow: 'trumark/deceased-accounts',
+    });
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    await rm(directory, { recursive: true, force: true });
+  }
+});

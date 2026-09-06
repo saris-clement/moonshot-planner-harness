@@ -291,6 +291,24 @@ Evidence:
 
 - unrelated-holdout: 3 runs, 82.8% unanimous decisions; 116 units; build=93, reuse=0, extend=18, defer=5, question=0; verified=unscored, provisional=7.8%
 
+## Target-Excluded Guard
+
+Status: `failed`
+
+Gate: `pending`
+
+Baseline mean build rate: unscored
+
+Candidate mean build rate: unscored
+
+Build-rate drop: unscored
+
+Pair validity: invalid or pending
+
+Leakage paths: 0
+
+This arm is a promotion guard, not a fitness reward. Target-blind labels and suggestions remain separate from normal evaluation truth.
+
 ## Failure
 
 None recorded.

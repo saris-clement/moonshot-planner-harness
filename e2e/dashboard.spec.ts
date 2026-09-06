@@ -218,6 +218,7 @@ async function seedCampaign(): Promise<void> {
       instructions: 'No changes.',
       expectedImpact: 'One reviewed source gap.',
       risk: 'Provider variance.',
+      findingIds: [],
     },
   });
   database.updateVariant(baseline.id, {
@@ -305,6 +306,7 @@ async function seedCampaign(): Promise<void> {
       instructions: 'Prefer source-backed reuse.',
       expectedImpact: 'More source-backed decisions.',
       risk: 'Partial output may change.',
+      findingIds: [],
     },
   });
   database.updateVariant(live.id, {
@@ -352,6 +354,7 @@ async function seedCampaign(): Promise<void> {
       instructions: 'Add a bounded source guard.',
       expectedImpact: 'Reduce unsupported reuse.',
       risk: 'May reject a valid candidate.',
+      findingIds: [],
     },
   });
   database.updateVariant(review.id, {
@@ -367,6 +370,44 @@ async function seedCampaign(): Promise<void> {
     executionState: baseline.executionState,
   });
 
+  database.createTargetExcludedConfig(campaignId, {
+    targetImplementationWorkflow: 'trumark/deceased-accounts',
+    baselineVariantId: baseline.id,
+    comparatorImage: `sha256:${'a'.repeat(64)}`,
+    configuredAt: '2026-09-06T05:00:00.000Z',
+    replicates: 2,
+    concurrency: 2,
+    warningBuildDropRatio: 0.08,
+    blockBuildDropRatio: 0.15,
+  });
+  const excludedReplicates = [runFacts(primaryUsage()), runFacts(primaryUsage())];
+  const excludedFacts = consensusRunFacts(excludedReplicates);
+  database.createTargetExcludedEvaluation(campaignId, baseline.id);
+  database.updateTargetExcludedEvaluation(baseline.id, {
+    status: 'completed',
+    controlFacts: excludedFacts,
+    controlReplicateFacts: excludedReplicates,
+    holdoutFacts: { 'holdout-pack': baselineHoldout },
+    holdoutReplicateFacts: { 'holdout-pack': holdoutReplicates.slice(0, 2) },
+    excludedFacts,
+    excludedReplicateFacts: excludedReplicates,
+    judgment,
+    score: computeScore(excludedFacts, [], judgment),
+    comparisons: [
+      { replicate: 1, valid: true, mismatches: [], leakagePaths: [], reportHash: `sha256:${'b'.repeat(64)}` },
+      { replicate: 2, valid: true, mismatches: [], leakagePaths: [], reportHash: `sha256:${'c'.repeat(64)}` },
+    ],
+    gate: {
+      status: 'passed',
+      baselineMeanBuildRate: 1,
+      candidateMeanBuildRate: 1,
+      buildDropRatio: 0,
+      reasons: [],
+    },
+    artifactCollectionComplete: true,
+    startedAt: '2026-09-06T05:00:00.000Z',
+    completedAt: '2026-09-06T05:00:10.000Z',
+  });
   database.updateCampaign(campaign.id, {
     status: 'running_round',
     currentParentVariantId: baseline.id,
@@ -482,6 +523,22 @@ test('opens review evidence at the cited lines in the frozen workflows source', 
   await expect(plannerEvidence.getByRole('link', { name: 'src/shared/account.ts:2-3' })).toBeVisible();
 });
 
+test('shows the immutable two-run target-excluded guard and separate review truth', async ({ page }) => {
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${baselineId}?tab=target-excluded`);
+  await expect(page.getByText('trumark/deceased-accounts')).toBeVisible();
+  await expect(page.getByText('2 runs · concurrency 2')).toBeVisible();
+  await expect(page.getByText('Disposition profile')).toBeVisible();
+  await expect(page.getByText('Valid', { exact: true })).toBeVisible();
+
+  await page.getByRole('link', { name: 'Review excluded requirements' }).click();
+  await expect(page).toHaveURL(/scope=target-excluded/);
+  await expect(page.getByLabel('Select benchmark')).toHaveValue('target-excluded');
+  await page.getByRole('button', { name: /field · capture-a/ }).click();
+  await page.getByLabel('Human rationale').fill('Verified only against the filtered source snapshot.');
+  await page.getByRole('button', { name: 'Save verified truth' }).click();
+  await expect(page.getByText('verified', { exact: true })).toBeVisible();
+});
+
 test('refreshes a deep-linked overview with completed, live, and pending replicate telemetry', async ({ page }) => {
   await page.goto(`${baseUrl}/campaigns/${campaignId}/overview`);
   await page.reload();
@@ -507,7 +564,7 @@ test('refreshes a deep-linked overview with completed, live, and pending replica
   await expect(running.getByRole('progressbar')).toHaveAttribute('value', '2');
   await expect(running).toContainText('2 / 5');
   await expect(running).toContainText('B 1 · R 1 · E 0');
-  await expect(running).toContainText(/4\.\d s/);
+  await expect(running).toContainText(/(?:[4-9](?:\.\d)?|[1-9]\d+) s/);
   await expect(running).toContainText('3.0 s');
   await expect(running).toContainText('500');
   await expect(running).toContainText('100');

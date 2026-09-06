@@ -96,6 +96,10 @@ Question resolution did not run.
 
 Not run for this variant.
 
+## Target-Excluded Guard
+
+Not configured or not run for this variant.
+
 ## Failure
 
 `agent returned invalid structured output: I’ll trace the frozen TruMark deceased-accounts workflow’s Symitar client, configuration boundary, and operation set, then cite only source-proven facts.`

@@ -83,6 +83,22 @@ export function plannerQuestionsFromResponse(
           : typeof audit?.prompt === 'string'
             ? audit.prompt
             : '',
+      ...(question.responseKind === 'single_select' ||
+      question.responseKind === 'free_text' ||
+      question.responseKind === 'value'
+        ? { responseKind: question.responseKind }
+        : {}),
+      ...(Array.isArray(question.options)
+        ? {
+            options: question.options
+              .filter(isRecord)
+              .flatMap((option) =>
+                typeof option.id === 'string' && typeof option.label === 'string'
+                  ? [{ id: option.id, label: option.label }]
+                  : [],
+              ),
+          }
+        : {}),
       rationale: typeof question.rationale === 'string' ? question.rationale : '',
       status: audit
         ? 'answered'
@@ -96,7 +112,8 @@ export function plannerQuestionsFromResponse(
       resolution:
         audit?.resolution === 'requirements_agent' ||
         audit?.resolution === 'source_fallback' ||
-        audit?.resolution === 'reused_source_answer'
+        audit?.resolution === 'reused_source_answer' ||
+        audit?.resolution === 'human_answer'
           ? audit.resolution
           : null,
       evidence: Array.isArray(audit?.evidence)

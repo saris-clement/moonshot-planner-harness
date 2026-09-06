@@ -143,6 +143,10 @@ No blocking question required an answer.
 
 Not run for this variant.
 
+## Target-Excluded Guard
+
+Not configured or not run for this variant.
+
 ## Failure
 
 `POST /api/requirements-packs failed (400): {"error":"InvalidRequest"}`

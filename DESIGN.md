@@ -68,6 +68,8 @@ The harness archives stack logs and S3 objects before invoking graceful planner 
 - The strategist receives the campaign goal, prior hypotheses, measured summaries, labels, and failures.
 - A mutator receives one hypothesis and the genericity constraints. It edits only its disposable planner worktree.
 - The blind judge receives requirement-level run facts and read-only access to the frozen workflows source. It does not see the mutation or experiment score.
+- After judging and stack teardown, a read-only diagnostician receives a bounded immutable reconstruction with explicit durable, Langfuse, deterministic, model-inference, and not-captured provenance. Its findings remain unverified and cannot affect scoring.
+- The strategist must cite current-parent diagnosis finding IDs. The mutator receives only those selected findings and their cited evidence, counterevidence, limitations, and falsification tests.
 - The user accepts or replaces judge suggestions in the dashboard. Accepted labels are not overwritten by later agents.
 
 This separation reduces, but cannot eliminate, correlated errors from using one model family for implementation and evaluation.
@@ -93,6 +95,8 @@ The evaluated planner receives the campaign's frozen copy of the repository `.en
 ## Failure Handling
 
 Every state transition emits a durable event. Failed variants retain logs, patches, worktrees, and reports. Stack collection is best effort and teardown runs in `finally`. Campaign limits prevent unbounded automatic search.
+
+Diagnosis failure has its own persisted status and error and never clears measured facts, scores, or artifact-completeness state. Human label edits mark existing diagnoses stale. A stale, missing, or hash-invalid current-parent diagnosis blocks the next round unless the frozen campaign configuration contains the explicit missing-parent opt-out.
 
 An in-flight external process is currently cooperative rather than cancellable. A stop request is observed between experiments and before promotion.
 

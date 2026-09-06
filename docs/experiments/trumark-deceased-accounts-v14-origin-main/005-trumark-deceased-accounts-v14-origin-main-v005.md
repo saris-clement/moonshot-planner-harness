@@ -142,6 +142,10 @@ No blocking question required an answer.
 
 Not run for this variant.
 
+## Target-Excluded Guard
+
+Not configured or not run for this variant.
+
 ## Failure
 
 `deceased-account replicate 1 did not complete`

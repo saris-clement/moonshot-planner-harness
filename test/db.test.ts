@@ -42,6 +42,7 @@ test('database persists campaign lineage, labels, and ordered events', async () 
         instructions: 'Do not change files.',
         expectedImpact: 'Create an observation.',
         risk: 'One run is nondeterministic.',
+        findingIds: [],
       },
     });
     database.updateCampaign(config.id, {
@@ -92,6 +93,29 @@ test('database persists campaign lineage, labels, and ordered events', async () 
       rationale: 'Source proves reuse.',
       status: 'verified',
     });
+    const targetConfig = database.createTargetExcludedConfig(config.id, {
+      targetImplementationWorkflow: 'trumark/deceased-accounts',
+      baselineVariantId: variant.id,
+      comparatorImage: `sha256:${'d'.repeat(64)}`,
+      configuredAt: '2026-09-06T12:00:00.000Z',
+      replicates: 2,
+      concurrency: 2,
+      warningBuildDropRatio: 0.08,
+      blockBuildDropRatio: 0.15,
+    });
+    const targetEvaluation = database.createTargetExcludedEvaluation(config.id, variant.id);
+    database.updateTargetExcludedEvaluation(variant.id, {
+      status: 'running',
+      artifactCollectionComplete: false,
+    });
+    database.upsertTargetExcludedLabel({
+      campaignId: config.id,
+      unitKey: 'unit-a',
+      expectedDecision: 'build',
+      classification: 'real_gap',
+      rationale: 'The target is excluded and no shared source implements the behavior.',
+      status: 'verified',
+    });
 
     assert.equal(database.getCampaign(config.id).currentParentVariantId, variant.id);
     assert.equal(database.getCampaign(config.id).noImprovementRounds, 1);
@@ -100,14 +124,67 @@ test('database persists campaign lineage, labels, and ordered events', async () 
     database.releaseLease(config.id, 'owner-a');
     assert.equal(database.acquireLease(config.id, 'owner-b', 60_000), true);
     assert.equal(database.listLabels(config.id)[0]?.status, 'verified');
+    assert.equal(targetConfig.replicates, 2);
+    assert.equal(targetEvaluation.variantId, variant.id);
+    assert.equal(database.getTargetExcludedEvaluation(variant.id)?.status, 'running');
+    assert.equal(database.listTargetExcludedLabels(config.id)[0]?.expectedDecision, 'build');
+    assert.throws(
+      () => database.createTargetExcludedConfig(config.id, targetConfig),
+      /already configured/,
+    );
     const persistedVariant = database.getVariant(variant.id);
     assert.equal(persistedVariant.elapsedMs, 600_000);
     assert.equal(persistedVariant.phase2ElapsedMs, 240_000);
     assert.equal(persistedVariant.executionState?.executions[0]?.caseId, 'case-a');
     assert.equal(persistedVariant.executionState?.executions[0]?.elapsedMs, 120_000);
     assert.equal(persistedVariant.executionState?.executions[0]?.usage?.totalTokens, 120);
+    const diagnosisInputHash = `sha256:${'e'.repeat(64)}`;
+    database.updateVariant(variant.id, {
+      diagnosisStatus: 'completed',
+      diagnosisInputHash,
+      diagnosis: {
+        kind: 'ainative-planner-eval/model-diagnosis',
+        schemaVersion: 1,
+        interpretationStatus: 'unverified_model_judgment',
+        inputSha256: diagnosisInputHash,
+        summary: 'A model-generated diagnosis.',
+        findings: [
+          {
+            id: 'finding-hydration',
+            category: 'evidence_hydration',
+            affectedUnitKeys: ['unit-a'],
+            causalMechanism: 'Evidence was rejected after a source read.',
+            supportingEvidenceRefs: ['evidence-1111111111111111'],
+            counterEvidenceRefs: ['evidence-2222222222222222'],
+            confidence: 'medium',
+            genericIntervention: 'Retain qualified executable evidence.',
+            falsificationTest: 'Admit a valid source declaration and preserve build decisions for gaps.',
+            limitations: ['This is model inference.'],
+            provenance: 'model_inference',
+          },
+        ],
+        limitations: ['This is model inference.'],
+      },
+      diagnosisError: null,
+    });
+    assert.equal(database.getVariant(variant.id).diagnosisStatus, 'completed');
+    assert.equal(database.getVariant(variant.id).diagnosis?.findings[0]?.id, 'finding-hydration');
+    database.upsertLabel({
+      campaignId: config.id,
+      benchmark: 'primary-pack',
+      unitKey: 'unit-a',
+      expectedDecision: 'reuse',
+      classification: 'system_error',
+      rationale: 'Human review updated the verified rationale.',
+      status: 'verified',
+    });
+    const staleVariant = database.getVariant(variant.id);
+    assert.equal(staleVariant.diagnosisStatus, 'stale');
+    assert.equal(staleVariant.diagnosisInputHash, diagnosisInputHash);
+    assert.match(staleVariant.diagnosisError ?? '', /Human label changed.*primary-pack\/unit-a/);
     const events = database.listEvents(config.id);
     assert.ok(events.length >= 3);
+    assert.ok(events.some((event) => event.type === 'diagnosis.stale'));
     assert.deepEqual(
       events.map((event) => event.id),
       [...events.map((event) => event.id)].sort((left, right) => left - right),

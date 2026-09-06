@@ -78,6 +78,12 @@ export const CampaignConfigSchema = z
         autoApprove: z.boolean().default(false),
       })
       .default({ command: 'opencode', model: 'openai/gpt-5.6-sol', autoApprove: false }),
+    diagnosis: z
+      .object({
+        allowMissingParent: z.boolean().default(false),
+      })
+      .strict()
+      .default({ allowMissingParent: false }),
     gates: z
       .object({
         commands: z
@@ -135,6 +141,26 @@ export const CampaignConfigSchema = z
 export type CampaignConfigInput = z.input<typeof CampaignConfigSchema>;
 export type CampaignConfig = z.output<typeof CampaignConfigSchema>;
 
+const WorkflowKeySchema = z
+  .string()
+  .min(3)
+  .max(512)
+  .regex(/^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)+$/);
+
+export const TargetExcludedConfigSchema = z
+  .object({
+    targetImplementationWorkflow: WorkflowKeySchema,
+    baselineVariantId: z.string().min(1).max(256),
+    comparatorImage: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+    configuredAt: z.string().datetime(),
+    replicates: z.literal(2).default(2),
+    concurrency: z.literal(2).default(2),
+    warningBuildDropRatio: z.literal(0.08).default(0.08),
+    blockBuildDropRatio: z.literal(0.15).default(0.15),
+  })
+  .strict();
+export type TargetExcludedConfig = z.output<typeof TargetExcludedConfigSchema>;
+
 export const HypothesisSchema = z
   .object({
     title: z.string().min(1).max(200),
@@ -142,9 +168,287 @@ export const HypothesisSchema = z
     instructions: z.string().min(1).max(8_000),
     expectedImpact: z.string().min(1).max(2_000),
     risk: z.string().min(1).max(2_000),
+    findingIds: z
+      .array(z.string().regex(/^finding-[a-z0-9][a-z0-9._-]{0,79}$/))
+      .max(20)
+      .default([]),
   })
   .strict();
 export type Hypothesis = z.infer<typeof HypothesisSchema>;
+
+const Sha256Schema = z.string().regex(/^sha256:[a-f0-9]{64}$/);
+const RelativeArtifactPathSchema = z
+  .string()
+  .min(1)
+  .max(2_048)
+  .refine(
+    (value) =>
+      !value.startsWith('/') &&
+      !value.includes('\\') &&
+      !value.split('/').some((segment) => segment === '..'),
+    { message: 'expected a safe relative artifact path' },
+  );
+export type JsonValue = string | number | boolean | null | JsonValue[] | JsonObject;
+export interface JsonObject {
+  [key: string]: JsonValue;
+}
+const JsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
+  z.union([
+    z.string(),
+    z.number().finite(),
+    z.boolean(),
+    z.null(),
+    z.array(JsonValueSchema),
+    z.record(z.string(), JsonValueSchema),
+  ]),
+);
+
+export const DiagnosisFindingCategorySchema = z.enum([
+  'workflow_resolution',
+  'source_discovery',
+  'candidate_ranking',
+  'tool_selection',
+  'evidence_hydration',
+  'evidence_retention',
+  'planner_interpretation',
+  'confidence_calibration',
+  'replicate_instability',
+  'infrastructure',
+  'unknown',
+]);
+export type DiagnosisFindingCategory = z.infer<typeof DiagnosisFindingCategorySchema>;
+
+export const DiagnosisProvenanceClassSchema = z.enum([
+  'observed_durable',
+  'observed_langfuse',
+  'deterministic_reconstruction',
+  'model_inference',
+  'not_captured',
+]);
+export type DiagnosisProvenanceClass = z.infer<typeof DiagnosisProvenanceClassSchema>;
+
+export const DiagnosisProvenanceSchema = z
+  .object({
+    classification: DiagnosisProvenanceClassSchema,
+    source: z.enum([
+      'planner_api',
+      's3',
+      'langfuse',
+      'replicate',
+      'judge',
+      'human_label',
+      'frozen_source',
+      'harness',
+    ]),
+    artifactPath: RelativeArtifactPathSchema.nullable(),
+    artifactSha256: Sha256Schema.nullable(),
+    integrity: z.enum(['verified', 'hash_only', 'unverified', 'unavailable']),
+    caseId: z.string().min(1).max(256).nullable(),
+    runId: z.string().min(1).max(256).nullable(),
+    unitKey: z.string().min(1).max(512).nullable(),
+    limitation: z.string().max(2_000).nullable(),
+  })
+  .strict();
+export type DiagnosisProvenance = z.infer<typeof DiagnosisProvenanceSchema>;
+
+export const DiagnosisCompletenessItemSchema = z
+  .object({
+    component: z.enum([
+      'analysis',
+      'replicate_facts',
+      'case_run_lineage',
+      'transcript_entries',
+      'transcript_requests',
+      'transcript_results',
+      'shortlist_and_evidence',
+      'langfuse',
+      'judge',
+      'labels',
+      'frozen_source',
+      'target_excluded',
+    ]),
+    scope: z.string().min(1).max(512),
+    status: z.enum(['complete', 'partial', 'unavailable', 'not_configured', 'failed']),
+    captured: z.number().int().nonnegative(),
+    expected: z.number().int().nonnegative().nullable(),
+    limitations: z.array(z.string().min(1).max(2_000)).max(50),
+  })
+  .strict();
+export type DiagnosisCompletenessItem = z.infer<typeof DiagnosisCompletenessItemSchema>;
+
+export const DiagnosisCompletenessSchema = z
+  .object({
+    status: z.enum(['complete', 'partial']),
+    items: z.array(DiagnosisCompletenessItemSchema).min(1).max(5_000),
+    limitations: z.array(z.string().min(1).max(2_000)).max(200),
+  })
+  .strict();
+export type DiagnosisCompleteness = z.infer<typeof DiagnosisCompletenessSchema>;
+
+export const DiagnosisEvidenceSchema = z
+  .object({
+    id: z.string().regex(/^evidence-[a-f0-9]{16}$/),
+    kind: z.string().min(1).max(128),
+    summary: z.string().min(1).max(4_000),
+    affectedUnitKeys: z.array(z.string().min(1).max(512)).max(500),
+    provenance: DiagnosisProvenanceSchema,
+    data: JsonValueSchema,
+  })
+  .strict();
+export type DiagnosisEvidence = z.infer<typeof DiagnosisEvidenceSchema>;
+
+export const DiagnosisReconstructionSignalSchema = z
+  .object({
+    category: DiagnosisFindingCategorySchema,
+    affectedUnitKeys: z.array(z.string().min(1).max(512)).max(500),
+    evidenceRefs: z.array(z.string().regex(/^evidence-[a-f0-9]{16}$/)).min(1).max(100),
+    summary: z.string().min(1).max(4_000),
+    provenance: z.literal('deterministic_reconstruction'),
+  })
+  .strict();
+export type DiagnosisReconstructionSignal = z.infer<typeof DiagnosisReconstructionSignalSchema>;
+
+const DiagnosisLineageSchema = z
+  .object({
+    benchmark: z.string().min(1).max(128),
+    role: z.enum(['primary', 'holdout']),
+    replicate: z.number().int().positive(),
+    caseId: z.string().min(1).max(256).nullable(),
+    runId: z.string().min(1).max(256).nullable(),
+    status: z.string().min(1).max(128),
+  })
+  .strict();
+
+export const DiagnosisInputSchema = z
+  .object({
+    kind: z.literal('ainative-planner-eval/diagnosis-input'),
+    schemaVersion: z.literal(1),
+    interpretationPolicy: z.literal(
+      'Diagnosis is model-generated, unverified, and excluded from numeric scoring.',
+    ),
+    campaign: z
+      .object({
+        id: z.string().min(1).max(128),
+        plannerSeed: z.string().min(1).max(128),
+        workflowsRevision: z.string().min(1).max(128),
+        environmentSha256: Sha256Schema,
+        benchmarkPins: z.array(
+          z
+            .object({
+              name: z.string().min(1).max(128),
+              role: z.enum(['primary', 'holdout']),
+              sha256: Sha256Schema.nullable(),
+            })
+            .strict(),
+        ),
+      })
+      .strict(),
+    variant: z
+      .object({
+        id: z.string().min(1).max(256),
+        parentVariantId: z.string().min(1).max(256).nullable(),
+        round: z.number().int().nonnegative(),
+        artifactCollectionComplete: z.boolean(),
+      })
+      .strict(),
+    lineage: z.array(DiagnosisLineageSchema).max(1_000),
+    completeness: DiagnosisCompletenessSchema,
+    evidence: z.array(DiagnosisEvidenceSchema).max(10_000),
+    reconstructionSignals: z.array(DiagnosisReconstructionSignalSchema).max(5_000),
+  })
+  .strict()
+  .superRefine((input, context) => {
+    const ids = input.evidence.map(({ id }) => id);
+    if (new Set(ids).size !== ids.length) {
+      context.addIssue({ code: 'custom', path: ['evidence'], message: 'evidence IDs must be unique' });
+    }
+    const known = new Set(ids);
+    for (const [index, signal] of input.reconstructionSignals.entries()) {
+      if (signal.evidenceRefs.some((id) => !known.has(id))) {
+        context.addIssue({
+          code: 'custom',
+          path: ['reconstructionSignals', index, 'evidenceRefs'],
+          message: 'reconstruction signals must cite input evidence IDs',
+        });
+      }
+    }
+  });
+export type DiagnosisInput = z.infer<typeof DiagnosisInputSchema>;
+
+export const DiagnosisFindingSchema = z
+  .object({
+    id: z.string().regex(/^finding-[a-z0-9][a-z0-9._-]{0,79}$/),
+    category: DiagnosisFindingCategorySchema,
+    affectedUnitKeys: z.array(z.string().min(1).max(512)).max(500),
+    causalMechanism: z.string().min(1).max(4_000),
+    supportingEvidenceRefs: z
+      .array(z.string().regex(/^evidence-[a-f0-9]{16}$/))
+      .min(1)
+      .max(100),
+    counterEvidenceRefs: z
+      .array(z.string().regex(/^evidence-[a-f0-9]{16}$/))
+      .min(1)
+      .max(100),
+    confidence: z.enum(['low', 'medium', 'high']),
+    genericIntervention: z.string().min(1).max(4_000),
+    falsificationTest: z.string().min(1).max(4_000),
+    limitations: z.array(z.string().min(1).max(2_000)).min(1).max(50),
+    provenance: z.literal('model_inference'),
+  })
+  .strict();
+export type DiagnosisFinding = z.infer<typeof DiagnosisFindingSchema>;
+
+export const DiagnosisOutputSchema = z
+  .object({
+    kind: z.literal('ainative-planner-eval/model-diagnosis'),
+    schemaVersion: z.literal(1),
+    interpretationStatus: z.literal('unverified_model_judgment'),
+    inputSha256: Sha256Schema,
+    summary: z.string().min(1).max(8_000),
+    findings: z.array(DiagnosisFindingSchema).max(50),
+    limitations: z.array(z.string().min(1).max(2_000)).min(1).max(100),
+  })
+  .strict()
+  .superRefine((output, context) => {
+    const ids = output.findings.map(({ id }) => id);
+    if (new Set(ids).size !== ids.length) {
+      context.addIssue({ code: 'custom', path: ['findings'], message: 'finding IDs must be unique' });
+    }
+  });
+export type DiagnosisOutput = z.infer<typeof DiagnosisOutputSchema>;
+
+export const DiagnosisStatusSchema = z.enum([
+  'not_started',
+  'assembling',
+  'running',
+  'completed',
+  'failed',
+  'stale',
+]);
+export type DiagnosisStatus = z.infer<typeof DiagnosisStatusSchema>;
+
+export const DiagnosisManifestSchema = z
+  .object({
+    kind: z.literal('ainative-planner-eval/diagnosis-manifest'),
+    schemaVersion: z.literal(1),
+    inputPath: RelativeArtifactPathSchema,
+    inputSha256: Sha256Schema,
+    inputBytes: z.number().int().positive(),
+    artifacts: z
+      .array(
+        z
+          .object({
+            path: RelativeArtifactPathSchema,
+            sha256: Sha256Schema,
+            bytes: z.number().int().nonnegative(),
+            integrity: z.enum(['verified', 'hash_only', 'unverified']),
+          })
+          .strict(),
+      )
+      .max(20_000),
+  })
+  .strict();
+export type DiagnosisManifest = z.infer<typeof DiagnosisManifestSchema>;
 
 export const VariantStatusSchema = z.enum([
   'queued',
@@ -245,7 +549,7 @@ export interface Score {
 export interface QuestionResolutionEntry {
   id: string;
   question: string;
-  resolution: 'requirements_agent' | 'source_fallback' | 'reused_source_answer';
+  resolution: 'requirements_agent' | 'source_fallback' | 'reused_source_answer' | 'human_answer';
   answer: string;
   evidence: string[];
 }
@@ -265,6 +569,7 @@ export interface BenchmarkQuestionResolution {
   plannerRequirementsAgentAnswers: number;
   plannerSourceFallbackAnswers: number;
   plannerReusedAnswers: number;
+  plannerHumanAnswers?: number;
   entries: QuestionResolutionEntry[];
 }
 
@@ -274,10 +579,12 @@ export interface RuntimeQuestionObservation {
   ownerRole: string;
   priority: string;
   prompt: string;
+  responseKind?: 'single_select' | 'free_text' | 'value';
+  options?: Array<{ id: string; label: string }>;
   rationale: string;
   status: string;
   answer: string | null;
-  resolution: 'requirements_agent' | 'source_fallback' | 'reused_source_answer' | null;
+  resolution: 'requirements_agent' | 'source_fallback' | 'reused_source_answer' | 'human_answer' | null;
   evidence: string[];
   createdAt: string | null;
   updatedAt: string | null;
@@ -307,6 +614,31 @@ export interface VariantExecution extends Phase2RunSnapshot {
 
 export interface VariantExecutionState {
   executions: VariantExecution[];
+}
+
+export type TargetExcludedEvaluationStatus =
+  | 'queued'
+  | 'starting'
+  | 'running'
+  | 'waiting_for_input'
+  | 'judging'
+  | 'completed'
+  | 'failed';
+
+export interface TargetExcludedComparison {
+  replicate: number;
+  valid: boolean;
+  mismatches: string[];
+  leakagePaths: string[];
+  reportHash: string | null;
+}
+
+export interface TargetExcludedGate {
+  status: 'pending' | 'passed' | 'warning' | 'blocked';
+  baselineMeanBuildRate: number | null;
+  candidateMeanBuildRate: number | null;
+  buildDropRatio: number | null;
+  reasons: string[];
 }
 
 export interface CampaignRecord {
@@ -347,6 +679,10 @@ export interface VariantRecord {
   score: Score | null;
   questionResolutions: Record<string, BenchmarkQuestionResolution> | null;
   executionState: VariantExecutionState | null;
+  diagnosisStatus: DiagnosisStatus;
+  diagnosisInputHash: string | null;
+  diagnosis: DiagnosisOutput | null;
+  diagnosisError: string | null;
   error: string | null;
   startedAt: string | null;
   completedAt: string | null;
@@ -354,6 +690,30 @@ export interface VariantRecord {
   phase2StartedAt: string | null;
   phase2CompletedAt: string | null;
   phase2ElapsedMs: number | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TargetExcludedEvaluationRecord {
+  campaignId: string;
+  variantId: string;
+  status: TargetExcludedEvaluationStatus;
+  controlFacts: RunFacts | null;
+  controlReplicateFacts: RunFacts[] | null;
+  holdoutFacts: Record<string, RunFacts> | null;
+  holdoutReplicateFacts: Record<string, RunFacts[]> | null;
+  excludedFacts: RunFacts | null;
+  excludedReplicateFacts: RunFacts[] | null;
+  judgment: JudgeOutput | null;
+  score: Score | null;
+  questionResolution: BenchmarkQuestionResolution | null;
+  executionState: VariantExecutionState | null;
+  comparisons: TargetExcludedComparison[] | null;
+  gate: TargetExcludedGate | null;
+  artifactCollectionComplete: boolean;
+  error: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -368,3 +728,5 @@ export interface LabelRecord {
   status: 'suggested' | 'verified';
   updatedAt: string;
 }
+
+export interface TargetExcludedLabelRecord extends Omit<LabelRecord, 'benchmark'> {}

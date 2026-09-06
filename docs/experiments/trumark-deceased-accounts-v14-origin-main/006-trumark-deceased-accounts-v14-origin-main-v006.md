@@ -142,6 +142,10 @@ No blocking question required an answer.
 
 Not run for this variant.
 
+## Target-Excluded Guard
+
+Not configured or not run for this variant.
+
 ## Failure
 
 `replicate cohort drift: analysis pins`

@@ -14,6 +14,7 @@ It is deliberately a one-machine tool: one coordinator process, SQLite state, di
 - Uses a separate blind LLM session to suggest per-unit expected decisions.
 - Resolves imported blocking questions through requirements-agent first, then a concise source-grounded fallback, and records every answer.
 - Persists human-reviewed labels independently from model suggestions.
+- Reconstructs bounded, cited post-run diagnoses from durable planner/S3 artifacts, optional Langfuse observations, frozen source references, judge evidence, labels, and replicate facts before proposing a planner mutation.
 - Generates one Markdown record per experiment under `docs/experiments/<campaign>/`.
 - Runs three primary and three holdout repetitions for every variant, then scores their unit-level consensus.
 
@@ -49,6 +50,8 @@ The server serves `index.html` only for these GET/HEAD UI paths. API paths and e
 
 Initialization copies the environment file and both ZIPs into the ignored campaign data directory, records their hashes, and uses only those frozen copies afterward. Environment contents are never copied into reports. If the local planner API requires authentication, expose its token to the harness as `PLANNER_EVAL_API_TOKEN` in that file.
 
+Optional diagnosis-time Langfuse reads use `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, and `LANGFUSE_SECRET_KEY` from that frozen campaign environment. Reads are case/run filtered and capped; credentials and authorization headers are never persisted. Missing or failed Langfuse telemetry is recorded as incomplete optional evidence and does not invalidate durable run facts.
+
 All campaign operations after the server starts are available in the UI: create, baseline, retry failed baseline, run a supervised or automatic round, stop, resume, review labels, inspect planner questions and their answers, inspect artifacts, open Langfuse traces, open Markdown, and promote a candidate.
 
 The overview separates live execution from durable experiment results. Each active experiment matrix synthesizes every configured benchmark and replicate slot, then joins persisted execution state and final replicate facts. Completed, current, and pending rows remain visible together; pending measurements use dashes rather than zero. Live decisions are the latest accepted checkpoint and can change after a planner question or successor run.
@@ -64,6 +67,7 @@ The CLI remains an optional recovery surface:
 ```bash
 npm run cli -- init --config campaign.example.json
 npm run cli -- baseline phase2-source-policy-search
+npm run cli -- diagnose phase2-source-policy-search phase2-source-policy-search-v000
 npm run cli -- round phase2-source-policy-search
 npm run cli -- promote phase2-source-policy-search phase2-source-policy-search-v001
 npm run cli -- auto phase2-source-policy-search
@@ -90,6 +94,7 @@ Decision counts are observations, not fitness.
 - Candidate and baseline requirement-unit/pin drift is recorded as a cohort mismatch.
 - Every run must contain nonempty units, complete adjudications, runtime pins, model usage, semantics, and rationale before it is considered meaningful.
 - Lower cost and latency are visible but do not override correctness.
+- Model-generated diagnosis is shown separately and never contributes to numeric scoring. A next round requires a current, hash-verified parent diagnosis unless the campaign explicitly sets `diagnosis.allowMissingParent` to `true`. Use `npm run cli -- diagnose <campaign-id> <variant-id>` to backfill or retry an archived variant; the equivalent API is `POST /api/campaigns/<campaign-id>/variants/<variant-id>/diagnose`.
 
 The blind judge sees the exact frozen workflows checkout and the selected run facts. It does not receive the candidate hypothesis or planner patch.
 
@@ -105,6 +110,7 @@ Blocking requirements questions are resolved once per campaign before evaluation
     packs/                       immutable benchmark ZIP copies
   worktrees/<id>/                planner candidates and frozen workflows source
   artifacts/<id>/<variant>/      raw output, patches, logs, S3 objects
+    diagnosis/                   immutable bounded inputs, manifests, optional telemetry, prompts, logs, and results
 docs/experiments/<id>/           trackable Markdown facts and conclusions
 ```
 

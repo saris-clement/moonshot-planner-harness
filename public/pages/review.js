@@ -14,14 +14,15 @@ const filters = [
 
 const sourceReferencePattern = /(?<![a-z0-9_.\/-])((?:[a-z0-9_.-]+\/)*[a-z0-9_.-]+\.(?:c|cc|cpp|cs|go|h|hpp|java|js|jsx|json|kt|kts|md|php|py|rb|rs|sh|sql|toml|ts|tsx|yaml|yml))(?::(\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*))?/gi;
 
-function sourceUrl(campaign, sourcePath, ranges) {
+function sourceUrl(campaign, sourcePath, ranges, scope) {
   const query = new URLSearchParams({ path: sourcePath });
   if (ranges) query.set('lines', ranges);
+  if (scope === 'target-excluded') query.set('scope', scope);
   const firstLine = ranges?.match(/^\d+/)?.[0];
   return `/campaigns/${encodeURIComponent(campaign.id)}/source?${query}${firstLine ? `#L${firstLine}` : ''}`;
 }
 
-function linkedSourceText(campaign, value) {
+function linkedSourceText(campaign, value, scope) {
   const children = [];
   let cursor = 0;
   for (const match of value.matchAll(sourceReferencePattern)) {
@@ -32,7 +33,7 @@ function linkedSourceText(campaign, value) {
       className: 'source-reference',
       text: label,
       attributes: {
-        href: sourceUrl(campaign, sourcePath, ranges),
+        href: sourceUrl(campaign, sourcePath, ranges, scope),
         target: '_blank',
         rel: 'noopener',
         title: `Open ${sourcePath}${ranges ? ` at lines ${ranges}` : ''} from the frozen campaign source`,
@@ -44,11 +45,11 @@ function linkedSourceText(campaign, value) {
   return children.length ? children : [text(value)];
 }
 
-function sourceReferenceList(campaign, values, separator) {
+function sourceReferenceList(campaign, values, separator, scope) {
   const children = [];
   values.forEach((value, index) => {
     if (index > 0) children.push(text(separator));
-    children.push(...linkedSourceText(campaign, value));
+    children.push(...linkedSourceText(campaign, value, scope));
   });
   return children;
 }
@@ -61,6 +62,7 @@ function evaluationFor(variant, benchmark, primaryName) {
 
 function reviewUrl(campaign, variant, values) {
   const query = new URLSearchParams({ benchmark: values.benchmark, filter: values.filter });
+  if (values.scope === 'target-excluded') query.set('scope', values.scope);
   if (values.unit) query.set('unit', values.unit);
   return `/campaigns/${encodeURIComponent(campaign.id)}/review/${encodeURIComponent(variant.id)}?${query}`;
 }
@@ -178,7 +180,7 @@ function requirementSemantics(value) {
   ]);
 }
 
-function reviewDetail(context, campaign, variant, benchmark, unit, suggestion, label) {
+function reviewDetail(context, campaign, variant, benchmark, unit, suggestion, label, scope) {
   if (!unit) {
     return element('aside', { className: 'review-detail empty-detail' }, [
       element('p', { className: 'overline', text: 'Requirement review' }),
@@ -230,10 +232,13 @@ function reviewDetail(context, campaign, variant, benchmark, unit, suggestion, l
     event.preventDefault();
     const values = new FormData(form);
     try {
-      await api(`/api/campaigns/${encodeURIComponent(campaign.id)}/label`, {
+      await api(
+        scope === 'target-excluded'
+          ? `/api/campaigns/${encodeURIComponent(campaign.id)}/target-excluded/label`
+          : `/api/campaigns/${encodeURIComponent(campaign.id)}/label`, {
         method: 'PUT',
         body: JSON.stringify({
-          benchmark,
+          ...(scope === 'target-excluded' ? {} : { benchmark }),
           unitKey: unit.key,
           expectedDecision: values.get('expectedDecision'),
           classification: values.get('classification'),
@@ -271,14 +276,14 @@ function reviewDetail(context, campaign, variant, benchmark, unit, suggestion, l
       element('p', { text: unit.rationale }),
       element('p', { className: 'muted source-evidence' }, [
         text('Source references: '),
-        ...(refs.length ? sourceReferenceList(campaign, refs, ', ') : [text('none')]),
+        ...(refs.length ? sourceReferenceList(campaign, refs, ', ', scope) : [text('none')]),
       ]),
     ]),
     element('section', { className: 'evidence-block suggestion' }, [
       element('h3', { text: 'Blind judge · suggestion' }),
       element('p', { text: suggestion?.rationale ?? 'No suggestion available.' }),
       suggestion?.evidence?.length
-        ? element('p', { className: 'muted source-evidence' }, sourceReferenceList(campaign, suggestion.evidence, ' · '))
+        ? element('p', { className: 'muted source-evidence' }, sourceReferenceList(campaign, suggestion.evidence, ' · ', scope))
         : null,
     ]),
     form,
@@ -290,31 +295,51 @@ export function reviewPage(context, route) {
   const variant = campaign.variants.find((candidate) => candidate.id === route.params.variantId);
   if (!variant) return element('div', { className: 'empty-state', text: 'Experiment not found in this campaign.' });
   const primaryName = campaign.config.benchmarks.find((item) => item.role === 'primary')?.name;
-  const benchmark = campaign.config.benchmarks.some((item) => item.name === route.query.get('benchmark'))
-    ? route.query.get('benchmark')
-    : primaryName;
+  const scope = route.query.get('scope') === 'target-excluded' ? 'target-excluded' : 'standard';
+  const benchmark = scope === 'target-excluded'
+    ? 'target-excluded'
+    : campaign.config.benchmarks.some((item) => item.name === route.query.get('benchmark'))
+      ? route.query.get('benchmark')
+      : primaryName;
   const filter = filters.some(([value]) => value === route.query.get('filter')) ? route.query.get('filter') : 'all';
   const selectedUnit = route.query.get('unit');
-  const evaluation = evaluationFor(variant, benchmark, primaryName);
+  const targetEvaluation = (campaign.targetExcludedEvaluations ?? []).find(
+    (candidate) => candidate.variantId === variant.id,
+  );
+  const evaluation = scope === 'target-excluded'
+    ? { facts: targetEvaluation?.excludedFacts, judgment: targetEvaluation?.judgment }
+    : evaluationFor(variant, benchmark, primaryName);
   const units = evaluation.facts?.units ?? [];
   const labels = new Map(
-    campaign.labels.filter((item) => item.benchmark === benchmark).map((item) => [item.unitKey, item]),
+    (scope === 'target-excluded'
+      ? campaign.targetExcludedLabels ?? []
+      : campaign.labels.filter((item) => item.benchmark === benchmark)
+    ).map((item) => [item.unitKey, item]),
   );
   const suggestions = new Map((evaluation.judgment?.verdicts ?? []).map((item) => [item.unitKey, item]));
   const visible = visibleUnits(units, filter, labels, suggestions);
   const toolbar = element('div', { className: 'review-toolbar' });
   const benchmarkSelect = element('select', { attributes: { 'aria-label': 'Select benchmark' } });
   for (const item of campaign.config.benchmarks) {
-    benchmarkSelect.append(option(item.name, `${item.name} · ${item.role}`, item.name === benchmark));
+    benchmarkSelect.append(option(item.name, `${item.name} · ${item.role}`, scope === 'standard' && item.name === benchmark));
+  }
+  if (campaign.targetExcludedConfig) {
+    benchmarkSelect.append(option('target-excluded', 'target excluded · guard', scope === 'target-excluded'));
   }
   benchmarkSelect.addEventListener('change', (event) => {
-    const moved = context.navigate(reviewUrl(campaign, variant, { benchmark: event.target.value, filter, unit: '' }));
+    const target = event.target.value === 'target-excluded';
+    const moved = context.navigate(reviewUrl(campaign, variant, {
+      benchmark: event.target.value,
+      filter,
+      unit: '',
+      scope: target ? 'target-excluded' : '',
+    }));
     if (!moved) context.render();
   });
   const filterSelect = element('select', { attributes: { 'aria-label': 'Filter requirement units' } });
   for (const [value, label] of filters) filterSelect.append(option(value, label, value === filter));
   filterSelect.addEventListener('change', (event) => {
-    const moved = context.navigate(reviewUrl(campaign, variant, { benchmark, filter: event.target.value, unit: '' }));
+    const moved = context.navigate(reviewUrl(campaign, variant, { benchmark, filter: event.target.value, unit: '', scope }));
     if (!moved) context.render();
   });
   toolbar.append(benchmarkSelect, filterSelect);
@@ -328,7 +353,7 @@ export function reviewPage(context, route) {
       className: 'unit-select',
       attributes: { type: 'button', 'aria-pressed': String(unit.key === selectedUnit) },
       on: {
-        click: () => context.navigate(reviewUrl(campaign, variant, { benchmark, filter, unit: unit.key })),
+        click: () => context.navigate(reviewUrl(campaign, variant, { benchmark, filter, unit: unit.key, scope })),
       },
     }, [element('b', { text: `${unit.kind} · ${unit.ref.anchor}` }), element('span', { text: unit.semantics })]);
     body.append(element('tr', { className: unit.key === selectedUnit ? 'selected' : '' }, [
@@ -346,7 +371,7 @@ export function reviewPage(context, route) {
   const unit = units.find((candidate) => candidate.key === selectedUnit);
   const back = routeLink(
     'Back to experiment',
-    `/campaigns/${encodeURIComponent(campaign.id)}/experiments/${encodeURIComponent(variant.id)}?tab=summary`,
+    `/campaigns/${encodeURIComponent(campaign.id)}/experiments/${encodeURIComponent(variant.id)}?tab=${scope === 'target-excluded' ? 'target-excluded' : 'summary'}`,
     'button button-ghost',
   );
   return element('div', { className: 'page review-page' }, [
@@ -363,7 +388,7 @@ export function reviewPage(context, route) {
           body,
         ]),
       ]),
-      reviewDetail(context, campaign, variant, benchmark, unit, suggestions.get(selectedUnit), labels.get(selectedUnit)),
+      reviewDetail(context, campaign, variant, benchmark, unit, suggestions.get(selectedUnit), labels.get(selectedUnit), scope),
     ]),
   ]);
 }

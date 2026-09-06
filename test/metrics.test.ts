@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   compareCohort,
+  computeTargetExcludedGate,
   computeScore,
   consensusRunFacts,
   extractRunFacts,
@@ -148,4 +149,30 @@ test('consensus uses majority decisions and retains replicate cost', () => {
   assert.equal(consensus.decisions.reuse, 1);
   assert.equal(consensus.decisionAgreement, 0.5);
   assert.equal(consensus.usage.totalTokens, 360);
+});
+
+test('target-excluded gate compares mean raw build rates without rewarding increases', () => {
+  const facts = extractRunFacts(analysis, run);
+  const baseline = [structuredClone(facts), structuredClone(facts)];
+  baseline[0]!.decisions.build = 100;
+  baseline[0]!.unitCount = 125;
+  baseline[1]!.decisions.build = 100;
+  baseline[1]!.unitCount = 125;
+
+  const warning = baseline.map((value) => structuredClone(value));
+  warning[0]!.decisions.build = 92;
+  warning[1]!.decisions.build = 92;
+  assert.equal(computeTargetExcludedGate(baseline, warning, true, false).status, 'warning');
+
+  const blocked = baseline.map((value) => structuredClone(value));
+  blocked[0]!.decisions.build = 85;
+  blocked[1]!.decisions.build = 85;
+  assert.equal(computeTargetExcludedGate(baseline, blocked, true, false).status, 'blocked');
+
+  const increase = baseline.map((value) => structuredClone(value));
+  increase[0]!.decisions.build = 110;
+  increase[1]!.decisions.build = 110;
+  assert.equal(computeTargetExcludedGate(baseline, increase, true, false).status, 'passed');
+  assert.equal(computeTargetExcludedGate(baseline, increase, false, false).status, 'blocked');
+  assert.equal(computeTargetExcludedGate(baseline, increase, true, true).status, 'blocked');
 });

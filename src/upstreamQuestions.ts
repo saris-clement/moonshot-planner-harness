@@ -179,6 +179,7 @@ export async function resolveBenchmarkQuestions(input: {
         plannerRequirementsAgentAnswers: 0,
         plannerSourceFallbackAnswers: 0,
         plannerReusedAnswers: 0,
+        plannerHumanAnswers: 0,
       };
       await writeFile(
         path.join(input.artifactDirectory, 'question-resolutions.json'),
@@ -267,6 +268,7 @@ export async function resolveBenchmarkQuestions(input: {
     plannerRequirementsAgentAnswers: 0,
     plannerSourceFallbackAnswers: 0,
     plannerReusedAnswers: 0,
+    plannerHumanAnswers: 0,
     entries,
   };
   await Promise.all([

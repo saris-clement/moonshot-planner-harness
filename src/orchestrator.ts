@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import {
@@ -14,6 +14,7 @@ import {
   compareCohort,
   compareScores,
   computeScore,
+  computeTargetExcludedGate,
   consensusRunFacts,
   validateMeaningfulFacts,
 } from './metrics.js';
@@ -32,6 +33,12 @@ import {
   type PlannerQuestionRecord,
 } from './plannerClient.js';
 import { writeAgentHistory, writeCampaignIndex, writeVariantReport } from './reports.js';
+import {
+  assembleDiagnosisInput,
+  readDiagnosisInput,
+  verifyDiagnosisArtifacts,
+  writeMutationContext,
+} from './diagnosis.js';
 import { runCommand } from './process.js';
 import {
   buildVariantImage,
@@ -53,9 +60,18 @@ import type {
   JudgeOutput,
   Phase2RunSnapshot,
   RunFacts,
+  TargetExcludedConfig,
+  TargetExcludedEvaluationRecord,
   VariantRecord,
 } from './types.js';
+import { TargetExcludedConfigSchema } from './types.js';
 import { resolveBenchmarkQuestions } from './upstreamQuestions.js';
+import { runTargetExcludedComparison } from './targetExcludedComparison.js';
+import {
+  containsTargetIdentityLeak,
+  createTargetExcludedSourceSnapshot,
+  verifyTargetExcludedSourceSnapshot,
+} from './targetExcludedSource.js';
 
 const baselineHypothesis: Hypothesis = {
   title: 'Unmodified campaign seed',
@@ -63,6 +79,7 @@ const baselineHypothesis: Hypothesis = {
   instructions: 'Do not modify the planner.',
   expectedImpact: 'Establish reproducible primary and holdout facts for this campaign.',
   risk: 'Provider nondeterminism means one screening run is descriptive rather than conclusive.',
+  findingIds: [],
 };
 
 function errorMessage(error: unknown): string {
@@ -154,6 +171,21 @@ type RuntimeAnswerCache = Map<
   Phase2QuestionAnswer | Promise<Phase2QuestionAnswer>
 >;
 
+interface BenchmarkRunOptions {
+  replicateCount?: number;
+  scope?: string;
+  targetWorkflow?: string;
+  persistToTargetEvaluation?: boolean;
+}
+
+interface PendingTargetAnswer {
+  campaignId: string;
+  targetWorkflow: string;
+  question: PlannerQuestionRecord;
+  resolve: (answer: Phase2QuestionAnswer) => void;
+  reject: (error: Error) => void;
+}
+
 function withRuntimeQuestions(
   summary: NonNullable<VariantRecord['questionResolutions']>[string],
   questions: readonly Phase2QuestionAudit[],
@@ -174,6 +206,9 @@ function withRuntimeQuestions(
     plannerReusedAnswers: questions.filter(
       (question) => question.resolution === 'reused_source_answer',
     ).length,
+    plannerHumanAnswers: questions.filter(
+      (question) => question.resolution === 'human_answer',
+    ).length,
     entries: [
       ...summary.entries,
       ...questions.map((question) => ({
@@ -190,11 +225,22 @@ function withRuntimeQuestions(
 export class CampaignOrchestrator {
   private readonly activeCampaigns = new Set<string>();
   private readonly reportQueues = new Map<string, Promise<void>>();
+  private readonly pendingTargetAnswers = new Map<string, PendingTargetAnswer>();
 
   constructor(
     readonly paths: HarnessPaths,
     readonly database: HarnessDatabase,
-  ) {}
+  ) {
+    for (const campaign of database.listCampaigns()) {
+      for (const evaluation of database.listTargetExcludedEvaluations(campaign.id)) {
+        if (evaluation.status === 'completed' || evaluation.status === 'failed') continue;
+        database.updateTargetExcludedEvaluation(evaluation.variantId, {
+          status: 'failed',
+          error: 'target-excluded evaluation was interrupted; retry the complete two-run attempt',
+        });
+      }
+    }
+  }
 
   async initialize(configPath: string): Promise<CampaignRecord> {
     const resolved = await loadCampaignConfig(configPath);
@@ -204,6 +250,147 @@ export class CampaignOrchestrator {
   async initializeFromInput(input: unknown): Promise<CampaignRecord> {
     const resolved = await resolveCampaignConfig(input);
     return await this.initializeResolved(resolved);
+  }
+
+  async configureTargetExcluded(
+    campaignId: string,
+    baselineVariantId: string,
+    targetImplementationWorkflow: string,
+  ): Promise<TargetExcludedConfig> {
+    return await this.withCampaignLock(campaignId, async () => {
+      const campaign = this.database.getCampaign(campaignId);
+      const baseline = this.database.getVariant(baselineVariantId);
+      if (
+        baseline.campaignId !== campaignId ||
+        baseline.status !== 'completed' ||
+        !baseline.artifactCollectionComplete ||
+        !baseline.imageTag ||
+        !baseline.worktreePath
+      ) {
+        throw new Error('target-excluded baseline must be a completed, archived campaign variant');
+      }
+      if (!/^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)+$/.test(targetImplementationWorkflow)) {
+        throw new Error('invalid target implementation workflow');
+      }
+      const workflowsSource = await this.ensureFrozenWorkflowsSource(campaign);
+      const targetIndex = path.join(
+        workflowsSource,
+        'src',
+        'customers',
+        ...targetImplementationWorkflow.split('/'),
+        'index.ts',
+      );
+      if (!(await stat(targetIndex).catch(() => null))?.isFile()) {
+        throw new Error(`target implementation is not present at the frozen source revision: ${targetImplementationWorkflow}`);
+      }
+      const comparatorImage = (
+        await runCommand(
+          'docker',
+          ['image', 'inspect', '--format', '{{.Id}}', `${baseline.imageTag}-test`],
+          { timeoutMs: 120_000 },
+        )
+      ).stdout.trim();
+      if (!/^sha256:[a-f0-9]{64}$/.test(comparatorImage)) {
+        throw new Error('baseline comparator image did not resolve to an immutable image ID');
+      }
+      const config = TargetExcludedConfigSchema.parse({
+        targetImplementationWorkflow,
+        baselineVariantId,
+        comparatorImage,
+        configuredAt: new Date().toISOString(),
+        replicates: 2,
+        concurrency: 2,
+        warningBuildDropRatio: 0.08,
+        blockBuildDropRatio: 0.15,
+      });
+      const sidecar = path.join(campaignDirectory(this.paths, campaign.id), 'target-excluded.json');
+      await writeFile(sidecar, `${JSON.stringify(config, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+      let persisted = false;
+      try {
+        const saved = this.database.createTargetExcludedConfig(campaign.id, config);
+        persisted = true;
+        try {
+          await this.refreshReports(campaign.id);
+        } catch (error) {
+          this.database.addEvent(campaign.id, null, 'target_excluded.report_failed', {
+            error: errorMessage(error),
+          });
+        }
+        return saved;
+      } catch (error) {
+        if (!persisted) await rm(sidecar, { force: true });
+        throw error;
+      }
+    });
+  }
+
+  async runTargetExcluded(campaignId: string, variantId: string): Promise<TargetExcludedEvaluationRecord> {
+    return await this.withCampaignLock(campaignId, async () => {
+      const campaign = this.database.getCampaign(campaignId);
+      const variant = this.database.getVariant(variantId);
+      if (variant.campaignId !== campaignId) throw new Error('variant belongs to another campaign');
+      const config = this.database.getTargetExcludedConfig(campaignId);
+      if (!config) throw new Error('target-excluded protocol is not configured');
+      return await this.runTargetExcludedBackfill(campaign, variant, config);
+    });
+  }
+
+  answerTargetExcludedQuestion(
+    campaignId: string,
+    variantId: string,
+    questionId: string,
+    answer: string,
+    selectedOptionId?: string,
+  ): void {
+    const pending = this.pendingTargetAnswers.get(`${variantId}:${questionId}`);
+    if (!pending) throw new Error('target-excluded question is not waiting for an answer');
+    if (
+      pending.campaignId !== campaignId ||
+      this.database.getVariant(variantId).campaignId !== campaignId
+    ) {
+      throw new Error('target-excluded question belongs to another campaign');
+    }
+    if (containsTargetIdentityLeak(answer, pending.targetWorkflow)) {
+      throw new Error('target-excluded answer references the excluded implementation');
+    }
+    if (pending.question.responseKind === 'single_select') {
+      if (!selectedOptionId || !pending.question.options?.some((option) => option.id === selectedOptionId)) {
+        throw new Error('target-excluded answer must select one of the current question options');
+      }
+    } else if (selectedOptionId) {
+      throw new Error('selectedOptionId is only valid for single-select questions');
+    }
+    this.pendingTargetAnswers.delete(`${variantId}:${questionId}`);
+    pending.resolve({
+      answer,
+      ...(selectedOptionId ? { selectedOptionId } : {}),
+      resolution: 'human_answer',
+      evidence: ['human operator answer'],
+      requirementsAgentRequests: 0,
+    });
+    const stillWaiting = [...this.pendingTargetAnswers.keys()].some((key) => key.startsWith(`${variantId}:`));
+    this.database.updateTargetExcludedEvaluation(variantId, {
+      status: stillWaiting ? 'waiting_for_input' : 'running',
+    });
+  }
+
+  async saveTargetExcludedVerifiedLabel(input: {
+    campaignId: string;
+    unitKey: string;
+    expectedDecision: Decision;
+    classification: 'system_error' | 'real_gap' | 'uncertain';
+    rationale: string;
+  }): Promise<void> {
+    this.database.getCampaign(input.campaignId);
+    this.database.upsertTargetExcludedLabel({ ...input, status: 'verified' });
+    const labels = this.database.listTargetExcludedLabels(input.campaignId);
+    for (const evaluation of this.database.listTargetExcludedEvaluations(input.campaignId)) {
+      if (!evaluation.excludedFacts || !evaluation.judgment) continue;
+      this.database.updateTargetExcludedEvaluation(evaluation.variantId, {
+        score: computeScore(evaluation.excludedFacts, labels.map((label) => ({ ...label, benchmark: 'target-excluded' })), evaluation.judgment),
+      });
+    }
+    await this.refreshReports(input.campaignId);
   }
 
   private async initializeResolved(
@@ -301,6 +488,21 @@ export class CampaignOrchestrator {
     });
   }
 
+  async diagnoseVariant(campaignId: string, variantId: string): Promise<VariantRecord> {
+    return await this.withCampaignLock(campaignId, async () => {
+      const campaign = this.database.getCampaign(campaignId);
+      const variant = this.database.getVariant(variantId);
+      if (variant.campaignId !== campaignId) throw new Error('variant belongs to another campaign');
+      if (!variant.artifactCollectionComplete || !variant.facts || !variant.judgment) {
+        throw new Error('diagnosis requires archived artifacts, measured facts, and a blind judgment');
+      }
+      const artifactDirectory = variantArtifactDirectory(this.paths, campaignId, variantId);
+      await this.runDiagnosis(campaign, variant, artifactDirectory);
+      await this.refreshReports(campaignId);
+      return this.database.getVariant(variantId);
+    });
+  }
+
   private async finalizeBaseline(campaignId: string, result: VariantRecord): Promise<VariantRecord> {
       if (this.database.getCampaign(campaignId).status === 'stopped_by_user') return result;
       if (result.status !== 'review' || !result.facts || !result.artifactCollectionComplete) {
@@ -385,7 +587,7 @@ export class CampaignOrchestrator {
         holdoutJudgments[benchmark.name] = evaluation.judgment;
         holdoutScores[benchmark.name] = evaluation.score;
       }
-      return this.database.updateVariant(variant.id, {
+      const recovered = this.database.updateVariant(variant.id, {
         facts,
         replicateFacts,
         holdoutFacts,
@@ -397,6 +599,8 @@ export class CampaignOrchestrator {
         status: 'review',
         error: null,
       });
+      await this.runDiagnosis(campaign, recovered, root);
+      return this.database.getVariant(variant.id);
     } catch (error) {
       return this.database.updateVariant(variant.id, {
         status: 'failed',
@@ -449,6 +653,16 @@ export class CampaignOrchestrator {
     if (campaign.status !== 'ready') {
       throw new Error(`campaign cannot start a round from status=${campaign.status}`);
     }
+    const targetConfig = this.database.getTargetExcludedConfig(campaignId);
+    if (targetConfig) {
+      const baselineEvaluation = this.database.getTargetExcludedEvaluation(
+        targetConfig.baselineVariantId,
+      );
+      if (!this.targetExcludedEvaluationReady(targetConfig, baselineEvaluation, true)) {
+        throw new Error('run a valid target-excluded baseline calibration before starting a round');
+      }
+    }
+    const diagnosisAvailable = await this.requireCurrentParentDiagnosis(campaign);
     const variants = this.database.listVariants(campaignId);
     const generatedCount = variants.filter((variant) => variant.round > 0).length;
     const remaining = campaign.config.limits.maxVariants - generatedCount;
@@ -465,7 +679,21 @@ export class CampaignOrchestrator {
       campaignDirectory(this.paths, campaignId),
       historyPath,
       count,
+      diagnosisAvailable,
     );
+    const parentDiagnosis = this.database.getVariant(campaign.currentParentVariantId).diagnosis;
+    const findingIds = new Set(parentDiagnosis?.findings.map((finding) => finding.id) ?? []);
+    for (const hypothesis of hypotheses) {
+      if (diagnosisAvailable && hypothesis.findingIds.length === 0) {
+        throw new Error('strategist hypothesis must cite at least one current-parent diagnosis finding');
+      }
+      if (diagnosisAvailable && hypothesis.findingIds.some((id) => !findingIds.has(id))) {
+        throw new Error('strategist hypothesis cited an unknown or stale diagnosis finding');
+      }
+      if (!diagnosisAvailable && hypothesis.findingIds.length > 0) {
+        throw new Error('strategist invented diagnosis finding IDs during the explicit opt-out');
+      }
+    }
     let ordinal = Math.max(0, ...variants.map((variant) => variant.ordinal));
     const candidates = hypotheses.map((hypothesis) => {
       ordinal += 1;
@@ -491,6 +719,16 @@ export class CampaignOrchestrator {
           variant.status === 'review' && variant.artifactCollectionComplete && variant.score !== null,
       )
       .filter((variant) => !variant.score.cohortMismatches.includes('requirement units'))
+      .filter((variant) => {
+        const config = this.database.getTargetExcludedConfig(campaignId);
+        return config
+          ? this.targetExcludedEvaluationReady(
+              config,
+              this.database.getTargetExcludedEvaluation(variant.id),
+              false,
+            )
+          : true;
+      })
       .sort((left, right) => compareScores(left.score, right.score));
     if (eligible.length === 0) {
       this.database.updateCampaign(campaignId, { status: 'stopped_round_failed' });
@@ -527,6 +765,13 @@ export class CampaignOrchestrator {
     if (variant.round !== latestRound) throw new Error('only the current round can be promoted');
     if (variant.score.cohortMismatches.includes('requirement units')) {
       throw new Error('variant changed the frozen requirement-unit cohort');
+    }
+    const targetConfig = this.database.getTargetExcludedConfig(campaignId);
+    if (targetConfig) {
+      const targetEvaluation = this.database.getTargetExcludedEvaluation(variant.id);
+      if (!this.targetExcludedEvaluationReady(targetConfig, targetEvaluation, false)) {
+        throw new Error('variant is missing a completed target-excluded evaluation');
+      }
     }
     const requiredHoldouts = campaign.config.benchmarks
       .filter((benchmark) => benchmark.role === 'holdout')
@@ -589,7 +834,40 @@ export class CampaignOrchestrator {
     return variant;
   }
 
+  private targetExcludedEvaluationReady(
+    config: TargetExcludedConfig,
+    evaluation: TargetExcludedEvaluationRecord | null,
+    baseline: boolean,
+  ): evaluation is TargetExcludedEvaluationRecord {
+    return Boolean(
+      evaluation &&
+        evaluation.status === 'completed' &&
+        evaluation.artifactCollectionComplete &&
+        evaluation.excludedReplicateFacts?.length === config.replicates &&
+        evaluation.comparisons?.length === config.replicates &&
+        evaluation.comparisons.every(
+          (comparison) => comparison.valid && comparison.leakagePaths.length === 0,
+        ) &&
+        evaluation.gate &&
+        (baseline
+          ? evaluation.gate.status === 'passed'
+          : evaluation.gate.status === 'passed' || evaluation.gate.status === 'warning'),
+    );
+  }
+
   stop(campaignId: string): CampaignRecord {
+    for (const [key, pending] of this.pendingTargetAnswers) {
+      if (pending.campaignId !== campaignId) continue;
+      this.pendingTargetAnswers.delete(key);
+      pending.reject(new Error('target-excluded question wait was stopped by the user'));
+      const variantId = key.slice(0, key.lastIndexOf(':'));
+      if (this.database.getTargetExcludedEvaluation(variantId)) {
+        this.database.updateTargetExcludedEvaluation(variantId, {
+          status: 'failed',
+          error: 'target-excluded question wait was stopped by the user',
+        });
+      }
+    }
     const campaign = this.database.updateCampaign(campaignId, { status: 'stopped_by_user' });
     this.database.addEvent(campaignId, null, 'campaign.stop_requested', {});
     return campaign;
@@ -691,7 +969,54 @@ export class CampaignOrchestrator {
       );
       variant = this.database.updateVariant(variant.id, { worktreePath: worktree });
       if (mutate) {
-        await new AgentRunner(campaign).mutate(variant, worktree, artifactDirectory);
+        const parent = variant.parentVariantId
+          ? this.database.getVariant(variant.parentVariantId)
+          : null;
+        if (!parent) throw new Error('mutation parent is unavailable');
+        let mutationContextPath: string;
+        if (parent.diagnosisInputHash && parent.diagnosisStatus === 'completed') {
+          const parentInput = await readDiagnosisInput(
+            variantArtifactDirectory(this.paths, campaign.id, parent.id),
+            parent.diagnosisInputHash,
+          );
+          mutationContextPath = await writeMutationContext(
+            artifactDirectory,
+            parent,
+            parentInput,
+            variant.hypothesis.findingIds,
+          );
+        } else if (campaign.config.diagnosis.allowMissingParent) {
+          mutationContextPath = path.join(artifactDirectory, 'mutation-context.json');
+          const optOutContext = `${JSON.stringify(
+            {
+              kind: 'ainative-planner-eval/mutation-context',
+              schemaVersion: 1,
+              interpretationPolicy:
+                'The campaign explicitly opted out of a current-parent diagnosis. No diagnosis finding is available or implied; measured facts and labels remain separate.',
+              parentVariantId: parent.id,
+              explicitMissingParentOptOut: true,
+              selectedFindings: [],
+              citedEvidence: [],
+            },
+            null,
+            2,
+          )}\n`;
+          const existing = await readFile(mutationContextPath, 'utf8').catch(() => null);
+          if (existing !== null && existing !== optOutContext) {
+            throw new Error('immutable mutation opt-out context changed');
+          }
+          if (existing === null) {
+            await writeFile(mutationContextPath, optOutContext, { flag: 'wx', mode: 0o600 });
+          }
+        } else {
+          throw new Error('mutation parent has no completed diagnosis input');
+        }
+        await new AgentRunner(campaign).mutate(
+          variant,
+          worktree,
+          artifactDirectory,
+          mutationContextPath,
+        );
         variant = this.database.updateVariant(variant.id, { status: 'gating' });
       }
       const { patchPath } = await captureAndGateDiff(
@@ -754,6 +1079,17 @@ export class CampaignOrchestrator {
       const token = environment.PLANNER_EVAL_API_TOKEN || environment.PLANNER_API_TOKEN;
       const primary = resolvedBenchmarks.find((benchmark) => benchmark.role === 'primary');
       if (!primary) throw new Error('resolved benchmark set omitted the primary pack');
+      const targetConfig = this.database.getTargetExcludedConfig(campaign.id);
+      if (targetConfig) {
+        this.database.createTargetExcludedEvaluation(campaign.id, variant.id);
+        this.database.updateTargetExcludedEvaluation(variant.id, {
+          status: 'running',
+          startedAt: new Date().toISOString(),
+          completedAt: null,
+          artifactCollectionComplete: false,
+          error: null,
+        });
+      }
       const phase2StartedAtMs = Date.now();
       variant = this.database.updateVariant(variant.id, {
         phase2StartedAt: new Date(phase2StartedAtMs).toISOString(),
@@ -767,6 +1103,8 @@ export class CampaignOrchestrator {
       };
       const holdoutFacts: Record<string, RunFacts> = {};
       const holdoutReplicateFacts: Record<string, RunFacts[]> = {};
+      let targetExcludedRuns: Awaited<ReturnType<CampaignOrchestrator['runBenchmarkReplicates']>> | null = null;
+      let targetComparisons: Awaited<ReturnType<typeof runTargetExcludedComparison>>[] = [];
       try {
         primaryRuns = await this.runBenchmarkReplicates(
           campaign,
@@ -774,6 +1112,7 @@ export class CampaignOrchestrator {
           stack,
           primary,
           token,
+          targetConfig ? { replicateCount: targetConfig.replicates } : {},
         );
         questionResolutions[primary.name] = withRuntimeQuestions(
           questionResolutions[primary.name]!,
@@ -786,6 +1125,7 @@ export class CampaignOrchestrator {
             stack,
             benchmark,
             token,
+            targetConfig ? { replicateCount: targetConfig.replicates } : {},
           );
           holdoutFacts[benchmark.name] = holdout.facts;
           holdoutReplicateFacts[benchmark.name] = holdout.replicates;
@@ -793,6 +1133,66 @@ export class CampaignOrchestrator {
             questionResolutions[benchmark.name]!,
             holdout.questions,
           );
+        }
+        if (targetConfig) {
+          try {
+            targetExcludedRuns = await this.runBenchmarkReplicates(
+              campaign,
+              variant,
+              stack,
+              primary,
+              token,
+              {
+                replicateCount: targetConfig.replicates,
+                scope: 'target-excluded',
+                targetWorkflow: targetConfig.targetImplementationWorkflow,
+                persistToTargetEvaluation: true,
+              },
+            );
+            const comparisonDirectory = path.join(artifactDirectory, 'target-excluded', 'comparisons');
+            await mkdir(comparisonDirectory, { recursive: true });
+            targetComparisons = await Promise.all(
+              Array.from({ length: targetConfig.replicates }, (_, index) =>
+                runTargetExcludedComparison({
+                  normalArtifactDirectory: path.join(
+                    artifactDirectory,
+                    primary.name,
+                    `replicate-${index + 1}`,
+                  ),
+                  excludedArtifactDirectory: path.join(
+                    artifactDirectory,
+                    'target-excluded',
+                    primary.name,
+                    `replicate-${index + 1}`,
+                  ),
+                  outputPath: path.join(comparisonDirectory, `replicate-${index + 1}.json`),
+                  imageTag: targetConfig.comparatorImage,
+                  replicate: index + 1,
+                }),
+              ),
+            );
+            this.database.updateTargetExcludedEvaluation(variant.id, {
+              controlFacts: primaryRuns.facts,
+              controlReplicateFacts: primaryRuns.replicates,
+              holdoutFacts,
+              holdoutReplicateFacts,
+              excludedFacts: targetExcludedRuns.facts,
+              excludedReplicateFacts: targetExcludedRuns.replicates,
+              questionResolution: withRuntimeQuestions(
+                questionResolutions[primary.name]!,
+                targetExcludedRuns.questions,
+              ),
+              comparisons: targetComparisons,
+              status: 'judging',
+            });
+          } catch (error) {
+            targetExcludedRuns = null;
+            targetComparisons = [];
+            this.database.updateTargetExcludedEvaluation(variant.id, {
+              status: 'failed',
+              error: errorMessage(error).slice(0, 20_000),
+            });
+          }
         }
       } finally {
         const phase2CompletedAtMs = Date.now();
@@ -829,6 +1229,49 @@ export class CampaignOrchestrator {
         holdoutJudgments[benchmark.name] = evaluation.judgment;
         holdoutScores[benchmark.name] = evaluation.score;
       }
+      if (targetConfig && targetExcludedRuns) {
+        try {
+          const judged = await this.judgeTargetExcluded(
+            campaign,
+            variant,
+            primary,
+            targetExcludedRuns.facts,
+            targetConfig,
+            path.join(artifactDirectory, 'target-excluded', primary.name),
+          );
+          const baselineEvaluation = this.database.getTargetExcludedEvaluation(
+            targetConfig.baselineVariantId,
+          );
+          const baselineRuns = baselineEvaluation?.excludedReplicateFacts ?? [];
+          const comparisonValid =
+            targetComparisons.length === targetConfig.replicates &&
+            targetComparisons.every((comparison) => comparison.valid);
+          const leakageDetected =
+            targetComparisons.some((comparison) => comparison.leakagePaths.length > 0) ||
+            containsTargetIdentityLeak(judged.judgment, targetConfig.targetImplementationWorkflow);
+          const gate = computeTargetExcludedGate(
+            baselineRuns,
+            targetExcludedRuns.replicates,
+            comparisonValid,
+            leakageDetected,
+            targetConfig.warningBuildDropRatio,
+            targetConfig.blockBuildDropRatio,
+          );
+          this.database.updateTargetExcludedEvaluation(variant.id, {
+            status: 'completed',
+            judgment: judged.judgment,
+            score: judged.score,
+            gate,
+            error: null,
+            completedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          this.database.updateTargetExcludedEvaluation(variant.id, {
+            status: 'failed',
+            error: errorMessage(error).slice(0, 20_000),
+          });
+        }
+      }
       variant = this.database.updateVariant(variant.id, {
         facts,
         replicateFacts: primaryRuns.replicates,
@@ -847,6 +1290,16 @@ export class CampaignOrchestrator {
         status: 'failed',
         error: errorMessage(error).slice(0, 20_000),
       });
+      const targetEvaluation = this.database.getTargetExcludedEvaluation(variant.id);
+      if (targetEvaluation && !['completed', 'failed'].includes(targetEvaluation.status)) {
+        this.database.updateTargetExcludedEvaluation(variant.id, {
+          status: 'failed',
+          error: `standard evaluation failed before target-excluded completion: ${errorMessage(error)}`.slice(
+            0,
+            20_000,
+          ),
+        });
+      }
     } finally {
       if (stack) {
         let collectionComplete = true;
@@ -875,6 +1328,23 @@ export class CampaignOrchestrator {
                 error: variant.error ?? 'required stack artifacts were not completely archived',
               }),
         });
+        const targetEvaluation = this.database.getTargetExcludedEvaluation(variant.id);
+        if (targetEvaluation) {
+          this.database.updateTargetExcludedEvaluation(variant.id, {
+            artifactCollectionComplete: collectionComplete,
+            ...(!collectionComplete && targetEvaluation.status === 'completed'
+              ? {
+                  status: 'failed',
+                  error: 'required target-excluded artifacts were not completely archived',
+                }
+              : {}),
+          });
+        }
+      }
+      variant = this.database.getVariant(variant.id);
+      if (artifactDirectory && variant.facts && variant.judgment) {
+        await this.runDiagnosis(campaign, variant, artifactDirectory);
+        variant = this.database.getVariant(variant.id);
       }
       const variantCompletedAtMs = Date.now();
       variant = this.database.updateVariant(variant.id, {
@@ -895,6 +1365,7 @@ export class CampaignOrchestrator {
     replicate: number,
     workflowsSource: string,
     answerCache: RuntimeAnswerCache,
+    options: BenchmarkRunOptions = {},
   ): Promise<Phase2Result> {
     const startedAtMs = Date.now();
     const startedAt = new Date(startedAtMs).toISOString();
@@ -913,23 +1384,33 @@ export class CampaignOrchestrator {
       updatedAt: startedAt,
     };
     const persistSnapshot = (snapshot: Phase2RunSnapshot): void => {
-      this.database.updateVariantExecution(variant.id, {
-        benchmark: benchmark.name,
+      const input = {
+        benchmark: options.scope ? `${benchmark.name}:${options.scope}` : benchmark.name,
         role: benchmark.role,
         replicate,
-        replicateCount: campaign.config.evaluation.replicates,
+        replicateCount: options.replicateCount ?? campaign.config.evaluation.replicates,
         snapshot,
-      });
+      };
+      if (options.persistToTargetEvaluation) {
+        this.database.updateTargetExcludedExecution(variant.id, input);
+      } else {
+        this.database.updateVariantExecution(variant.id, input);
+      }
     };
     persistSnapshot(latestSnapshot);
-    const directory = path.join(stack.artifactDirectory, benchmark.name, `replicate-${replicate}`);
+    const directory = path.join(
+      stack.artifactDirectory,
+      ...(options.scope ? [options.scope] : []),
+      benchmark.name,
+      `replicate-${replicate}`,
+    );
     try {
       await mkdir(directory, { recursive: true });
       const client = new PlannerClient(stack.baseUrl, directory, token);
       await client.health();
       const result = await client.runPhase2(
         benchmark.zipPath,
-        `${variant.id}-${benchmark.name}-r${replicate}`,
+        `${variant.id}-${benchmark.name}${options.scope ? `-${options.scope}` : ''}-r${replicate}`,
         campaign.config.limits.phase2TimeoutMs,
         benchmark.sha256,
         async ({ question, consultations }) =>
@@ -940,6 +1421,9 @@ export class CampaignOrchestrator {
             workflowsSource,
             path.join(directory, 'questions'),
             answerCache,
+            options.targetWorkflow
+              ? { targetWorkflow: options.targetWorkflow, variantId: variant.id }
+              : undefined,
           ),
         async (snapshot) => {
           const updatedAtMs = Date.now();
@@ -951,6 +1435,9 @@ export class CampaignOrchestrator {
           };
           persistSnapshot(latestSnapshot);
         },
+        options.targetWorkflow
+          ? { targetImplementationWorkflow: options.targetWorkflow }
+          : undefined,
       );
       await writeFile(path.join(directory, 'result.json'), `${JSON.stringify(result, null, 2)}\n`);
       return result;
@@ -977,16 +1464,20 @@ export class CampaignOrchestrator {
     stack: StackHandle,
     benchmark: Benchmark,
     token: string | undefined,
+    options: BenchmarkRunOptions = {},
   ): Promise<{ facts: RunFacts; replicates: RunFacts[]; questions: Phase2QuestionAudit[] }> {
+    const replicateCount = options.replicateCount ?? campaign.config.evaluation.replicates;
     const replicateResults: Array<Phase2Result | undefined> = new Array(
-      campaign.config.evaluation.replicates,
+      replicateCount,
     );
-    const workflowsSource = await this.ensureFrozenWorkflowsSource(campaign);
+    const workflowsSource = options.targetWorkflow
+      ? await this.ensureTargetExcludedWorkflowsSource(campaign, options.targetWorkflow)
+      : await this.ensureFrozenWorkflowsSource(campaign);
     const answerCache: RuntimeAnswerCache = new Map();
     let nextReplicate = 1;
     let workerFailure: unknown;
     const worker = async (): Promise<void> => {
-      while (!workerFailure && nextReplicate <= campaign.config.evaluation.replicates) {
+      while (!workerFailure && nextReplicate <= replicateCount) {
         const replicate = nextReplicate;
         nextReplicate += 1;
         try {
@@ -999,6 +1490,7 @@ export class CampaignOrchestrator {
             replicate,
             workflowsSource,
             answerCache,
+            { ...options, replicateCount },
           );
         } catch (error) {
           workerFailure ??= error;
@@ -1006,8 +1498,8 @@ export class CampaignOrchestrator {
       }
     };
     const concurrency = Math.min(
-      campaign.config.evaluation.replicateConcurrency ?? 2,
-      campaign.config.evaluation.replicates,
+      options.replicateCount ? Math.min(2, options.replicateCount) : campaign.config.evaluation.replicateConcurrency ?? 2,
+      replicateCount,
     );
     await Promise.all(Array.from({ length: concurrency }, worker));
     if (workerFailure) throw workerFailure;
@@ -1022,7 +1514,11 @@ export class CampaignOrchestrator {
       questions.push(...result.questions);
     }
     const facts = consensusRunFacts(replicates);
-    const directory = path.join(stack.artifactDirectory, benchmark.name);
+    const directory = path.join(
+      stack.artifactDirectory,
+      ...(options.scope ? [options.scope] : []),
+      benchmark.name,
+    );
     await Promise.all([
       writeFile(path.join(directory, 'facts.json'), `${JSON.stringify(facts, null, 2)}\n`),
       writeFile(path.join(directory, 'replicates.json'), `${JSON.stringify(replicates, null, 2)}\n`),
@@ -1037,6 +1533,7 @@ export class CampaignOrchestrator {
     workflowsSource: string,
     artifactDirectory: string,
     answerCache: RuntimeAnswerCache,
+    targetContext?: { targetWorkflow: string; variantId: string },
   ): Promise<Phase2QuestionAnswer> {
     await mkdir(artifactDirectory, { recursive: true });
     const consultationRecords = matchQuestionConsultations(consultations, question);
@@ -1059,7 +1556,10 @@ export class CampaignOrchestrator {
         cached.answer,
         cached.selectedOptionId,
       );
-      if (question.responseKind !== 'single_select' || selectedOptionId) {
+      if (
+        (question.responseKind !== 'single_select' || selectedOptionId) &&
+        (!targetContext || !containsTargetIdentityLeak(cached, targetContext.targetWorkflow))
+      ) {
         return {
           ...cached,
           ...(selectedOptionId ? { selectedOptionId } : {}),
@@ -1085,7 +1585,14 @@ export class CampaignOrchestrator {
         : ['requirements-agent returned a grounded answer'];
       const answerText = String(outcome.answer);
       const selectedOptionId = selectedOptionIdForAnswer(question, answerText);
-      if (question.responseKind !== 'single_select' || selectedOptionId) {
+       if (
+         (question.responseKind !== 'single_select' || selectedOptionId) &&
+         (!targetContext ||
+           !containsTargetIdentityLeak(
+             { answer: answerText, evidence: citations },
+             targetContext.targetWorkflow,
+           ))
+       ) {
         const answer: Phase2QuestionAnswer = {
           answer: answerText,
           ...(selectedOptionId ? { selectedOptionId } : {}),
@@ -1110,9 +1617,19 @@ export class CampaignOrchestrator {
       workflowsSource,
       artifactDirectory,
     );
+      if (targetContext) {
+        await this.ensureTargetExcludedWorkflowsSource(campaign, targetContext.targetWorkflow);
+      }
       if (source.resolution !== 'answered') {
-      throw new Error(`planner question ${question.id} remains unresolved: ${source.reason}`);
-    }
+        if (!targetContext) {
+          throw new Error(`planner question ${question.id} remains unresolved: ${source.reason}`);
+        }
+        return await this.waitForTargetExcludedAnswer(
+          targetContext.variantId,
+          targetContext.targetWorkflow,
+          question,
+        );
+      }
       const selectedOptionId = selectedOptionIdForAnswer(
       question,
       source.answer,
@@ -1128,6 +1645,13 @@ export class CampaignOrchestrator {
       evidence: source.evidence,
       requirementsAgentRequests: consultationRecords.length,
     };
+      if (targetContext && containsTargetIdentityLeak(answer, targetContext.targetWorkflow)) {
+        return await this.waitForTargetExcludedAnswer(
+          targetContext.variantId,
+          targetContext.targetWorkflow,
+          question,
+        );
+      }
       return answer;
     })();
     answerCache.set(cacheKey, resolutionPromise);
@@ -1139,6 +1663,263 @@ export class CampaignOrchestrator {
       if (answerCache.get(cacheKey) === resolutionPromise) answerCache.delete(cacheKey);
       throw error;
     }
+  }
+
+  private async waitForTargetExcludedAnswer(
+    variantId: string,
+    targetWorkflow: string,
+    question: PlannerQuestionRecord,
+  ): Promise<Phase2QuestionAnswer> {
+    const key = `${variantId}:${question.id}`;
+    if (this.pendingTargetAnswers.has(key)) {
+      throw new Error(`target-excluded question is already waiting: ${question.id}`);
+    }
+    this.database.updateTargetExcludedEvaluation(variantId, { status: 'waiting_for_input' });
+    this.database.addEvent(
+      this.database.getVariant(variantId).campaignId,
+      variantId,
+      'target_excluded.question_waiting',
+      {
+        id: question.id,
+        prompt: question.prompt,
+        responseKind: question.responseKind,
+        options: question.options ?? [],
+      },
+    );
+    return await new Promise<Phase2QuestionAnswer>((resolve, reject) => {
+      this.pendingTargetAnswers.set(key, {
+        campaignId: this.database.getVariant(variantId).campaignId,
+        targetWorkflow,
+        question,
+        resolve,
+        reject,
+      });
+    });
+  }
+
+  private async runTargetExcludedBackfill(
+    campaign: CampaignRecord,
+    variant: VariantRecord,
+    config: TargetExcludedConfig,
+  ): Promise<TargetExcludedEvaluationRecord> {
+    const existing = this.database.getTargetExcludedEvaluation(variant.id);
+    if (
+      existing?.status === 'completed' &&
+      existing.artifactCollectionComplete &&
+      (existing.gate?.status === 'passed' || existing.gate?.status === 'warning')
+    ) {
+      throw new Error(`target-excluded evaluation already exists: ${variant.id}`);
+    }
+    if (!variant.worktreePath || !variant.imageTag || !variant.artifactCollectionComplete) {
+      throw new Error('variant worktree, image, and archived artifacts are required');
+    }
+    let evaluation = this.database.createTargetExcludedEvaluation(campaign.id, variant.id);
+    evaluation = this.database.updateTargetExcludedEvaluation(variant.id, {
+      status: 'starting',
+      startedAt: new Date().toISOString(),
+      completedAt: null,
+      artifactCollectionComplete: false,
+      error: null,
+    });
+    const artifactDirectory = path.join(
+      variantArtifactDirectory(this.paths, campaign.id, variant.id),
+      'target-excluded',
+    );
+    await mkdir(artifactDirectory, { recursive: true });
+    let stack: StackHandle | null = null;
+    try {
+      const workflowsSource = await this.ensureFrozenWorkflowsSource(campaign);
+      await this.ensureTargetExcludedWorkflowsSource(
+        campaign,
+        config.targetImplementationWorkflow,
+      );
+      const resolvedBenchmarks: Benchmark[] = [];
+      const resolutions: Record<string, NonNullable<VariantRecord['questionResolutions']>[string]> = {};
+      for (const benchmark of campaign.config.benchmarks) {
+        const resolved = await resolveBenchmarkQuestions({
+          campaign,
+          benchmark,
+          workflowsSource,
+          sharedDirectory: path.join(campaignDirectory(this.paths, campaign.id), 'resolved-packs'),
+          artifactDirectory: path.join(artifactDirectory, 'pack-questions', benchmark.name),
+        });
+        resolvedBenchmarks.push(resolved.benchmark);
+        resolutions[benchmark.name] = resolved.summary;
+      }
+      const environment = await loadCampaignEnvironment(campaign);
+      stack = await startVariantStack(
+        this.paths,
+        campaign,
+        variant,
+        variant.worktreePath,
+        artifactDirectory,
+        variant.imageTag,
+        environment,
+        await this.ensureFrozenPlannerSource(campaign),
+        'target-excluded',
+      );
+      evaluation = this.database.updateTargetExcludedEvaluation(variant.id, { status: 'running' });
+      const token = stack.environment.PLANNER_EVAL_API_TOKEN || stack.environment.PLANNER_API_TOKEN;
+      const primary = resolvedBenchmarks.find((benchmark) => benchmark.role === 'primary');
+      if (!primary) throw new Error('resolved benchmark set omitted the primary pack');
+      const control = await this.runBenchmarkReplicates(campaign, variant, stack, primary, token, {
+        replicateCount: config.replicates,
+        scope: 'control',
+        persistToTargetEvaluation: true,
+      });
+      const holdoutFacts: Record<string, RunFacts> = {};
+      const holdoutReplicateFacts: Record<string, RunFacts[]> = {};
+      for (const holdout of resolvedBenchmarks.filter((benchmark) => benchmark.role === 'holdout')) {
+        const result = await this.runBenchmarkReplicates(campaign, variant, stack, holdout, token, {
+          replicateCount: config.replicates,
+          scope: 'control',
+          persistToTargetEvaluation: true,
+        });
+        holdoutFacts[holdout.name] = result.facts;
+        holdoutReplicateFacts[holdout.name] = result.replicates;
+      }
+      const excluded = await this.runBenchmarkReplicates(campaign, variant, stack, primary, token, {
+        replicateCount: config.replicates,
+        scope: 'excluded',
+        targetWorkflow: config.targetImplementationWorkflow,
+        persistToTargetEvaluation: true,
+      });
+      const comparisonDirectory = path.join(artifactDirectory, 'comparisons');
+      await mkdir(comparisonDirectory, { recursive: true });
+      const comparisons = await Promise.all(
+        Array.from({ length: config.replicates }, (_, index) =>
+          runTargetExcludedComparison({
+            normalArtifactDirectory: path.join(
+              artifactDirectory,
+              'control',
+              primary.name,
+              `replicate-${index + 1}`,
+            ),
+            excludedArtifactDirectory: path.join(
+              artifactDirectory,
+              'excluded',
+              primary.name,
+              `replicate-${index + 1}`,
+            ),
+            outputPath: path.join(comparisonDirectory, `replicate-${index + 1}.json`),
+            imageTag: config.comparatorImage,
+            replicate: index + 1,
+          }),
+        ),
+      );
+      evaluation = this.database.updateTargetExcludedEvaluation(variant.id, {
+        status: 'judging',
+        controlFacts: control.facts,
+        controlReplicateFacts: control.replicates,
+        holdoutFacts,
+        holdoutReplicateFacts,
+        excludedFacts: excluded.facts,
+        excludedReplicateFacts: excluded.replicates,
+        questionResolution: withRuntimeQuestions(resolutions[primary.name]!, excluded.questions),
+        comparisons,
+      });
+      const judged = await this.judgeTargetExcluded(
+        campaign,
+        variant,
+        primary,
+        excluded.facts,
+        config,
+        path.join(artifactDirectory, 'excluded', primary.name),
+      );
+      const comparisonValid =
+        comparisons.length === config.replicates &&
+        comparisons.every((comparison) => comparison.valid);
+      const leakageDetected =
+        comparisons.some((comparison) => comparison.leakagePaths.length > 0) ||
+        containsTargetIdentityLeak(judged.judgment, config.targetImplementationWorkflow);
+      const baselineEvaluation = this.database.getTargetExcludedEvaluation(config.baselineVariantId);
+      const baselineRuns =
+        variant.id === config.baselineVariantId
+          ? excluded.replicates
+          : baselineEvaluation?.excludedReplicateFacts ?? [];
+      const gate = computeTargetExcludedGate(
+        baselineRuns,
+        excluded.replicates,
+        comparisonValid,
+        leakageDetected,
+        config.warningBuildDropRatio,
+        config.blockBuildDropRatio,
+      );
+      evaluation = this.database.updateTargetExcludedEvaluation(variant.id, {
+        status: 'completed',
+        judgment: judged.judgment,
+        score: judged.score,
+        gate,
+        error: null,
+      });
+    } catch (error) {
+      evaluation = this.database.updateTargetExcludedEvaluation(variant.id, {
+        status: 'failed',
+        error: errorMessage(error).slice(0, 20_000),
+      });
+    } finally {
+      let collectionComplete = stack !== null;
+      if (stack) {
+        try {
+          await collectStackArtifacts(stack);
+        } catch (error) {
+          collectionComplete = false;
+          this.database.addEvent(campaign.id, variant.id, 'target_excluded.artifacts_failed', {
+            error: errorMessage(error),
+          });
+        }
+        try {
+          await stopVariantStack(stack, collectionComplete);
+        } catch (error) {
+          collectionComplete = false;
+          this.database.addEvent(campaign.id, variant.id, 'target_excluded.teardown_failed', {
+            error: errorMessage(error),
+          });
+        }
+      }
+      evaluation = this.database.updateTargetExcludedEvaluation(variant.id, {
+        artifactCollectionComplete: collectionComplete,
+        completedAt: new Date().toISOString(),
+        ...(!collectionComplete && evaluation.status === 'completed'
+          ? { status: 'failed', error: 'required target-excluded artifacts were not completely archived' }
+          : {}),
+      });
+      await this.refreshReports(campaign.id);
+    }
+    return evaluation;
+  }
+
+  private async judgeTargetExcluded(
+    campaign: CampaignRecord,
+    variant: VariantRecord,
+    benchmark: Benchmark,
+    facts: RunFacts,
+    config: TargetExcludedConfig,
+    artifactDirectory: string,
+  ): Promise<{ judgment: JudgeOutput; score: NonNullable<VariantRecord['score']> }> {
+    const workflowsSource = await this.ensureTargetExcludedWorkflowsSource(
+      campaign,
+      config.targetImplementationWorkflow,
+    );
+    const judgment = await new AgentRunner(campaign).judge(
+      variant,
+      workflowsSource,
+      path.join(artifactDirectory, 'facts.json'),
+      artifactDirectory,
+      true,
+    );
+    await this.ensureTargetExcludedWorkflowsSource(
+      campaign,
+      config.targetImplementationWorkflow,
+    );
+    if (containsTargetIdentityLeak(judgment, config.targetImplementationWorkflow)) {
+      throw new Error('target-blind judge referenced the excluded implementation');
+    }
+    this.validateJudgment(facts, judgment);
+    const labels = this.database
+      .listTargetExcludedLabels(campaign.id)
+      .map((label) => ({ ...label, benchmark: `${benchmark.name}:target-excluded` }));
+    return { judgment, score: computeScore(facts, labels, judgment) };
   }
 
   private async runHoldouts(
@@ -1303,6 +2084,50 @@ export class CampaignOrchestrator {
     return destination;
   }
 
+  private async ensureTargetExcludedWorkflowsSource(
+    campaign: CampaignRecord,
+    targetWorkflow: string,
+  ): Promise<string> {
+    const destination = path.join(
+      this.paths.worktrees,
+      campaign.id,
+      'target-excluded-workflows',
+    );
+    const manifestPath = path.join(
+      campaignDirectory(this.paths, campaign.id),
+      'target-excluded-source-manifest.json',
+    );
+    const [destinationState, manifestState] = await Promise.all([
+      stat(destination).catch(() => null),
+      stat(manifestPath).catch(() => null),
+    ]);
+    if (destinationState?.isDirectory() && manifestState?.isFile()) {
+      const expectedManifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Parameters<
+        typeof verifyTargetExcludedSourceSnapshot
+      >[0]['expectedManifest'];
+      await verifyTargetExcludedSourceSnapshot({
+        snapshotRoot: destination,
+        targetWorkflow,
+        expectedManifest,
+      });
+      return destination;
+    }
+    if (destinationState || manifestState) {
+      throw new Error('target-excluded source snapshot is incomplete');
+    }
+    const sourceRoot = await this.ensureFrozenWorkflowsSource(campaign);
+    const manifest = await createTargetExcludedSourceSnapshot({
+      sourceRoot,
+      snapshotRoot: destination,
+      targetWorkflow,
+    });
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, {
+      flag: 'wx',
+      mode: 0o600,
+    });
+    return destination;
+  }
+
   private async ensureFrozenPlannerSource(campaign: CampaignRecord): Promise<string> {
     const destination = path.join(this.paths.worktrees, campaign.id, 'frozen-planner');
     if ((await stat(destination).catch(() => null))?.isDirectory()) {
@@ -1322,6 +2147,136 @@ export class CampaignOrchestrator {
     return destination;
   }
 
+  private async requireCurrentParentDiagnosis(campaign: CampaignRecord): Promise<boolean> {
+    if (!campaign.currentParentVariantId) throw new Error('campaign has no current parent variant');
+    const parent = this.database.getVariant(campaign.currentParentVariantId);
+    let failure: string | null = null;
+    if (
+      parent.diagnosisStatus !== 'completed' ||
+      !parent.diagnosis ||
+      !parent.diagnosisInputHash
+    ) {
+      failure = `current parent diagnosis is ${parent.diagnosisStatus}`;
+    } else {
+      try {
+        await verifyDiagnosisArtifacts(
+          variantArtifactDirectory(this.paths, campaign.id, parent.id),
+          parent.diagnosisInputHash,
+        );
+      } catch (error) {
+        failure = `current parent diagnosis artifacts are missing or stale: ${errorMessage(error)}`;
+      }
+    }
+    if (!failure) return true;
+    if (campaign.config.diagnosis.allowMissingParent) {
+      this.database.addEvent(campaign.id, parent.id, 'diagnosis.parent_opt_out', { reason: failure });
+      return false;
+    }
+    throw new Error(`${failure}; set diagnosis.allowMissingParent=true only for an explicit opt-out`);
+  }
+
+  private async runDiagnosis(
+    campaign: CampaignRecord,
+    initialVariant: VariantRecord,
+    artifactDirectory: string,
+  ): Promise<void> {
+    let inputSha256: string | null = null;
+    this.database.updateVariant(initialVariant.id, {
+      diagnosisStatus: 'assembling',
+      diagnosisError: null,
+    });
+    this.database.addEvent(campaign.id, initialVariant.id, 'diagnosis.assembling', {});
+    try {
+      const diagnosisLabels = [
+        ...this.database.listLabels(campaign.id),
+        ...this.database.listTargetExcludedLabels(campaign.id).map((label) => ({
+          ...label,
+          benchmark: 'target-excluded',
+        })),
+      ];
+      const [plannerSource, workflowsSource, environment] = await Promise.all([
+        this.ensureFrozenPlannerSource(campaign),
+        this.ensureFrozenWorkflowsSource(campaign),
+        loadCampaignEnvironment(campaign),
+      ]);
+      const assembled = await assembleDiagnosisInput({
+        artifactDirectory,
+        campaign,
+        variant: this.database.getVariant(initialVariant.id),
+        labels: diagnosisLabels,
+        targetExcluded: this.database.getTargetExcludedEvaluation(initialVariant.id),
+        workflowsSource,
+        environment,
+      });
+      inputSha256 = assembled.inputSha256;
+      const manifestSha256 = await sha256File(assembled.manifestPath);
+      if (this.database.getVariant(initialVariant.id).diagnosisStatus === 'stale') {
+        throw new Error('diagnosis_stale: human labels changed during diagnostic assembly');
+      }
+      this.database.updateVariant(initialVariant.id, {
+        diagnosisStatus: 'running',
+        diagnosisInputHash: inputSha256,
+        diagnosis: null,
+        diagnosisError: null,
+      });
+      this.database.addEvent(campaign.id, initialVariant.id, 'diagnosis.running', {
+        inputSha256,
+      });
+      const diagnosis = await new AgentRunner(campaign).diagnose(
+        assembled.inputPath,
+        inputSha256,
+        artifactDirectory,
+        path.dirname(plannerSource),
+      );
+      await Promise.all([
+        this.ensureFrozenPlannerSource(campaign),
+        this.ensureFrozenWorkflowsSource(campaign),
+        verifyDiagnosisArtifacts(artifactDirectory, inputSha256),
+      ]);
+      if ((await sha256File(assembled.manifestPath)) !== manifestSha256) {
+        throw new Error('diagnostician modified the immutable diagnosis manifest');
+      }
+      const current = this.database.getVariant(initialVariant.id);
+      if (current.diagnosisStatus === 'stale') {
+        this.database.updateVariant(initialVariant.id, {
+          diagnosisStatus: 'stale',
+          diagnosisInputHash: inputSha256,
+          diagnosis,
+          diagnosisError:
+            current.diagnosisError ?? 'Human labels changed while diagnosis was running.',
+        });
+        this.database.addEvent(campaign.id, initialVariant.id, 'diagnosis.completed_stale', {
+          inputSha256,
+          findingIds: diagnosis.findings.map((finding) => finding.id),
+        });
+        return;
+      }
+      this.database.updateVariant(initialVariant.id, {
+        diagnosisStatus: 'completed',
+        diagnosisInputHash: inputSha256,
+        diagnosis,
+        diagnosisError: null,
+      });
+      this.database.addEvent(campaign.id, initialVariant.id, 'diagnosis.completed', {
+        inputSha256,
+        findingIds: diagnosis.findings.map((finding) => finding.id),
+      });
+    } catch (error) {
+      const message = errorMessage(error).slice(0, 20_000);
+      const stale = message.startsWith('diagnosis_stale:');
+      this.database.updateVariant(initialVariant.id, {
+        diagnosisStatus: stale ? 'stale' : 'failed',
+        diagnosisInputHash: inputSha256,
+        diagnosis: null,
+        diagnosisError: message,
+      });
+      this.database.addEvent(campaign.id, initialVariant.id, stale ? 'diagnosis.stale' : 'diagnosis.failed', {
+        inputSha256,
+        error: message,
+      });
+    }
+  }
+
   private async refreshAgentHistory(campaignId: string): Promise<string> {
     const campaign = this.database.getCampaign(campaignId);
     const filePath = path.join(campaignDirectory(this.paths, campaignId), 'history.json');
@@ -1331,6 +2286,7 @@ export class CampaignOrchestrator {
       campaign,
       this.database.listVariants(campaignId),
       this.database.listLabels(campaignId),
+      this.database.listTargetExcludedEvaluations(campaignId),
     );
     return filePath;
   }
@@ -1341,9 +2297,22 @@ export class CampaignOrchestrator {
       const campaign = this.database.getCampaign(campaignId);
       const variants = this.database.listVariants(campaignId);
       const labels = this.database.listLabels(campaignId);
+      const targetConfig = this.database.getTargetExcludedConfig(campaignId);
+      const targetEvaluations = this.database.listTargetExcludedEvaluations(campaignId);
+      const targetByVariant = new Map(
+        targetEvaluations.map((evaluation) => [evaluation.variantId, evaluation]),
+      );
       await Promise.all([
-        writeCampaignIndex(this.paths, campaign, variants),
-        ...variants.map((variant) => writeVariantReport(this.paths, campaign, variant, labels)),
+        writeCampaignIndex(this.paths, campaign, variants, targetConfig, targetEvaluations),
+        ...variants.map((variant) =>
+          writeVariantReport(
+            this.paths,
+            campaign,
+            variant,
+            labels,
+            targetByVariant.get(variant.id),
+          ),
+        ),
       ]);
       await this.refreshAgentHistory(campaignId);
     });

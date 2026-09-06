@@ -11,11 +11,13 @@ import {
   sectionHeading,
   usageSummary,
 } from '../ui.js';
+import { targetExcludedPanel } from './targetExcluded.js';
 
 const tabs = [
   ['summary', 'Summary'],
   ['runs', 'Runs'],
   ['questions', 'Questions'],
+  ['target-excluded', 'Target excluded'],
   ['artifacts', 'Artifacts'],
 ];
 
@@ -132,6 +134,8 @@ export function experimentPage(context, route) {
       ])
     : selectedTab === 'questions'
       ? questionsPanel(variant)
+      : selectedTab === 'target-excluded'
+        ? targetExcludedPanel(context, campaign, variant)
       : selectedTab === 'artifacts'
         ? artifactsPanel(campaign, variant, context)
         : summaryPanel(campaign, variant);

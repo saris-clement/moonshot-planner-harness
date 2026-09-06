@@ -22,6 +22,15 @@ function nestedString(value: unknown, keys: readonly string[]): string | null {
   return typeof current === 'string' ? current : null;
 }
 
+function nestedValue(value: unknown, keys: readonly string[]): unknown {
+  let current: unknown = value;
+  for (const key of keys) {
+    if (!isRecord(current)) return undefined;
+    current = current[key];
+  }
+  return current;
+}
+
 function runStatus(value: unknown): string {
   return (
     nestedString(value, ['runtime', 'status']) ??
@@ -61,7 +70,7 @@ export interface Phase2QuestionAudit {
   questionId: string;
   prompt: string;
   answer: string;
-  resolution: 'requirements_agent' | 'source_fallback' | 'reused_source_answer';
+  resolution: 'requirements_agent' | 'source_fallback' | 'reused_source_answer' | 'human_answer';
   evidence: string[];
   requirementsAgentRequests: number;
 }
@@ -72,6 +81,10 @@ export interface Phase2QuestionAnswer {
   resolution: Phase2QuestionAudit['resolution'];
   evidence: string[];
   requirementsAgentRequests: number;
+}
+
+export interface Phase2CaseOptions {
+  targetImplementationWorkflow: string;
 }
 
 export class PlannerClient {
@@ -133,6 +146,7 @@ export class PlannerClient {
       consultations: unknown[];
     }) => Promise<Phase2QuestionAnswer>,
     onSnapshot?: (snapshot: Phase2RunSnapshot) => void | Promise<void>,
+    caseOptions?: Phase2CaseOptions,
   ): Promise<Phase2Result> {
     const bytes = await readFile(zipPath);
     const upload = await this.request('requirements-upload', '/api/requirements-packs', {
@@ -154,10 +168,43 @@ export class PlannerClient {
         'Content-Type': 'application/json',
         'Idempotency-Key': `${idempotencyPrefix}-case`,
       },
-      body: JSON.stringify({ requirementsArtifactSha256: artifactSha }),
+      body: JSON.stringify({
+        requirementsArtifactSha256: artifactSha,
+        ...(caseOptions
+          ? {
+              caseOptions: ['exclude-target-implementation'],
+              targetImplementationWorkflow: caseOptions.targetImplementationWorkflow,
+            }
+          : {}),
+      }),
     });
     const caseId = nestedString(created, ['case', 'id']) ?? nestedString(created, ['caseId']);
     if (!caseId) throw new Error('planning case response omitted case id');
+    if (caseOptions) {
+      const expectedRoot = `src/customers/${caseOptions.targetImplementationWorkflow}/`;
+      const inputSet = nestedValue(created, ['resolvedInputSet', 'inputSet']);
+      const sourcePolicy = isRecord(inputSet) && isRecord(inputSet.sourcePolicy) ? inputSet.sourcePolicy : null;
+      const planningView =
+        isRecord(inputSet) && isRecord(inputSet.workflowPlanningView)
+          ? inputSet.workflowPlanningView
+          : null;
+      if (
+        nestedString(created, ['case', 'mode']) !== 'greenfield' ||
+        !isRecord(inputSet) ||
+        !Array.isArray(inputSet.caseOptions) ||
+        inputSet.caseOptions.length !== 1 ||
+        inputSet.caseOptions[0] !== 'exclude-target-implementation' ||
+        sourcePolicy?.workflow !== caseOptions.targetImplementationWorkflow ||
+        sourcePolicy.root !== expectedRoot ||
+        sourcePolicy.targetSelection !== 'explicit_override' ||
+        planningView?.status !== 'new' ||
+        planningView.implementationStatus !== 'absent_by_policy' ||
+        planningView.harnessStatus !== 'missing_by_policy' ||
+        planningView.requiresWorkflowEstablishment !== true
+      ) {
+        throw new Error('planner did not admit the requested target-excluded planning view');
+      }
+    }
     const observedQuestions = new Map<string, PlannerQuestionRecord>();
     const questionAudits: Phase2QuestionAudit[] = [];
     const emitSnapshot = async (value: unknown, currentRunId: string | null) => {

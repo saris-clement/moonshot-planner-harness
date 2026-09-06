@@ -48,7 +48,14 @@ async function reloadCampaigns() {
 async function loadCampaign(campaignId) {
   if (state.campaign?.id === campaignId) return;
   const details = await api(`/api/campaigns/${encodeURIComponent(campaignId)}`);
-  state.campaign = { ...details.campaign, variants: details.variants, labels: details.labels };
+  state.campaign = {
+    ...details.campaign,
+    variants: details.variants,
+    labels: details.labels,
+    targetExcludedConfig: details.targetExcludedConfig,
+    targetExcludedEvaluations: details.targetExcludedEvaluations,
+    targetExcludedLabels: details.targetExcludedLabels,
+  };
   state.eventCursor = details.eventCursor ?? 0;
   state.campaigns = state.campaigns.map((campaign) =>
     campaign.id === campaignId ? { ...state.campaign } : campaign,
@@ -67,7 +74,14 @@ async function refreshCurrent() {
     const campaignId = state.campaign.id;
     const details = await api(`/api/campaigns/${encodeURIComponent(campaignId)}`);
     if (state.campaign?.id !== campaignId) return;
-    state.campaign = { ...details.campaign, variants: details.variants, labels: details.labels };
+    state.campaign = {
+      ...details.campaign,
+      variants: details.variants,
+      labels: details.labels,
+      targetExcludedConfig: details.targetExcludedConfig,
+      targetExcludedEvaluations: details.targetExcludedEvaluations,
+      targetExcludedLabels: details.targetExcludedLabels,
+    };
     state.eventCursor = details.eventCursor ?? state.eventCursor;
     state.campaigns = state.campaigns.map((campaign) =>
       campaign.id === campaignId ? { ...state.campaign } : campaign,
@@ -112,6 +126,11 @@ function connectEvents() {
     'campaign.operation_failed',
     'artifacts.collection_failed',
     'stack.teardown_failed',
+    'target_excluded.configured',
+    'target_excluded.created',
+    'target_excluded.updated',
+    'target_excluded.question_waiting',
+    'target_excluded.label_updated',
   ]) source.addEventListener(eventName, refreshCurrent);
 }
 
@@ -162,6 +181,39 @@ function promoteVariant(variantId) {
   );
 }
 
+function configureTargetExcluded(variantId, targetImplementationWorkflow) {
+  return runAction(
+    () => api(`/api/campaigns/${encodeURIComponent(state.campaign.id)}/target-excluded`, {
+      method: 'POST',
+      body: JSON.stringify({ baselineVariantId: variantId, targetImplementationWorkflow }),
+    }),
+    'Target-excluded protocol configured',
+  );
+}
+
+function runTargetExcluded(variantId) {
+  return runAction(
+    () => api(
+      `/api/campaigns/${encodeURIComponent(state.campaign.id)}/variants/${encodeURIComponent(variantId)}/target-excluded`,
+      { method: 'POST', body: '{}' },
+    ),
+    'Target-excluded evaluation admitted',
+  );
+}
+
+function answerTargetExcludedQuestion(variantId, questionId, answer, selectedOptionId) {
+  return runAction(
+    () => api(
+      `/api/campaigns/${encodeURIComponent(state.campaign.id)}/variants/${encodeURIComponent(variantId)}/target-excluded/questions/${encodeURIComponent(questionId)}/answer`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ answer, ...(selectedOptionId ? { selectedOptionId } : {}) }),
+      },
+    ),
+    'Target-excluded question answered',
+  );
+}
+
 const context = {
   state,
   navigate,
@@ -173,6 +225,9 @@ const context = {
   runCampaign,
   stopCampaign,
   promoteVariant,
+  configureTargetExcluded,
+  runTargetExcluded,
+  answerTargetExcludedQuestion,
 };
 
 function routeTitle(route) {

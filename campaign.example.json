@@ -38,6 +38,9 @@
     "model": "openai/gpt-5.6-sol",
     "autoApprove": false
   },
+  "diagnosis": {
+    "allowMissingParent": false
+  },
   "gates": {
     "allowedPathPrefixes": ["server/src/", "server/test/"],
     "commands": [

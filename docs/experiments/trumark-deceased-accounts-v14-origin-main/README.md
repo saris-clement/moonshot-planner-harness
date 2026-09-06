@@ -31,6 +31,13 @@ Accuracy, evidence quality, reproducibility, and genericity are the objectives. 
 - Concurrency: 3
 - Replicate concurrency: 2
 - Maximum generated variants: 9
+- Effective replicate protocol: 2 runs at concurrency 2
+- Target-excluded workflow: `trumark/deceased-accounts`
+- Target-excluded baseline: trumark-deceased-accounts-v14-origin-main-v007
+
+## Target-Excluded Evaluations
+
+- trumark-deceased-accounts-v14-origin-main-v007: failed; gate=pending; build drop=unscored
 
 ## Experiments
 

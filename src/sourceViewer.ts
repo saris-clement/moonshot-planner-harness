@@ -176,6 +176,7 @@ export function renderSourceViewer(input: {
   relativePath: string;
   source: string;
   ranges: readonly SourceLineRange[];
+  sourceLabel?: string;
 }): string {
   const lines = input.source.split(/\r?\n/);
   const highlightedLines = /\.tsx?$/i.test(input.relativePath)
@@ -205,7 +206,7 @@ export function renderSourceViewer(input: {
 <body class="source-viewer-page">
   <header class="source-viewer-header">
     <div>
-      <p class="overline">Frozen workflows source</p>
+      <p class="overline">${escapeHtml(input.sourceLabel ?? 'Frozen workflows source')}</p>
       <h1>${escapeHtml(input.relativePath)}</h1>
     </div>
     <dl class="source-viewer-meta">

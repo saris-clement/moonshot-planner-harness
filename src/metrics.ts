@@ -8,6 +8,7 @@ import {
   type RequirementUnitFact,
   type RunFacts,
   type Score,
+  type TargetExcludedGate,
 } from './types.js';
 
 type JsonRecord = Record<string, unknown>;
@@ -342,4 +343,60 @@ export function compareScores(left: Score, right: Score): number {
   const rightProvisional = right.provisional.accuracy ?? -1;
   if (leftProvisional !== rightProvisional) return rightProvisional - leftProvisional;
   return left.provisional.errors - right.provisional.errors;
+}
+
+function meanBuildRate(runs: readonly RunFacts[]): number | null {
+  if (runs.length === 0 || runs.some((facts) => facts.unitCount <= 0)) return null;
+  return runs.reduce((sum, facts) => sum + facts.decisions.build / facts.unitCount, 0) / runs.length;
+}
+
+export function computeTargetExcludedGate(
+  baselineRuns: readonly RunFacts[],
+  candidateRuns: readonly RunFacts[],
+  comparisonValid: boolean,
+  leakageDetected: boolean,
+  warningRatio = 0.08,
+  blockRatio = 0.15,
+): TargetExcludedGate {
+  const baselineMeanBuildRate = meanBuildRate(baselineRuns);
+  const candidateMeanBuildRate = meanBuildRate(candidateRuns);
+  const reasons: string[] = [];
+  if (!comparisonValid) reasons.push('counterfactual pair validation failed');
+  if (leakageDetected) reasons.push('target implementation leakage detected');
+  if (baselineMeanBuildRate === null || baselineMeanBuildRate === 0) {
+    reasons.push('excluded baseline build rate is unavailable');
+  }
+  if (candidateMeanBuildRate === null) reasons.push('candidate excluded build rate is unavailable');
+  const buildDropRatio =
+    baselineMeanBuildRate && candidateMeanBuildRate !== null
+      ? (baselineMeanBuildRate - candidateMeanBuildRate) / baselineMeanBuildRate
+      : null;
+  if (buildDropRatio !== null && buildDropRatio >= blockRatio) {
+    reasons.push(`excluded build rate dropped ${(buildDropRatio * 100).toFixed(1)}%`);
+  }
+  if (reasons.length > 0) {
+    return {
+      status: 'blocked',
+      baselineMeanBuildRate,
+      candidateMeanBuildRate,
+      buildDropRatio,
+      reasons,
+    };
+  }
+  if (buildDropRatio !== null && buildDropRatio >= warningRatio) {
+    return {
+      status: 'warning',
+      baselineMeanBuildRate,
+      candidateMeanBuildRate,
+      buildDropRatio,
+      reasons: [`excluded build rate dropped ${(buildDropRatio * 100).toFixed(1)}%`],
+    };
+  }
+  return {
+    status: 'passed',
+    baselineMeanBuildRate,
+    candidateMeanBuildRate,
+    buildDropRatio,
+    reasons: [],
+  };
 }

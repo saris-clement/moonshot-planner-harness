@@ -96,6 +96,10 @@ Question resolution did not run.
 
 Not run for this variant.
 
+## Target-Excluded Guard
+
+Not configured or not run for this variant.
+
 ## Failure
 
 `agent returned invalid structured output: I’m locating the frozen workflow source and the anchored Symitar decision, then I’ll distinguish source-proven access requirements from deployment-provided values.`

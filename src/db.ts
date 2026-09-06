@@ -3,15 +3,24 @@ import type {
   CampaignConfig,
   CampaignRecord,
   BenchmarkQuestionResolution,
+  DiagnosisOutput,
+  DiagnosisStatus,
   Hypothesis,
   JudgeOutput,
   LabelRecord,
   RunFacts,
   Score,
+  TargetExcludedComparison,
+  TargetExcludedConfig,
+  TargetExcludedEvaluationRecord,
+  TargetExcludedEvaluationStatus,
+  TargetExcludedGate,
+  TargetExcludedLabelRecord,
   VariantExecutionState,
   VariantRecord,
   VariantStatus,
 } from './types.js';
+import { CampaignConfigSchema, HypothesisSchema, TargetExcludedConfigSchema } from './types.js';
 import { mergeExecutionSnapshot } from './executionState.js';
 
 type Row = Record<string, unknown>;
@@ -27,7 +36,7 @@ function campaignFromRow(row: Row): CampaignRecord {
   return {
     id: String(row.id),
     status: String(row.status),
-    config: parseJson<CampaignConfig>(row.config_json),
+    config: CampaignConfigSchema.parse(parseJson<CampaignConfig>(row.config_json)),
     seedSha: String(row.seed_sha),
     workflowsSha: String(row.workflows_sha),
     environmentSha: String(row.environment_sha),
@@ -47,7 +56,7 @@ function variantFromRow(row: Row): VariantRecord {
     parentVariantId: row.parent_variant_id === null ? null : String(row.parent_variant_id),
     round: Number(row.round),
     ordinal: Number(row.ordinal),
-    hypothesis: parseJson<Hypothesis>(row.hypothesis_json),
+    hypothesis: HypothesisSchema.parse(parseJson<Hypothesis>(row.hypothesis_json)),
     status: String(row.status) as VariantStatus,
     worktreePath: row.worktree_path === null ? null : String(row.worktree_path),
     imageTag: row.image_tag === null ? null : String(row.image_tag),
@@ -84,6 +93,12 @@ function variantFromRow(row: Row): VariantRecord {
       row.execution_state_json === null
         ? null
         : parseJson<VariantExecutionState>(row.execution_state_json),
+    diagnosisStatus: String(row.diagnosis_status) as DiagnosisStatus,
+    diagnosisInputHash:
+      row.diagnosis_input_hash === null ? null : String(row.diagnosis_input_hash),
+    diagnosis:
+      row.diagnosis_json === null ? null : parseJson<DiagnosisOutput>(row.diagnosis_json),
+    diagnosisError: row.diagnosis_error === null ? null : String(row.diagnosis_error),
     error: row.error === null ? null : String(row.error),
     startedAt: row.started_at === null ? null : String(row.started_at),
     completedAt: row.completed_at === null ? null : String(row.completed_at),
@@ -106,6 +121,65 @@ function labelFromRow(row: Row): LabelRecord {
     classification: String(row.classification) as LabelRecord['classification'],
     rationale: String(row.rationale),
     status: String(row.status) as LabelRecord['status'],
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function targetExcludedLabelFromRow(row: Row): TargetExcludedLabelRecord {
+  return {
+    campaignId: String(row.campaign_id),
+    unitKey: String(row.unit_key),
+    expectedDecision: String(row.expected_decision) as TargetExcludedLabelRecord['expectedDecision'],
+    classification: String(row.classification) as TargetExcludedLabelRecord['classification'],
+    rationale: String(row.rationale),
+    status: String(row.status) as TargetExcludedLabelRecord['status'],
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function targetExcludedEvaluationFromRow(row: Row): TargetExcludedEvaluationRecord {
+  return {
+    campaignId: String(row.campaign_id),
+    variantId: String(row.variant_id),
+    status: String(row.status) as TargetExcludedEvaluationStatus,
+    controlFacts: row.control_facts_json === null ? null : parseJson<RunFacts>(row.control_facts_json),
+    controlReplicateFacts:
+      row.control_replicate_facts_json === null
+        ? null
+        : parseJson<RunFacts[]>(row.control_replicate_facts_json),
+    holdoutFacts:
+      row.holdout_facts_json === null
+        ? null
+        : parseJson<Record<string, RunFacts>>(row.holdout_facts_json),
+    holdoutReplicateFacts:
+      row.holdout_replicate_facts_json === null
+        ? null
+        : parseJson<Record<string, RunFacts[]>>(row.holdout_replicate_facts_json),
+    excludedFacts: row.excluded_facts_json === null ? null : parseJson<RunFacts>(row.excluded_facts_json),
+    excludedReplicateFacts:
+      row.excluded_replicate_facts_json === null
+        ? null
+        : parseJson<RunFacts[]>(row.excluded_replicate_facts_json),
+    judgment: row.judgment_json === null ? null : parseJson<JudgeOutput>(row.judgment_json),
+    score: row.score_json === null ? null : parseJson<Score>(row.score_json),
+    questionResolution:
+      row.question_resolution_json === null
+        ? null
+        : parseJson<BenchmarkQuestionResolution>(row.question_resolution_json),
+    executionState:
+      row.execution_state_json === null
+        ? null
+        : parseJson<VariantExecutionState>(row.execution_state_json),
+    comparisons:
+      row.comparisons_json === null
+        ? null
+        : parseJson<TargetExcludedComparison[]>(row.comparisons_json),
+    gate: row.gate_json === null ? null : parseJson<TargetExcludedGate>(row.gate_json),
+    artifactCollectionComplete: Boolean(row.artifact_collection_complete),
+    error: row.error === null ? null : String(row.error),
+    startedAt: row.started_at === null ? null : String(row.started_at),
+    completedAt: row.completed_at === null ? null : String(row.completed_at),
+    createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
 }
@@ -164,6 +238,10 @@ export class HarnessDatabase {
         score_json TEXT,
         question_resolutions_json TEXT,
         execution_state_json TEXT,
+        diagnosis_status TEXT NOT NULL DEFAULT 'not_started',
+        diagnosis_input_hash TEXT,
+        diagnosis_json TEXT,
+        diagnosis_error TEXT,
         error TEXT,
         started_at TEXT,
         completed_at TEXT,
@@ -186,6 +264,46 @@ export class HarnessDatabase {
         updated_at TEXT NOT NULL,
         PRIMARY KEY(campaign_id, benchmark, unit_key)
       );
+      CREATE TABLE IF NOT EXISTS target_excluded_configs (
+        campaign_id TEXT PRIMARY KEY REFERENCES campaigns(id),
+        config_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS target_excluded_evaluations (
+        variant_id TEXT PRIMARY KEY REFERENCES variants(id),
+        campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+        status TEXT NOT NULL,
+        control_facts_json TEXT,
+        control_replicate_facts_json TEXT,
+        holdout_facts_json TEXT,
+        holdout_replicate_facts_json TEXT,
+        excluded_facts_json TEXT,
+        excluded_replicate_facts_json TEXT,
+        judgment_json TEXT,
+        score_json TEXT,
+        question_resolution_json TEXT,
+        execution_state_json TEXT,
+        comparisons_json TEXT,
+        gate_json TEXT,
+        artifact_collection_complete INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        started_at TEXT,
+        completed_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(campaign_id, variant_id)
+      );
+      CREATE TABLE IF NOT EXISTS target_excluded_labels (
+        campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+        unit_key TEXT NOT NULL,
+        expected_decision TEXT NOT NULL,
+        classification TEXT NOT NULL,
+        rationale TEXT NOT NULL,
+        status TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(campaign_id, unit_key)
+      );
       CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         campaign_id TEXT NOT NULL REFERENCES campaigns(id),
@@ -196,6 +314,8 @@ export class HarnessDatabase {
       );
       CREATE INDEX IF NOT EXISTS variants_campaign_idx ON variants(campaign_id, ordinal);
       CREATE INDEX IF NOT EXISTS events_campaign_idx ON events(campaign_id, id);
+      CREATE INDEX IF NOT EXISTS target_excluded_evaluations_campaign_idx
+        ON target_excluded_evaluations(campaign_id, created_at);
     `);
     this.ensureColumn('campaigns', 'environment_sha', "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn('campaigns', 'workflows_remote_url', "TEXT NOT NULL DEFAULT ''");
@@ -209,6 +329,10 @@ export class HarnessDatabase {
     this.ensureColumn('variants', 'holdout_scores_json', 'TEXT');
     this.ensureColumn('variants', 'question_resolutions_json', 'TEXT');
     this.ensureColumn('variants', 'execution_state_json', 'TEXT');
+    this.ensureColumn('variants', 'diagnosis_status', "TEXT NOT NULL DEFAULT 'not_started'");
+    this.ensureColumn('variants', 'diagnosis_input_hash', 'TEXT');
+    this.ensureColumn('variants', 'diagnosis_json', 'TEXT');
+    this.ensureColumn('variants', 'diagnosis_error', 'TEXT');
     this.ensureColumn('variants', 'started_at', 'TEXT');
     this.ensureColumn('variants', 'completed_at', 'TEXT');
     this.ensureColumn('variants', 'elapsed_ms', 'INTEGER');
@@ -390,6 +514,10 @@ export class HarnessDatabase {
       score: Score | null;
       questionResolutions: Record<string, BenchmarkQuestionResolution> | null;
       executionState: VariantExecutionState | null;
+      diagnosisStatus: DiagnosisStatus;
+      diagnosisInputHash: string | null;
+      diagnosis: DiagnosisOutput | null;
+      diagnosisError: string | null;
       error: string | null;
       startedAt: string | null;
       completedAt: string | null;
@@ -417,6 +545,10 @@ export class HarnessDatabase {
       score: 'score_json',
       questionResolutions: 'question_resolutions_json',
       executionState: 'execution_state_json',
+      diagnosisStatus: 'diagnosis_status',
+      diagnosisInputHash: 'diagnosis_input_hash',
+      diagnosis: 'diagnosis_json',
+      diagnosisError: 'diagnosis_error',
       error: 'error',
       startedAt: 'started_at',
       completedAt: 'completed_at',
@@ -436,6 +568,7 @@ export class HarnessDatabase {
       'score',
       'questionResolutions',
       'executionState',
+      'diagnosis',
     ]);
     const assignments: string[] = [];
     const values: SQLInputValue[] = [];
@@ -501,7 +634,32 @@ export class HarnessDatabase {
         timestamp,
       );
     this.addEvent(label.campaignId, null, 'label.updated', { ...label, updatedAt: timestamp });
+    if (label.status === 'verified') {
+      this.markCampaignDiagnosesStale(
+        label.campaignId,
+        `Human label changed for ${label.benchmark}/${label.unitKey}.`,
+      );
+    }
     return { ...label, updatedAt: timestamp };
+  }
+
+  markCampaignDiagnosesStale(campaignId: string, reason: string): number {
+    const timestamp = now();
+    const result = this.database
+      .prepare(
+        `UPDATE variants
+         SET diagnosis_status = 'stale', diagnosis_error = ?, updated_at = ?
+         WHERE campaign_id = ?
+           AND diagnosis_status IN ('assembling', 'running', 'completed', 'failed')`,
+      )
+      .run(reason.slice(0, 20_000), timestamp, campaignId);
+    if (result.changes > 0) {
+      this.addEvent(campaignId, null, 'diagnosis.stale', {
+        reason: reason.slice(0, 2_000),
+        variants: result.changes,
+      });
+    }
+    return Number(result.changes);
   }
 
   listLabels(campaignId: string, benchmark?: string): LabelRecord[] {
@@ -513,6 +671,197 @@ export class HarnessDatabase {
           .prepare('SELECT * FROM labels WHERE campaign_id = ? ORDER BY benchmark, unit_key')
           .all(campaignId) as Row[]);
     return rows.map(labelFromRow);
+  }
+
+  createTargetExcludedConfig(campaignId: string, input: TargetExcludedConfig): TargetExcludedConfig {
+    this.getCampaign(campaignId);
+    if (this.getTargetExcludedConfig(campaignId)) {
+      throw new Error(`target-excluded protocol is already configured: ${campaignId}`);
+    }
+    const config = TargetExcludedConfigSchema.parse(input);
+    const timestamp = now();
+    this.database
+      .prepare(
+        `INSERT INTO target_excluded_configs (campaign_id, config_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(campaignId, JSON.stringify(config), timestamp, timestamp);
+    this.addEvent(campaignId, null, 'target_excluded.configured', config);
+    return config;
+  }
+
+  getTargetExcludedConfig(campaignId: string): TargetExcludedConfig | null {
+    const row = this.database
+      .prepare('SELECT config_json FROM target_excluded_configs WHERE campaign_id = ?')
+      .get(campaignId) as Row | undefined;
+    return row ? TargetExcludedConfigSchema.parse(parseJson<unknown>(row.config_json)) : null;
+  }
+
+  createTargetExcludedEvaluation(
+    campaignId: string,
+    variantId: string,
+  ): TargetExcludedEvaluationRecord {
+    const variant = this.getVariant(variantId);
+    if (variant.campaignId !== campaignId) throw new Error('variant belongs to another campaign');
+    const existing = this.getTargetExcludedEvaluation(variantId);
+    if (existing) return existing;
+    const timestamp = now();
+    this.database
+      .prepare(
+        `INSERT INTO target_excluded_evaluations
+          (variant_id, campaign_id, status, created_at, updated_at)
+         VALUES (?, ?, 'queued', ?, ?)`,
+      )
+      .run(variantId, campaignId, timestamp, timestamp);
+    this.addEvent(campaignId, variantId, 'target_excluded.created', {});
+    return this.getTargetExcludedEvaluation(variantId)!;
+  }
+
+  getTargetExcludedEvaluation(variantId: string): TargetExcludedEvaluationRecord | null {
+    const row = this.database
+      .prepare('SELECT * FROM target_excluded_evaluations WHERE variant_id = ?')
+      .get(variantId) as Row | undefined;
+    return row ? targetExcludedEvaluationFromRow(row) : null;
+  }
+
+  listTargetExcludedEvaluations(campaignId: string): TargetExcludedEvaluationRecord[] {
+    return (
+      this.database
+        .prepare('SELECT * FROM target_excluded_evaluations WHERE campaign_id = ? ORDER BY created_at')
+        .all(campaignId) as Row[]
+    ).map(targetExcludedEvaluationFromRow);
+  }
+
+  updateTargetExcludedEvaluation(
+    variantId: string,
+    changes: Partial<
+      Pick<
+        TargetExcludedEvaluationRecord,
+        | 'status'
+        | 'controlFacts'
+        | 'controlReplicateFacts'
+        | 'holdoutFacts'
+        | 'holdoutReplicateFacts'
+        | 'excludedFacts'
+        | 'excludedReplicateFacts'
+        | 'judgment'
+        | 'score'
+        | 'questionResolution'
+        | 'executionState'
+        | 'comparisons'
+        | 'gate'
+        | 'artifactCollectionComplete'
+        | 'error'
+        | 'startedAt'
+        | 'completedAt'
+      >
+    >,
+  ): TargetExcludedEvaluationRecord {
+    const columns: Record<string, string> = {
+      status: 'status',
+      controlFacts: 'control_facts_json',
+      controlReplicateFacts: 'control_replicate_facts_json',
+      holdoutFacts: 'holdout_facts_json',
+      holdoutReplicateFacts: 'holdout_replicate_facts_json',
+      excludedFacts: 'excluded_facts_json',
+      excludedReplicateFacts: 'excluded_replicate_facts_json',
+      judgment: 'judgment_json',
+      score: 'score_json',
+      questionResolution: 'question_resolution_json',
+      executionState: 'execution_state_json',
+      comparisons: 'comparisons_json',
+      gate: 'gate_json',
+      artifactCollectionComplete: 'artifact_collection_complete',
+      error: 'error',
+      startedAt: 'started_at',
+      completedAt: 'completed_at',
+    };
+    const scalar = new Set(['status', 'error', 'startedAt', 'completedAt']);
+    const assignments: string[] = [];
+    const values: SQLInputValue[] = [];
+    for (const [key, value] of Object.entries(changes)) {
+      const column = columns[key];
+      if (!column) continue;
+      assignments.push(`${column} = ?`);
+      values.push(
+        value === null
+          ? null
+          : key === 'artifactCollectionComplete'
+            ? value
+              ? 1
+              : 0
+            : scalar.has(key)
+              ? String(value)
+              : JSON.stringify(value),
+      );
+    }
+    if (assignments.length === 0) return this.getTargetExcludedEvaluation(variantId)!;
+    assignments.push('updated_at = ?');
+    values.push(now(), variantId);
+    this.database
+      .prepare(`UPDATE target_excluded_evaluations SET ${assignments.join(', ')} WHERE variant_id = ?`)
+      .run(...values);
+    const evaluation = this.getTargetExcludedEvaluation(variantId);
+    if (!evaluation) throw new Error(`target-excluded evaluation not found: ${variantId}`);
+    this.addEvent(evaluation.campaignId, variantId, 'target_excluded.updated', changes);
+    return evaluation;
+  }
+
+  updateTargetExcludedExecution(
+    variantId: string,
+    input: Parameters<typeof mergeExecutionSnapshot>[1],
+  ): TargetExcludedEvaluationRecord {
+    const evaluation = this.getTargetExcludedEvaluation(variantId);
+    if (!evaluation) throw new Error(`target-excluded evaluation not found: ${variantId}`);
+    const executionState = mergeExecutionSnapshot(evaluation.executionState, input);
+    if (JSON.stringify(executionState) === JSON.stringify(evaluation.executionState)) return evaluation;
+    return this.updateTargetExcludedEvaluation(variantId, { executionState });
+  }
+
+  upsertTargetExcludedLabel(
+    label: Omit<TargetExcludedLabelRecord, 'updatedAt'>,
+  ): TargetExcludedLabelRecord {
+    const timestamp = now();
+    this.database
+      .prepare(
+        `INSERT INTO target_excluded_labels
+          (campaign_id, unit_key, expected_decision, classification, rationale, status, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(campaign_id, unit_key) DO UPDATE SET
+          expected_decision = excluded.expected_decision,
+          classification = excluded.classification,
+          rationale = excluded.rationale,
+          status = excluded.status,
+          updated_at = excluded.updated_at`,
+      )
+      .run(
+        label.campaignId,
+        label.unitKey,
+        label.expectedDecision,
+        label.classification,
+        label.rationale,
+        label.status,
+        timestamp,
+      );
+    this.addEvent(label.campaignId, null, 'target_excluded.label_updated', {
+      ...label,
+      updatedAt: timestamp,
+    });
+    if (label.status === 'verified') {
+      this.markCampaignDiagnosesStale(
+        label.campaignId,
+        `Human target-excluded label changed for ${label.unitKey}.`,
+      );
+    }
+    return { ...label, updatedAt: timestamp };
+  }
+
+  listTargetExcludedLabels(campaignId: string): TargetExcludedLabelRecord[] {
+    return (
+      this.database
+        .prepare('SELECT * FROM target_excluded_labels WHERE campaign_id = ? ORDER BY unit_key')
+        .all(campaignId) as Row[]
+    ).map(targetExcludedLabelFromRow);
   }
 
   addEvent(

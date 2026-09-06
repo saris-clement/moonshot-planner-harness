@@ -14,9 +14,12 @@ function usage(): never {
   process.stderr.write(`Usage:
   npm run cli -- init --config <campaign.json>
   npm run cli -- baseline <campaign-id>
+  npm run cli -- diagnose <campaign-id> <variant-id>
   npm run cli -- round <campaign-id>
   npm run cli -- auto <campaign-id>
   npm run cli -- promote <campaign-id> <variant-id>
+  npm run cli -- target-config <campaign-id> <baseline-variant-id> <client/workflow>
+  npm run cli -- target-run <campaign-id> <variant-id>
   npm run cli -- serve [--port 4173]
 `);
   process.exit(2);
@@ -49,6 +52,16 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === 'diagnose') {
+    const campaignId = arguments_[1];
+    const variantId = arguments_[2];
+    if (!campaignId || !variantId) usage();
+    const variant = await orchestrator.diagnoseVariant(campaignId, variantId);
+    process.stdout.write(`${JSON.stringify(variant, null, 2)}\n`);
+    database.close();
+    return;
+  }
+
   if (command === 'round' || command === 'auto') {
     const campaignId = arguments_[1];
     if (!campaignId) usage();
@@ -65,6 +78,31 @@ async function main(): Promise<void> {
     if (!campaignId || !variantId) usage();
     const variant = await orchestrator.promote(campaignId, variantId);
     process.stdout.write(`${JSON.stringify(variant, null, 2)}\n`);
+    database.close();
+    return;
+  }
+
+  if (command === 'target-config') {
+    const campaignId = arguments_[1];
+    const baselineVariantId = arguments_[2];
+    const targetWorkflow = arguments_[3];
+    if (!campaignId || !baselineVariantId || !targetWorkflow) usage();
+    const config = await orchestrator.configureTargetExcluded(
+      campaignId,
+      baselineVariantId,
+      targetWorkflow,
+    );
+    process.stdout.write(`${JSON.stringify(config, null, 2)}\n`);
+    database.close();
+    return;
+  }
+
+  if (command === 'target-run') {
+    const campaignId = arguments_[1];
+    const variantId = arguments_[2];
+    if (!campaignId || !variantId) usage();
+    const evaluation = await orchestrator.runTargetExcluded(campaignId, variantId);
+    process.stdout.write(`${JSON.stringify(evaluation, null, 2)}\n`);
     database.close();
     return;
   }
