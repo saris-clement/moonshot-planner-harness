@@ -1,0 +1,672 @@
+import { once } from 'node:events';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import type { Server } from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import { expect, test } from '@playwright/test';
+import { HarnessDatabase } from '../src/db.js';
+import { computeScore, consensusRunFacts, extractRunFacts } from '../src/metrics.js';
+import { CampaignOrchestrator } from '../src/orchestrator.js';
+import type { HarnessPaths } from '../src/paths.js';
+import { runCommand } from '../src/process.js';
+import { startDashboard } from '../src/server.js';
+import type { JudgeOutput, PlannerUsage, RunFacts, VariantExecution } from '../src/types.js';
+
+test.describe.configure({ mode: 'serial' });
+
+let root: string;
+let plannerRepo: string;
+let workflowsRepo: string;
+let environmentFile: string;
+let primaryZip: string;
+let holdoutZip: string;
+let seedSha: string;
+let workflowsSha: string;
+let paths: HarnessPaths;
+let database: HarnessDatabase;
+let orchestrator: CampaignOrchestrator;
+let server: Server;
+let baseUrl: string;
+
+const campaignId = 'ui-e2e';
+const baselineId = 'ui-e2e-v000';
+const liveId = 'ui-e2e-v001';
+const reviewId = 'ui-e2e-v002';
+
+async function gitFixture(directory: string, remote = false): Promise<string> {
+  await mkdir(directory, { recursive: true });
+  await writeFile(path.join(directory, 'README.md'), 'fixture\n');
+  await runCommand('git', ['init'], { cwd: directory });
+  await runCommand('git', ['add', '.'], { cwd: directory });
+  await runCommand(
+    'git',
+    ['-c', 'user.name=Harness E2E', '-c', 'user.email=harness@example.invalid', 'commit', '-m', 'fixture'],
+    { cwd: directory },
+  );
+  if (remote) {
+    await runCommand('git', ['remote', 'add', 'origin', 'git@github.com:Saris-AI/workflows.git'], {
+      cwd: directory,
+    });
+  }
+  return (await runCommand('git', ['rev-parse', 'HEAD'], { cwd: directory })).stdout.trim();
+}
+
+function runFacts(usage: PlannerUsage, decision: 'build' | 'reuse' = 'build'): RunFacts {
+  const sourceRefs = decision === 'reuse' ? [{ path: 'src/shared/account.ts', symbol: 'accountId' }] : [];
+  return extractRunFacts(
+    {
+      analysis: {
+        requirementUnits: [
+          {
+            id: 'unit-a',
+            ref: { entity: 'workflow', anchor: 'capture-a' },
+            kind: 'field',
+            semantics: JSON.stringify({
+              kind: 'field',
+              payload: { required: true, source: 'account record' },
+              summary: 'Capture the verified account identifier.',
+              title: 'Account identifier',
+            }),
+          },
+        ],
+        adjudications: [
+          {
+            requirementUnitId: 'unit-a',
+            result: decision,
+            confidence: 'high',
+            rationale:
+              decision === 'build'
+                ? 'Frozen source contains no eligible implementation.'
+                : 'Frozen source exposes the canonical identifier.',
+            selectedCandidateIds: decision === 'reuse' ? ['account-id'] : [],
+            sourceRefs,
+            discoveredEvidence: sourceRefs,
+            uncoveredSemantics: decision === 'build' ? ['Capture account identifier'] : [],
+            shortlist: { candidates: decision === 'reuse' ? [{ id: 'account-id' }] : [] },
+          },
+        ],
+      },
+    },
+    { runtime: { status: 'completed', pins: { sourceCommit: workflowsSha }, aggregateUsage: usage } },
+  );
+}
+
+const primaryUsage = (): PlannerUsage => ({
+  calls: 1,
+  inputTokens: 100,
+  outputTokens: 20,
+  totalTokens: 120,
+  costUsd: 0.25,
+  durationMs: 1_500,
+});
+
+const holdoutUsage = (): PlannerUsage => ({
+  calls: 1,
+  inputTokens: 80,
+  outputTokens: 20,
+  totalTokens: 100,
+  costUsd: 0.2,
+  durationMs: 1_000,
+});
+
+function execution(input: {
+  benchmark: string;
+  role: 'primary' | 'holdout';
+  replicate: number;
+  status?: string;
+  stage?: string;
+  elapsedMs?: number;
+  usage?: PlannerUsage;
+  questions?: VariantExecution['questions'];
+  completedUnits?: number;
+  totalUnits?: number;
+  decisions?: VariantExecution['decisions'];
+}): VariantExecution {
+  const completed = (input.status ?? 'completed') === 'completed';
+  const elapsedMs = input.elapsedMs ?? 2_000;
+  return {
+    benchmark: input.benchmark,
+    role: input.role,
+    replicate: input.replicate,
+    replicateCount: 3,
+    caseId: `case-${input.benchmark}-${input.replicate}`,
+    runId: `run-${input.benchmark}-${input.replicate}`,
+    status: input.status ?? 'completed',
+    stage: input.stage ?? (completed ? 'completed' : 'adjudicating'),
+    progress: {
+      completedUnits: input.completedUnits ?? (completed ? 1 : 0),
+      totalUnits: input.totalUnits ?? 1,
+    },
+    decisions: input.decisions ?? { build: completed ? 1 : 0, reuse: 0, extend: 0, defer: 0, question: 0 },
+    questions: input.questions ?? [],
+    startedAt: completed
+      ? '2026-09-06T05:00:00.000Z'
+      : new Date(Date.now() - elapsedMs).toISOString(),
+    completedAt: completed ? '2026-09-06T05:00:02.000Z' : null,
+    elapsedMs,
+    usage: input.usage ?? (input.role === 'primary' ? primaryUsage() : holdoutUsage()),
+    updatedAt: completed ? '2026-09-06T05:00:02.000Z' : '2026-09-06T05:01:00.000Z',
+  };
+}
+
+async function seedCampaign(): Promise<void> {
+  const campaign = await orchestrator.initializeFromInput({
+    id: campaignId,
+    goal: 'Validate source-backed Phase 2 experiment results through a routed research console.',
+    plannerRepo,
+    workflowsRepo,
+    environmentFile,
+    seedRevision: seedSha,
+    workflowsRevision: workflowsSha,
+    benchmarks: [
+      { name: 'primary-pack', role: 'primary', zipPath: primaryZip },
+      { name: 'holdout-pack', role: 'holdout', zipPath: holdoutZip },
+    ],
+    mode: 'supervised',
+    evaluation: { replicates: 3, replicateConcurrency: 2 },
+    limits: { concurrency: 3, maxVariants: 9 },
+  });
+  const judgment: JudgeOutput = {
+    summary: 'The source inspection supports a genuine build gap.',
+    verdicts: [
+      {
+        unitKey: 'unit-a',
+        expectedDecision: 'build',
+        classification: 'real_gap',
+        confidence: 'high',
+        rationale: 'No existing source behavior captures this identifier.',
+        evidence: ['src/shared/account.ts: absent after source search'],
+      },
+    ],
+  };
+  database.upsertLabel({
+    campaignId,
+    benchmark: 'primary-pack',
+    unitKey: 'unit-a',
+    expectedDecision: 'build',
+    classification: 'real_gap',
+    rationale: judgment.verdicts[0]!.rationale,
+    status: 'suggested',
+  });
+
+  const primaryReplicates = [runFacts(primaryUsage()), runFacts(primaryUsage()), runFacts(primaryUsage())];
+  const holdoutReplicates = [runFacts(holdoutUsage(), 'reuse'), runFacts(holdoutUsage(), 'reuse'), runFacts(holdoutUsage(), 'reuse')];
+  const baselineFacts = consensusRunFacts(primaryReplicates);
+  const baselineHoldout = consensusRunFacts(holdoutReplicates);
+  const baseline = database.createVariant({
+    id: baselineId,
+    campaignId,
+    parentVariantId: null,
+    round: 0,
+    ordinal: 0,
+    hypothesis: {
+      title: 'Seed observation',
+      rationale: 'Establish a factual baseline.',
+      instructions: 'No changes.',
+      expectedImpact: 'One reviewed source gap.',
+      risk: 'Provider variance.',
+    },
+  });
+  database.updateVariant(baseline.id, {
+    status: 'completed',
+    artifactCollectionComplete: true,
+    facts: baselineFacts,
+    replicateFacts: primaryReplicates,
+    holdoutFacts: { 'holdout-pack': baselineHoldout },
+    holdoutReplicateFacts: { 'holdout-pack': holdoutReplicates },
+    judgment,
+    holdoutJudgments: { 'holdout-pack': judgment },
+    score: computeScore(baselineFacts, database.listLabels(campaignId, 'primary-pack'), judgment),
+    holdoutScores: {
+      'holdout-pack': computeScore(baselineHoldout, [], judgment),
+    },
+    startedAt: '2026-09-06T05:00:00.000Z',
+    completedAt: '2026-09-06T05:00:20.000Z',
+    elapsedMs: 20_000,
+    phase2StartedAt: '2026-09-06T05:00:03.000Z',
+    phase2CompletedAt: '2026-09-06T05:00:18.000Z',
+    phase2ElapsedMs: 15_000,
+    executionState: {
+      executions: [
+        execution({
+          benchmark: 'primary-pack',
+          role: 'primary',
+          replicate: 1,
+          questions: [
+            {
+              id: 'duplicate-question',
+              type: 'target_scope',
+              ownerRole: 'product',
+              priority: 'blocking',
+              prompt: 'Which primary account identifier format should be used?',
+              rationale: 'The primary pack does not define presentation.',
+              status: 'answered',
+              answer: 'Use the canonical source-backed identifier.',
+              resolution: 'source_fallback',
+              evidence: ['src/shared/account.ts:12'],
+              createdAt: '2026-09-06T04:58:00.000Z',
+              updatedAt: '2026-09-06T04:59:00.000Z',
+            },
+          ],
+        }),
+        execution({ benchmark: 'primary-pack', role: 'primary', replicate: 2 }),
+        execution({ benchmark: 'primary-pack', role: 'primary', replicate: 3 }),
+        execution({
+          benchmark: 'holdout-pack',
+          role: 'holdout',
+          replicate: 1,
+          questions: [
+            {
+              id: 'duplicate-question',
+              type: 'target_scope',
+              ownerRole: 'product',
+              priority: 'blocking',
+              prompt: 'Which holdout identifier format should be used?',
+              rationale: 'The holdout pack uses an independent source.',
+              status: 'answered',
+              answer: 'Use the holdout canonical identifier.',
+              resolution: 'requirements_agent',
+              evidence: ['src/holdout/id.ts:8'],
+              createdAt: '2026-09-06T04:58:30.000Z',
+              updatedAt: '2026-09-06T04:59:30.000Z',
+            },
+          ],
+        }),
+        execution({ benchmark: 'holdout-pack', role: 'holdout', replicate: 2 }),
+        execution({ benchmark: 'holdout-pack', role: 'holdout', replicate: 3 }),
+      ],
+    },
+  });
+
+  const livePrimary = runFacts(primaryUsage());
+  const liveHoldout = runFacts(holdoutUsage(), 'reuse');
+  const live = database.createVariant({
+    id: liveId,
+    campaignId,
+    parentVariantId: baselineId,
+    round: 1,
+    ordinal: 1,
+    hypothesis: {
+      title: 'Live source policy',
+      rationale: 'Exercise stable checkpoint projection.',
+      instructions: 'Prefer source-backed reuse.',
+      expectedImpact: 'More source-backed decisions.',
+      risk: 'Partial output may change.',
+    },
+  });
+  database.updateVariant(live.id, {
+    status: 'running',
+    replicateFacts: [livePrimary],
+    holdoutReplicateFacts: { 'holdout-pack': [liveHoldout] },
+    startedAt: new Date(Date.now() - 10_000).toISOString(),
+    phase2StartedAt: new Date(Date.now() - 8_000).toISOString(),
+    executionState: {
+      executions: [
+        execution({ benchmark: 'primary-pack', role: 'primary', replicate: 1, elapsedMs: 2_500 }),
+        execution({
+          benchmark: 'primary-pack',
+          role: 'primary',
+          replicate: 2,
+          status: 'running',
+          stage: 'adjudicating',
+          elapsedMs: 4_000,
+          completedUnits: 2,
+          totalUnits: 5,
+          decisions: { build: 1, reuse: 1, extend: 0, defer: 0, question: 0 },
+          usage: {
+            calls: 2,
+            inputTokens: 500,
+            outputTokens: 100,
+            totalTokens: 600,
+            costUsd: 0.5,
+            durationMs: 3_000,
+          },
+        }),
+        execution({ benchmark: 'holdout-pack', role: 'holdout', replicate: 1, elapsedMs: 1_800 }),
+      ],
+    },
+  });
+
+  const review = database.createVariant({
+    id: reviewId,
+    campaignId,
+    parentVariantId: baselineId,
+    round: 1,
+    ordinal: 2,
+    hypothesis: {
+      title: 'Candidate source guard',
+      rationale: 'Keep generic source eligibility explicit.',
+      instructions: 'Add a bounded source guard.',
+      expectedImpact: 'Reduce unsupported reuse.',
+      risk: 'May reject a valid candidate.',
+    },
+  });
+  database.updateVariant(review.id, {
+    status: 'review',
+    facts: baselineFacts,
+    replicateFacts: primaryReplicates,
+    holdoutFacts: { 'holdout-pack': baselineHoldout },
+    holdoutReplicateFacts: { 'holdout-pack': holdoutReplicates },
+    judgment,
+    score: computeScore(baselineFacts, database.listLabels(campaignId, 'primary-pack'), judgment),
+    elapsedMs: 18_000,
+    phase2ElapsedMs: 13_000,
+    executionState: baseline.executionState,
+  });
+
+  database.updateCampaign(campaign.id, {
+    status: 'running_round',
+    currentParentVariantId: baseline.id,
+  });
+  const artifactRoot = path.join(paths.artifacts, campaignId, baselineId);
+  await mkdir(artifactRoot, { recursive: true });
+  await writeFile(path.join(artifactRoot, 'planner-output.json'), '{"status":"completed"}\n');
+  await orchestrator.refreshReports(campaignId);
+}
+
+test.beforeAll(async () => {
+  root = await mkdtemp(path.join(os.tmpdir(), 'planner-eval-ui-'));
+  plannerRepo = path.join(root, 'planner');
+  workflowsRepo = path.join(root, 'workflows');
+  [seedSha, workflowsSha] = await Promise.all([
+    gitFixture(plannerRepo),
+    gitFixture(workflowsRepo, true),
+  ]);
+  environmentFile = path.join(root, 'planner.env');
+  primaryZip = path.join(root, 'primary.zip');
+  holdoutZip = path.join(root, 'holdout.zip');
+  await Promise.all([
+    writeFile(environmentFile, 'OPENAI_MODEL=gpt-5.6-sol\n'),
+    writeFile(primaryZip, Buffer.concat([Buffer.from('PK\u0003\u0004'), Buffer.from('primary requirements')])),
+    writeFile(holdoutZip, Buffer.concat([Buffer.from('PK\u0003\u0004'), Buffer.from('holdout requirements')])),
+  ]);
+  const data = path.join(root, 'data');
+  paths = {
+    root: data,
+    database: path.join(data, 'harness.sqlite'),
+    campaigns: path.join(data, 'campaigns'),
+    worktrees: path.join(data, 'worktrees'),
+    artifacts: path.join(data, 'artifacts'),
+    reports: path.join(root, 'docs/experiments'),
+  };
+  await mkdir(data);
+  database = new HarnessDatabase(paths.database);
+  orchestrator = new CampaignOrchestrator(paths, database);
+  await seedCampaign();
+  server = startDashboard({
+    port: 0,
+    publicDirectory: path.resolve(process.cwd(), 'public'),
+    database,
+    orchestrator,
+  });
+  await once(server, 'listening');
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('dashboard did not bind');
+  baseUrl = `http://127.0.0.1:${address.port}`;
+});
+
+test.afterAll(async () => {
+  await new Promise<void>((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  database.close();
+  await rm(root, { recursive: true, force: true });
+});
+
+test('serves valid HTML deep links and never falls back for APIs or extensions', async ({ request }) => {
+  const deepLink = await request.get(`${baseUrl}/campaigns/${campaignId}/experiments/${baselineId}?tab=runs`);
+  expect(deepLink.status()).toBe(200);
+  expect(deepLink.headers()['content-type']).toContain('text/html');
+  expect(await deepLink.text()).toContain('<div id="app">');
+
+  const head = await request.fetch(`${baseUrl}/campaigns/${campaignId}/review/${baselineId}`, { method: 'HEAD' });
+  expect(head.status()).toBe(200);
+  expect(await head.body()).toHaveLength(0);
+
+  const invalidFile = await request.get(`${baseUrl}/campaigns/${campaignId}/overview.js`);
+  expect(invalidFile.status()).toBe(404);
+  expect(invalidFile.headers()['content-type']).toContain('application/json');
+  const invalidApi = await request.get(`${baseUrl}/api/not-a-route`);
+  expect(invalidApi.status()).toBe(404);
+  const nonHtmlDeepLink = await request.get(`${baseUrl}/campaigns/${campaignId}/overview`, {
+    headers: { Accept: 'application/json' },
+  });
+  expect(nonHtmlDeepLink.status()).toBe(404);
+});
+
+test('refreshes a deep-linked overview with completed, live, and pending replicate telemetry', async ({ page }) => {
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/overview`);
+  await page.reload();
+  await expect(page).toHaveURL(`${baseUrl}/campaigns/${campaignId}/overview`);
+  await expect(page.getByRole('heading', { name: 'ui e2e' })).toBeVisible();
+
+  const active = page.getByTestId(`active-variant-${liveId}`);
+  await expect(active).toBeVisible();
+  await expect(active.locator('[data-replicate-state="completed"]')).toHaveCount(2);
+  await expect(active.locator('[data-replicate-state="current"]')).toHaveCount(1);
+  await expect(active.locator('[data-replicate-state="pending"]')).toHaveCount(3);
+
+  const running = page.getByTestId(`replicate-${liveId}-primary-pack-2`);
+  await expect(active.locator('th').first()).toHaveCSS('position', 'sticky');
+  await expect(running.locator('td').first()).toHaveCSS('position', 'sticky');
+  const replicateScroll = active.locator('.replicate-table-wrap');
+  await replicateScroll.evaluate((element) => { element.scrollLeft = 500; });
+  const [scrollBox, firstCellBox] = await Promise.all([
+    replicateScroll.boundingBox(),
+    running.locator('td').first().boundingBox(),
+  ]);
+  expect(Math.abs((firstCellBox?.x ?? 0) - (scrollBox?.x ?? 0))).toBeLessThan(2);
+  await expect(running.getByRole('progressbar')).toHaveAttribute('value', '2');
+  await expect(running).toContainText('2 / 5');
+  await expect(running).toContainText('B 1 · R 1 · E 0');
+  await expect(running).toContainText(/4\.\d s/);
+  await expect(running).toContainText('3.0 s');
+  await expect(running).toContainText('500');
+  await expect(running).toContainText('100');
+  await expect(running).toContainText('600');
+  await expect(running).toContainText('$0.50');
+
+  const pending = page.getByTestId(`replicate-${liveId}-primary-pack-3`);
+  await expect(pending).toContainText('—');
+  await expect(pending).not.toContainText('$0.00');
+  await expect(active.getByLabel('Experiment timing and planner usage')).toContainText('820 incl. reasoning');
+  await expect(active.getByLabel('Experiment timing and planner usage')).toContainText('$0.95');
+  await expect(active.locator('dt', { hasText: 'End-to-end' }).locator('..').locator('dd')).toContainText('s');
+  await expect(active.locator('dt', { hasText: 'Phase 2' }).locator('..').locator('dd')).toContainText('s');
+  const trace = running.getByRole('link', { name: 'Trace' });
+  expect(new URL((await trace.getAttribute('href'))!).searchParams.get('filter')).toBe(
+    'traceTags;arrayOptions;;any of;case%3Acase-primary-pack-2',
+  );
+});
+
+test('uses History API navigation and URL-synchronized experiment filters', async ({ page }) => {
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/overview`);
+  await page.getByRole('link', { name: 'Experiments' }).click();
+  await expect(page).toHaveURL(`${baseUrl}/campaigns/${campaignId}/experiments`);
+  await page.getByRole('link', { name: 'Lineage' }).click();
+  await expect(page).toHaveURL(`${baseUrl}/campaigns/${campaignId}/lineage`);
+  await page.goBack();
+  await expect(page).toHaveURL(`${baseUrl}/campaigns/${campaignId}/experiments`);
+  await page.goForward();
+  await expect(page).toHaveURL(`${baseUrl}/campaigns/${campaignId}/lineage`);
+
+  await page.getByRole('link', { name: 'Experiments' }).click();
+  await page.getByLabel('Search experiments', { exact: true }).fill('Live source policy');
+  await expect(page).toHaveURL(/q=Live\+source\+policy/);
+  await page.locator('#filter-status').selectOption('active');
+  await expect(page).toHaveURL(/status=active/);
+  await expect(page.locator('.filter-rail .filter-count')).toHaveText('2');
+  await expect(page.getByTestId(`experiment-row-${liveId}`)).toBeVisible();
+  await expect(page.getByTestId(`experiment-row-${baselineId}`)).toHaveCount(0);
+  await page.locator('.filter-rail').getByRole('button', { name: 'Clear filters' }).click();
+  await expect(page).toHaveURL(`${baseUrl}/campaigns/${campaignId}/experiments`);
+  await expect(page.locator('[data-testid^="experiment-row-"]')).toHaveCount(3);
+
+  await page.locator('#filter-sort').selectOption('tokens');
+  await expect(page.locator('.filter-rail .filter-count')).toHaveText('1');
+  await expect(page.locator('.filter-rail').getByRole('button', { name: 'Clear filters' })).toBeEnabled();
+  await page.locator('.filter-rail').getByRole('button', { name: 'Clear filters' }).click();
+
+  await page.locator('#filter-lineage').selectOption('current-candidates');
+  await expect(page).toHaveURL(/lineage=current-candidates/);
+  await expect(page.getByTestId(`experiment-row-${liveId}`)).toBeVisible();
+  await expect(page.getByTestId(`experiment-row-${reviewId}`)).toBeVisible();
+  await expect(page.getByTestId(`experiment-row-${baselineId}`)).toHaveCount(0);
+});
+
+test('shows dependency connectors, truthful lineage cards, and an equivalent list', async ({ page }) => {
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/lineage`);
+  const graph = page.getByTestId('lineage-graph');
+  await expect(graph).toBeVisible();
+  await expect(graph.locator('.lineage-card')).toHaveCount(3);
+  await expect(graph.locator('.connector')).toHaveCount(2);
+  await expect(graph.locator('.connector').first()).toHaveAttribute('d', /M [1-9]/);
+  await expect(graph.locator('.current-path')).toHaveCount(1);
+  await expect(graph).toContainText('Sibling rank');
+  await expect(graph).toContainText('Verified');
+  await expect(graph).toContainText('Provisional');
+  await expect(graph).toContainText('Agreement');
+  await expect(graph).not.toContainText('Composite');
+
+  await page.getByRole('button', { name: 'List' }).click();
+  await expect(page).toHaveURL(/view=list/);
+  await expect(page.getByTestId('lineage-list').locator('.lineage-card')).toHaveCount(3);
+});
+
+test('isolates duplicate question IDs by benchmark and replicate and serves artifacts', async ({ page }) => {
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${baselineId}?tab=runs`);
+  await expect(page.getByRole('heading', { name: 'Seed observation' })).toBeVisible();
+  await expect(page.getByLabel('Experiment timing and planner usage').first()).toContainText('20 s');
+  await expect(page.getByLabel('Experiment timing and planner usage').first()).toContainText('15 s');
+  await expect(page.getByLabel('Experiment timing and planner usage').first()).toContainText('660 incl. reasoning');
+
+  await page.getByRole('link', { name: /Questions/ }).click();
+  await expect(page.locator('[data-question-scope$=":duplicate-question"]')).toHaveCount(2);
+  await expect(page.getByText('Which primary account identifier format should be used?')).toBeVisible();
+  await expect(page.getByText('Which holdout identifier format should be used?')).toBeVisible();
+
+  await page.getByRole('link', { name: 'Artifacts' }).click();
+  const reportLink = page.getByRole('link', { name: 'Open experiment Markdown' });
+  await expect(reportLink).toBeVisible();
+  await expect(page.getByRole('link', { name: /planner-output.json/ })).toBeVisible();
+  const report = await page.request.get(`${baseUrl}${await reportLink.getAttribute('href')}`);
+  expect(report.ok()).toBe(true);
+  expect(await report.text()).toContain('## Actual Facts');
+
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${reviewId}`);
+  await expect(page.getByRole('button', { name: 'Promote experiment' })).toHaveCount(0);
+});
+
+test('retains a central dirty review draft across SSE and guards navigation before save', async ({ page }) => {
+  await page.goto(
+    `${baseUrl}/campaigns/${campaignId}/review/${baselineId}?benchmark=primary-pack&filter=all`,
+  );
+  const unitRow = page.getByRole('row', { name: /Capture the verified account identifier/ });
+  await unitRow.getByRole('button').click();
+  await expect(page).toHaveURL(/benchmark=primary-pack&filter=all&unit=unit-a/);
+  await expect(page.getByText('No existing source behavior captures this identifier.')).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'capture-a' })).toHaveCSS('overflow-wrap', 'anywhere');
+  await page.getByRole('button', { name: 'Copy unit anchor' }).click();
+  await expect(page.getByText('Unit anchor copied')).toBeVisible();
+  const requirementJson = page.getByRole('figure', { name: 'Requirement JSON' });
+  await expect(requirementJson).toBeVisible();
+  await expect(requirementJson.getByText('"kind"')).toBeVisible();
+  await expect(requirementJson.getByText('"field"')).toBeVisible();
+  await expect(requirementJson).not.toContainText('{null');
+  const payloadToggle = requirementJson.getByLabel('Toggle payload');
+  await expect(payloadToggle.locator('..')).toHaveAttribute('open', '');
+  await payloadToggle.click();
+  await expect(payloadToggle.locator('..')).not.toHaveAttribute('open');
+  const reviewLayout = await page.evaluate<{
+    detailHeight: number;
+    detailOverflow: string;
+    listHeight: number;
+    listOverflow: string;
+    pageClientHeight: number;
+    pageScrollHeight: number;
+  }>(`(() => {
+    const detail = document.querySelector('.review-detail');
+    const list = document.querySelector('.review-unit-list');
+    return {
+      detailHeight: detail.clientHeight,
+      detailOverflow: getComputedStyle(detail).overflowY,
+      listHeight: list.clientHeight,
+      listOverflow: getComputedStyle(list).overflowY,
+      pageClientHeight: document.documentElement.clientHeight,
+      pageScrollHeight: document.documentElement.scrollHeight,
+    };
+  })()`);
+  expect(reviewLayout.pageScrollHeight).toBe(reviewLayout.pageClientHeight);
+  expect(reviewLayout.detailOverflow).toBe('auto');
+  expect(reviewLayout.listOverflow).toBe('auto');
+  expect(Math.abs(reviewLayout.detailHeight - reviewLayout.listHeight)).toBeLessThanOrEqual(1);
+  const rationale = page.getByLabel('Human rationale');
+  await rationale.fill('Reviewed source confirms this remains a real implementation gap.');
+
+  database.updateVariant(liveId, { elapsedMs: 5_000 });
+  await expect(rationale).toHaveValue(
+    'Reviewed source confirms this remains a real implementation gap.',
+    { timeout: 5_000 },
+  );
+  await expect(rationale).toBeFocused();
+
+  page.once('dialog', (dialog) => dialog.dismiss());
+  await page.getByRole('link', { name: 'Overview' }).click();
+  await expect(page).toHaveURL(/\/review\//);
+  await expect(rationale).toHaveValue('Reviewed source confirms this remains a real implementation gap.');
+
+  await page.getByRole('button', { name: 'Save verified truth' }).click();
+  await expect(page.getByText('Verified label saved')).toBeVisible();
+  expect(database.listLabels(campaignId, 'primary-pack')[0]?.status).toBe('verified');
+  await page.getByRole('link', { name: 'Overview' }).click();
+  await expect(page).toHaveURL(`${baseUrl}/campaigns/${campaignId}/overview`);
+});
+
+test('provides a mobile drawer, defaults lineage to list, and preserves campaign creation', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(
+    `${baseUrl}/campaigns/${campaignId}/review/${baselineId}?benchmark=primary-pack&filter=all&unit=unit-a`,
+  );
+  await expect(page.getByRole('figure', { name: 'Requirement JSON' })).toBeVisible();
+  expect(await page.evaluate<number>('document.documentElement.scrollWidth')).toBe(390);
+
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/lineage`);
+  await expect(page.getByTestId('lineage-list')).toBeVisible();
+  await page.getByRole('button', { name: 'Open navigation' }).click();
+  await expect(page.getByRole('navigation', { name: 'Campaign navigation' })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('button', { name: 'Open navigation' })).toBeFocused();
+  await page.getByRole('button', { name: 'Open navigation' }).click();
+  await page.getByRole('link', { name: 'Experiments' }).click();
+  await expect(page).toHaveURL(`${baseUrl}/campaigns/${campaignId}/experiments`);
+  await page.locator('details.mobile-filters summary').click();
+  await expect(page.getByLabel('Mobile Search experiments')).toBeVisible();
+
+  await page.goto(`${baseUrl}/campaigns/new`);
+  await page.getByLabel('Campaign ID').fill('created-in-ui');
+  await page
+    .getByLabel('Research goal')
+    .fill('Validate that routed campaign creation still freezes every required local input.');
+  await page.getByLabel('Planner repository').fill(plannerRepo);
+  await page.getByLabel('Workflows repository').fill(workflowsRepo);
+  await page.getByLabel('Planner environment file').fill(environmentFile);
+  await page.getByLabel('Planner seed revision').fill(seedSha);
+  await page.getByLabel('Workflows revision').fill(workflowsSha);
+  await page.getByLabel('Primary requirements ZIP').setInputFiles(primaryZip);
+  await page.getByLabel('Holdout requirements ZIP').setInputFiles(holdoutZip);
+  await page.getByRole('button', { name: 'Create frozen campaign' }).click();
+  await expect(page).toHaveURL(`${baseUrl}/campaigns/created-in-ui/overview`);
+  await expect(page.getByRole('heading', { name: 'created in ui' })).toBeVisible();
+  expect(database.getCampaign('created-in-ui').config.evaluation.replicates).toBe(3);
+  expect(
+    (await readFile(database.getCampaign('created-in-ui').config.benchmarks[0]!.zipPath))
+      .subarray(4)
+      .toString('utf8'),
+  ).toBe('primary requirements');
+
+  const rejected = await page.request.post(`${baseUrl}/api/campaigns/${campaignId}/stop`, {
+    headers: { Origin: 'https://attacker.example', 'Content-Type': 'application/json' },
+    data: {},
+  });
+  expect(rejected.status()).toBe(400);
+});

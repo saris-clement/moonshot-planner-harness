@@ -1,0 +1,56 @@
+{
+  "id": "phase2-source-policy-search",
+  "goal": "Improve generic Phase 2 source-backed adjudication accuracy without adding customer, workflow, or pack-specific production heuristics.",
+  "plannerRepo": "/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner",
+  "workflowsRepo": "/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/workflows",
+  "environmentFile": "/absolute/path/to/planner-eval.env",
+  "seedRevision": "feat/counterfactual-source-policy",
+  "workflowsRevision": "REPLACE_WITH_EXACT_WORKFLOWS_SHA",
+  "benchmarks": [
+    {
+      "name": "deceased-account",
+      "role": "primary",
+      "zipPath": "/absolute/path/to/deceased-account.zip"
+    },
+    {
+      "name": "unrelated-holdout",
+      "role": "holdout",
+      "zipPath": "/absolute/path/to/unrelated-workflow.zip"
+    }
+  ],
+  "mode": "supervised",
+  "evaluation": {
+    "replicates": 3,
+    "replicateConcurrency": 2
+  },
+  "limits": {
+    "concurrency": 3,
+    "maxVariants": 9,
+    "noImprovementRounds": 2,
+    "phase2TimeoutMs": 36000000,
+    "stackReadyTimeoutMs": 300000,
+    "maxChangedFiles": 20,
+    "maxChangedLines": 2000,
+    "maxPatchBytes": 10485760
+  },
+  "agent": {
+    "command": "opencode",
+    "model": "openai/gpt-5.6-sol",
+    "autoApprove": false
+  },
+  "gates": {
+    "allowedPathPrefixes": ["server/src/", "server/test/"],
+    "commands": [
+      {
+        "command": "npm",
+        "args": ["run", "typecheck"],
+        "timeoutMs": 1800000
+      },
+      {
+        "command": "npm",
+        "args": ["exec", "--workspace", "@ainative-planner/server", "--", "vitest", "run", "--exclude", "test/deployment.integration.test.ts"],
+        "timeoutMs": 1800000
+      }
+    ]
+  }
+}

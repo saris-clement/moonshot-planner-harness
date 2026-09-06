@@ -1,0 +1,551 @@
+import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
+import type {
+  CampaignConfig,
+  CampaignRecord,
+  BenchmarkQuestionResolution,
+  Hypothesis,
+  JudgeOutput,
+  LabelRecord,
+  RunFacts,
+  Score,
+  VariantExecutionState,
+  VariantRecord,
+  VariantStatus,
+} from './types.js';
+import { mergeExecutionSnapshot } from './executionState.js';
+
+type Row = Record<string, unknown>;
+
+const now = (): string => new Date().toISOString();
+
+function parseJson<T>(value: unknown): T {
+  if (typeof value !== 'string') throw new Error('expected persisted JSON string');
+  return JSON.parse(value) as T;
+}
+
+function campaignFromRow(row: Row): CampaignRecord {
+  return {
+    id: String(row.id),
+    status: String(row.status),
+    config: parseJson<CampaignConfig>(row.config_json),
+    seedSha: String(row.seed_sha),
+    workflowsSha: String(row.workflows_sha),
+    environmentSha: String(row.environment_sha),
+    workflowsRemoteUrl: String(row.workflows_remote_url),
+    currentParentVariantId:
+      row.current_parent_variant_id === null ? null : String(row.current_parent_variant_id),
+    noImprovementRounds: Number(row.no_improvement_rounds),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function variantFromRow(row: Row): VariantRecord {
+  return {
+    id: String(row.id),
+    campaignId: String(row.campaign_id),
+    parentVariantId: row.parent_variant_id === null ? null : String(row.parent_variant_id),
+    round: Number(row.round),
+    ordinal: Number(row.ordinal),
+    hypothesis: parseJson<Hypothesis>(row.hypothesis_json),
+    status: String(row.status) as VariantStatus,
+    worktreePath: row.worktree_path === null ? null : String(row.worktree_path),
+    imageTag: row.image_tag === null ? null : String(row.image_tag),
+    composeProject: row.compose_project === null ? null : String(row.compose_project),
+    baseUrl: row.base_url === null ? null : String(row.base_url),
+    patchPath: row.patch_path === null ? null : String(row.patch_path),
+    artifactCollectionComplete: Boolean(row.artifact_collection_complete),
+    facts: row.facts_json === null ? null : parseJson<RunFacts>(row.facts_json),
+    replicateFacts:
+      row.replicate_facts_json === null ? null : parseJson<RunFacts[]>(row.replicate_facts_json),
+    holdoutFacts:
+      row.holdout_facts_json === null
+        ? null
+        : parseJson<Record<string, RunFacts>>(row.holdout_facts_json),
+    holdoutReplicateFacts:
+      row.holdout_replicate_facts_json === null
+        ? null
+        : parseJson<Record<string, RunFacts[]>>(row.holdout_replicate_facts_json),
+    holdoutJudgments:
+      row.holdout_judgments_json === null
+        ? null
+        : parseJson<Record<string, JudgeOutput>>(row.holdout_judgments_json),
+    holdoutScores:
+      row.holdout_scores_json === null
+        ? null
+        : parseJson<Record<string, Score>>(row.holdout_scores_json),
+    judgment: row.judgment_json === null ? null : parseJson<JudgeOutput>(row.judgment_json),
+    score: row.score_json === null ? null : parseJson<Score>(row.score_json),
+    questionResolutions:
+      row.question_resolutions_json === null
+        ? null
+        : parseJson<Record<string, BenchmarkQuestionResolution>>(row.question_resolutions_json),
+    executionState:
+      row.execution_state_json === null
+        ? null
+        : parseJson<VariantExecutionState>(row.execution_state_json),
+    error: row.error === null ? null : String(row.error),
+    startedAt: row.started_at === null ? null : String(row.started_at),
+    completedAt: row.completed_at === null ? null : String(row.completed_at),
+    elapsedMs: row.elapsed_ms === null ? null : Number(row.elapsed_ms),
+    phase2StartedAt: row.phase2_started_at === null ? null : String(row.phase2_started_at),
+    phase2CompletedAt:
+      row.phase2_completed_at === null ? null : String(row.phase2_completed_at),
+    phase2ElapsedMs: row.phase2_elapsed_ms === null ? null : Number(row.phase2_elapsed_ms),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function labelFromRow(row: Row): LabelRecord {
+  return {
+    campaignId: String(row.campaign_id),
+    benchmark: String(row.benchmark),
+    unitKey: String(row.unit_key),
+    expectedDecision: String(row.expected_decision) as LabelRecord['expectedDecision'],
+    classification: String(row.classification) as LabelRecord['classification'],
+    rationale: String(row.rationale),
+    status: String(row.status) as LabelRecord['status'],
+    updatedAt: String(row.updated_at),
+  };
+}
+
+export class HarnessDatabase {
+  readonly database: DatabaseSync;
+
+  constructor(filePath: string) {
+    this.database = new DatabaseSync(filePath);
+    this.database.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+    this.migrate();
+  }
+
+  close(): void {
+    this.database.close();
+  }
+
+  private migrate(): void {
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS campaigns (
+        id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        config_json TEXT NOT NULL,
+        seed_sha TEXT NOT NULL,
+        workflows_sha TEXT NOT NULL,
+        environment_sha TEXT NOT NULL,
+        workflows_remote_url TEXT NOT NULL,
+        current_parent_variant_id TEXT,
+        no_improvement_rounds INTEGER NOT NULL DEFAULT 0,
+        lease_owner TEXT,
+        lease_expires_at INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS variants (
+        id TEXT PRIMARY KEY,
+        campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+        parent_variant_id TEXT,
+        round INTEGER NOT NULL,
+        ordinal INTEGER NOT NULL,
+        hypothesis_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        worktree_path TEXT,
+        image_tag TEXT,
+        compose_project TEXT,
+        base_url TEXT,
+        patch_path TEXT,
+        artifact_collection_complete INTEGER NOT NULL DEFAULT 0,
+        facts_json TEXT,
+        replicate_facts_json TEXT,
+        holdout_facts_json TEXT,
+        holdout_replicate_facts_json TEXT,
+        holdout_judgments_json TEXT,
+        holdout_scores_json TEXT,
+        judgment_json TEXT,
+        score_json TEXT,
+        question_resolutions_json TEXT,
+        execution_state_json TEXT,
+        error TEXT,
+        started_at TEXT,
+        completed_at TEXT,
+        elapsed_ms INTEGER,
+        phase2_started_at TEXT,
+        phase2_completed_at TEXT,
+        phase2_elapsed_ms INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(campaign_id, ordinal)
+      );
+      CREATE TABLE IF NOT EXISTS labels (
+        campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+        benchmark TEXT NOT NULL,
+        unit_key TEXT NOT NULL,
+        expected_decision TEXT NOT NULL,
+        classification TEXT NOT NULL,
+        rationale TEXT NOT NULL,
+        status TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(campaign_id, benchmark, unit_key)
+      );
+      CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+        variant_id TEXT,
+        type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS variants_campaign_idx ON variants(campaign_id, ordinal);
+      CREATE INDEX IF NOT EXISTS events_campaign_idx ON events(campaign_id, id);
+    `);
+    this.ensureColumn('campaigns', 'environment_sha', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('campaigns', 'workflows_remote_url', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('campaigns', 'lease_owner', 'TEXT');
+    this.ensureColumn('campaigns', 'lease_expires_at', 'INTEGER');
+    this.ensureColumn('variants', 'holdout_facts_json', 'TEXT');
+    this.ensureColumn('variants', 'artifact_collection_complete', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('variants', 'replicate_facts_json', 'TEXT');
+    this.ensureColumn('variants', 'holdout_replicate_facts_json', 'TEXT');
+    this.ensureColumn('variants', 'holdout_judgments_json', 'TEXT');
+    this.ensureColumn('variants', 'holdout_scores_json', 'TEXT');
+    this.ensureColumn('variants', 'question_resolutions_json', 'TEXT');
+    this.ensureColumn('variants', 'execution_state_json', 'TEXT');
+    this.ensureColumn('variants', 'started_at', 'TEXT');
+    this.ensureColumn('variants', 'completed_at', 'TEXT');
+    this.ensureColumn('variants', 'elapsed_ms', 'INTEGER');
+    this.ensureColumn('variants', 'phase2_started_at', 'TEXT');
+    this.ensureColumn('variants', 'phase2_completed_at', 'TEXT');
+    this.ensureColumn('variants', 'phase2_elapsed_ms', 'INTEGER');
+  }
+
+  private ensureColumn(table: 'campaigns' | 'variants', column: string, definition: string): void {
+    const columns = this.database.prepare(`PRAGMA table_info(${table})`).all() as Array<{
+      name: string;
+    }>;
+    if (!columns.some((candidate) => candidate.name === column)) {
+      this.database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  }
+
+  createCampaign(
+    config: CampaignConfig,
+    seedSha: string,
+    workflowsSha: string,
+    environmentSha: string,
+    workflowsRemoteUrl: string,
+  ): CampaignRecord {
+    const timestamp = now();
+    this.database
+      .prepare(
+        `INSERT INTO campaigns
+          (id, status, config_json, seed_sha, workflows_sha, environment_sha, workflows_remote_url, current_parent_variant_id, no_improvement_rounds, created_at, updated_at)
+         VALUES (?, 'ready', ?, ?, ?, ?, ?, NULL, 0, ?, ?)`,
+      )
+      .run(
+        config.id,
+        JSON.stringify(config),
+        seedSha,
+        workflowsSha,
+        environmentSha,
+        workflowsRemoteUrl,
+        timestamp,
+        timestamp,
+      );
+    this.addEvent(config.id, null, 'campaign.created', {
+      seedSha,
+      workflowsSha,
+      environmentSha,
+      workflowsRemoteUrl,
+    });
+    return this.getCampaign(config.id);
+  }
+
+  acquireLease(campaignId: string, owner: string, ttlMs: number): boolean {
+    const result = this.database
+      .prepare(
+        `UPDATE campaigns SET lease_owner = ?, lease_expires_at = ?
+         WHERE id = ? AND (lease_owner IS NULL OR lease_expires_at < ? OR lease_owner = ?)`,
+      )
+      .run(owner, Date.now() + ttlMs, campaignId, Date.now(), owner);
+    return result.changes === 1;
+  }
+
+  renewLease(campaignId: string, owner: string, ttlMs: number): boolean {
+    const result = this.database
+      .prepare('UPDATE campaigns SET lease_expires_at = ? WHERE id = ? AND lease_owner = ?')
+      .run(Date.now() + ttlMs, campaignId, owner);
+    return result.changes === 1;
+  }
+
+  releaseLease(campaignId: string, owner: string): void {
+    this.database
+      .prepare(
+        'UPDATE campaigns SET lease_owner = NULL, lease_expires_at = NULL WHERE id = ? AND lease_owner = ?',
+      )
+      .run(campaignId, owner);
+  }
+
+  getCampaign(id: string): CampaignRecord {
+    const row = this.database.prepare('SELECT * FROM campaigns WHERE id = ?').get(id) as Row | undefined;
+    if (!row) throw new Error(`campaign not found: ${id}`);
+    return campaignFromRow(row);
+  }
+
+  listCampaigns(): CampaignRecord[] {
+    return (this.database.prepare('SELECT * FROM campaigns ORDER BY created_at DESC').all() as Row[]).map(
+      campaignFromRow,
+    );
+  }
+
+  updateCampaign(
+    id: string,
+    changes: {
+      status?: string;
+      currentParentVariantId?: string | null;
+      noImprovementRounds?: number;
+    },
+  ): CampaignRecord {
+    const assignments: string[] = [];
+    const values: SQLInputValue[] = [];
+    if (changes.status !== undefined) {
+      assignments.push('status = ?');
+      values.push(changes.status);
+    }
+    if (changes.currentParentVariantId !== undefined) {
+      assignments.push('current_parent_variant_id = ?');
+      values.push(changes.currentParentVariantId);
+    }
+    if (changes.noImprovementRounds !== undefined) {
+      assignments.push('no_improvement_rounds = ?');
+      values.push(changes.noImprovementRounds);
+    }
+    if (assignments.length === 0) return this.getCampaign(id);
+    assignments.push('updated_at = ?');
+    values.push(now(), id);
+    this.database.prepare(`UPDATE campaigns SET ${assignments.join(', ')} WHERE id = ?`).run(...values);
+    const campaign = this.getCampaign(id);
+    this.addEvent(id, null, 'campaign.updated', changes);
+    return campaign;
+  }
+
+  createVariant(input: {
+    id: string;
+    campaignId: string;
+    parentVariantId: string | null;
+    round: number;
+    ordinal: number;
+    hypothesis: Hypothesis;
+  }): VariantRecord {
+    const timestamp = now();
+    this.database
+      .prepare(
+        `INSERT INTO variants
+          (id, campaign_id, parent_variant_id, round, ordinal, hypothesis_json, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+      )
+      .run(
+        input.id,
+        input.campaignId,
+        input.parentVariantId,
+        input.round,
+        input.ordinal,
+        JSON.stringify(input.hypothesis),
+        timestamp,
+        timestamp,
+      );
+    this.addEvent(input.campaignId, input.id, 'variant.created', { hypothesis: input.hypothesis });
+    return this.getVariant(input.id);
+  }
+
+  getVariant(id: string): VariantRecord {
+    const row = this.database.prepare('SELECT * FROM variants WHERE id = ?').get(id) as Row | undefined;
+    if (!row) throw new Error(`variant not found: ${id}`);
+    return variantFromRow(row);
+  }
+
+  listVariants(campaignId: string): VariantRecord[] {
+    return (
+      this.database
+        .prepare('SELECT * FROM variants WHERE campaign_id = ? ORDER BY ordinal ASC')
+        .all(campaignId) as Row[]
+    ).map(variantFromRow);
+  }
+
+  updateVariant(
+    id: string,
+    changes: Partial<{
+      status: VariantStatus;
+      worktreePath: string | null;
+      imageTag: string | null;
+      composeProject: string | null;
+      baseUrl: string | null;
+      patchPath: string | null;
+      artifactCollectionComplete: boolean;
+      facts: RunFacts | null;
+      replicateFacts: RunFacts[] | null;
+      holdoutFacts: Record<string, RunFacts> | null;
+      holdoutReplicateFacts: Record<string, RunFacts[]> | null;
+      holdoutJudgments: Record<string, JudgeOutput> | null;
+      holdoutScores: Record<string, Score> | null;
+      judgment: JudgeOutput | null;
+      score: Score | null;
+      questionResolutions: Record<string, BenchmarkQuestionResolution> | null;
+      executionState: VariantExecutionState | null;
+      error: string | null;
+      startedAt: string | null;
+      completedAt: string | null;
+      elapsedMs: number | null;
+      phase2StartedAt: string | null;
+      phase2CompletedAt: string | null;
+      phase2ElapsedMs: number | null;
+    }>,
+  ): VariantRecord {
+    const columns = {
+      status: 'status',
+      worktreePath: 'worktree_path',
+      imageTag: 'image_tag',
+      composeProject: 'compose_project',
+      baseUrl: 'base_url',
+      patchPath: 'patch_path',
+      artifactCollectionComplete: 'artifact_collection_complete',
+      facts: 'facts_json',
+      replicateFacts: 'replicate_facts_json',
+      holdoutFacts: 'holdout_facts_json',
+      holdoutReplicateFacts: 'holdout_replicate_facts_json',
+      holdoutJudgments: 'holdout_judgments_json',
+      holdoutScores: 'holdout_scores_json',
+      judgment: 'judgment_json',
+      score: 'score_json',
+      questionResolutions: 'question_resolutions_json',
+      executionState: 'execution_state_json',
+      error: 'error',
+      startedAt: 'started_at',
+      completedAt: 'completed_at',
+      elapsedMs: 'elapsed_ms',
+      phase2StartedAt: 'phase2_started_at',
+      phase2CompletedAt: 'phase2_completed_at',
+      phase2ElapsedMs: 'phase2_elapsed_ms',
+    } as const;
+    const jsonFields = new Set([
+      'facts',
+      'replicateFacts',
+      'holdoutFacts',
+      'holdoutReplicateFacts',
+      'holdoutJudgments',
+      'holdoutScores',
+      'judgment',
+      'score',
+      'questionResolutions',
+      'executionState',
+    ]);
+    const assignments: string[] = [];
+    const values: SQLInputValue[] = [];
+    for (const [key, value] of Object.entries(changes)) {
+      const column = columns[key as keyof typeof columns];
+      if (!column) continue;
+      assignments.push(`${column} = ?`);
+      values.push(
+        value === null
+          ? null
+          : jsonFields.has(key)
+            ? JSON.stringify(value)
+            : typeof value === 'boolean'
+              ? value
+                ? 1
+                : 0
+              : typeof value === 'number'
+                ? value
+                : String(value),
+      );
+    }
+    if (assignments.length === 0) return this.getVariant(id);
+    assignments.push('updated_at = ?');
+    values.push(now(), id);
+    this.database.prepare(`UPDATE variants SET ${assignments.join(', ')} WHERE id = ?`).run(...values);
+    const variant = this.getVariant(id);
+    this.addEvent(variant.campaignId, id, 'variant.updated', changes);
+    return variant;
+  }
+
+  updateVariantExecution(
+    id: string,
+    input: Parameters<typeof mergeExecutionSnapshot>[1],
+  ): VariantRecord {
+    const variant = this.getVariant(id);
+    const executionState = mergeExecutionSnapshot(variant.executionState, input);
+    if (JSON.stringify(executionState) === JSON.stringify(variant.executionState)) return variant;
+    return this.updateVariant(id, { executionState });
+  }
+
+  upsertLabel(label: Omit<LabelRecord, 'updatedAt'>): LabelRecord {
+    const timestamp = now();
+    this.database
+      .prepare(
+        `INSERT INTO labels
+          (campaign_id, benchmark, unit_key, expected_decision, classification, rationale, status, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(campaign_id, benchmark, unit_key) DO UPDATE SET
+          expected_decision = excluded.expected_decision,
+          classification = excluded.classification,
+          rationale = excluded.rationale,
+          status = excluded.status,
+          updated_at = excluded.updated_at`,
+      )
+      .run(
+        label.campaignId,
+        label.benchmark,
+        label.unitKey,
+        label.expectedDecision,
+        label.classification,
+        label.rationale,
+        label.status,
+        timestamp,
+      );
+    this.addEvent(label.campaignId, null, 'label.updated', { ...label, updatedAt: timestamp });
+    return { ...label, updatedAt: timestamp };
+  }
+
+  listLabels(campaignId: string, benchmark?: string): LabelRecord[] {
+    const rows = benchmark
+      ? (this.database
+          .prepare('SELECT * FROM labels WHERE campaign_id = ? AND benchmark = ? ORDER BY unit_key')
+          .all(campaignId, benchmark) as Row[])
+      : (this.database
+          .prepare('SELECT * FROM labels WHERE campaign_id = ? ORDER BY benchmark, unit_key')
+          .all(campaignId) as Row[]);
+    return rows.map(labelFromRow);
+  }
+
+  addEvent(
+    campaignId: string,
+    variantId: string | null,
+    type: string,
+    payload: unknown,
+  ): void {
+    this.database
+      .prepare(
+        'INSERT INTO events (campaign_id, variant_id, type, payload_json, created_at) VALUES (?, ?, ?, ?, ?)',
+      )
+      .run(campaignId, variantId, type, JSON.stringify(payload), now());
+  }
+
+  listEvents(campaignId: string, afterId = 0): Array<{
+    id: number;
+    campaignId: string;
+    variantId: string | null;
+    type: string;
+    payload: unknown;
+    createdAt: string;
+  }> {
+    const rows = this.database
+      .prepare('SELECT * FROM events WHERE campaign_id = ? AND id > ? ORDER BY id ASC')
+      .all(campaignId, afterId) as Row[];
+    return rows.map((row) => ({
+      id: Number(row.id),
+      campaignId: String(row.campaign_id),
+      variantId: row.variant_id === null ? null : String(row.variant_id),
+      type: String(row.type),
+      payload: parseJson(row.payload_json),
+      createdAt: String(row.created_at),
+    }));
+  }
+}

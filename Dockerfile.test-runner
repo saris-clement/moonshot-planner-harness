@@ -1,0 +1,7 @@
+ARG BUILDER_IMAGE
+FROM ${BUILDER_IMAGE}
+
+USER root
+RUN apt-get update \
+  && apt-get install --yes --no-install-recommends git jq \
+  && rm -rf /var/lib/apt/lists/*

@@ -1,0 +1,11 @@
+node_modules/
+dist/
+test-results/
+playwright-report/
+.data/
+*.log
+.DS_Store
+campaign.local.json
+
+# Campaign reports are intentionally tracked; raw customer artifacts are not.
+docs/experiments/**/artifacts/
