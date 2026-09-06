@@ -5,9 +5,15 @@ function decisionRows(facts) {
   if (!facts) return element('p', { className: 'muted', text: 'No excluded facts are available.' });
   return element('div', { className: 'counterfactual-decisions' },
     Object.entries(facts.decisions).map(([decision, count]) =>
-      element('div', {}, [
-        element('span', { className: `decision-${decision}`, text: decision }),
-        element('strong', { text: formatNumber(count) }),
+      element('div', { className: 'decision-cell' }, [
+        element('span', {
+          className: `decision-code decision-code-${decision}`,
+          text: `${decision[0].toUpperCase()}${decision.slice(1)}`,
+        }),
+        element('strong', {
+          className: `decision-code decision-code-${decision}`,
+          text: formatNumber(count),
+        }),
       ]),
     ),
   );

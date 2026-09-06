@@ -530,6 +530,11 @@ test('shows the immutable two-run target-excluded guard and separate review trut
   await expect(page.getByText('2 runs · concurrency 2')).toBeVisible();
   await expect(page.getByText('Disposition profile')).toBeVisible();
   await expect(page.getByText('Valid', { exact: true })).toBeVisible();
+  for (const decision of ['Build', 'Reuse', 'Extend', 'Defer', 'Question']) {
+    await expect(
+      page.locator(`.counterfactual-decisions .decision-code-${decision.toLowerCase()}`).first(),
+    ).toHaveText(decision);
+  }
   const retry = page.getByRole('button', { name: 'Retry complete evaluation' });
   await expect(retry).toBeVisible();
   await expect(retry).not.toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
