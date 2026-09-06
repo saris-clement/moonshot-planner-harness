@@ -6,16 +6,20 @@ import { LangfuseReadClient, type LangfuseCollection } from './langfuse.js';
 import {
   DiagnosisInputSchema,
   DiagnosisManifestSchema,
+  DiagnosisOutputSchema,
   type CampaignRecord,
   type DiagnosisCompletenessItem,
   type DiagnosisEvidence,
   type DiagnosisFinding,
   type DiagnosisInput,
+  type DiagnosisLineageArm,
   type DiagnosisManifest,
+  type DiagnosisOutput,
   type JsonValue,
   type LabelRecord,
   type RunFacts,
   type TargetExcludedEvaluationRecord,
+  type TargetExcludedConfig,
   type VariantRecord,
 } from './types.js';
 
@@ -50,6 +54,8 @@ export interface AssembleDiagnosisInput {
   variant: VariantRecord;
   labels: readonly LabelRecord[];
   targetExcluded?: TargetExcludedEvaluationRecord | null;
+  targetExcludedConfig?: TargetExcludedConfig | null;
+  targetExcludedSourceManifestPath?: string | null;
   workflowsSource: string;
   environment: NodeJS.ProcessEnv;
   langfuseClient?: LangfuseReadClient;
@@ -210,11 +216,34 @@ function unitKeyMap(facts: RunFacts | null): Map<string, string> {
   return new Map((facts?.units ?? []).map((unit) => [unit.id, unit.key]));
 }
 
+function targetRunFacts(target: TargetExcludedEvaluationRecord | null | undefined): RunFacts[] {
+  if (!target) return [];
+  return [
+    target.controlFacts,
+    ...(target.controlReplicateFacts ?? []),
+    ...Object.values(target.holdoutFacts ?? {}),
+    ...Object.values(target.holdoutReplicateFacts ?? {}).flat(),
+    target.excludedFacts,
+    ...(target.excludedReplicateFacts ?? []),
+  ].filter((facts): facts is RunFacts => facts !== null);
+}
+
 function selectFocusUnits(input: AssembleDiagnosisInput): {
   keys: Set<string>;
   candidateCount: number;
 } {
-  const measured = new Map((input.variant.facts?.units ?? []).map((unit) => [unit.key, unit]));
+  const standardMeasured = new Map(
+    (input.variant.facts?.units ?? []).map((unit) => [unit.key, unit]),
+  );
+  const targetMeasured = new Map(
+    targetRunFacts(input.targetExcluded).flatMap((facts) =>
+      facts.units.map((unit) => [unit.key, unit] as const),
+    ),
+  );
+  const targetExcludedMeasured = new Map(
+    (input.targetExcluded?.excludedFacts?.units ?? []).map((unit) => [unit.key, unit]),
+  );
+  const measured = new Map([...standardMeasured, ...targetMeasured]);
   const priority = new Map<string, number>();
   const add = (key: string, value: number) => {
     if (!measured.has(key)) return;
@@ -222,24 +251,44 @@ function selectFocusUnits(input: AssembleDiagnosisInput): {
   };
   const primary = input.campaign.config.benchmarks.find((benchmark) => benchmark.role === 'primary')?.name;
   for (const label of input.labels) {
-    const unit = measured.get(label.unitKey);
-    if (label.benchmark !== primary || !unit || unit.decision === label.expectedDecision) continue;
+    const labelFacts = label.benchmark.includes('target-excluded')
+      ? targetExcludedMeasured.size > 0
+        ? targetExcludedMeasured
+        : targetMeasured
+      : label.benchmark === primary
+        ? standardMeasured
+        : null;
+    const unit = labelFacts?.get(label.unitKey);
+    if (!unit || unit.decision === label.expectedDecision) continue;
     add(label.unitKey, label.status === 'verified' ? 0 : 2);
   }
   for (const verdict of input.variant.judgment?.verdicts ?? []) {
-    const unit = measured.get(verdict.unitKey);
+    const unit = standardMeasured.get(verdict.unitKey);
     if (!unit || unit.decision === verdict.expectedDecision) continue;
     add(verdict.unitKey, verdict.classification === 'system_error' ? 1 : 3);
   }
-  const decisions = new Map<string, Set<string>>();
-  for (const replicate of input.variant.replicateFacts ?? []) {
-    for (const unit of replicate.units) {
-      const values = decisions.get(unit.key) ?? new Set<string>();
-      values.add(unit.decision);
-      decisions.set(unit.key, values);
-    }
+  for (const verdict of input.targetExcluded?.judgment?.verdicts ?? []) {
+    const unit = (targetExcludedMeasured.size > 0 ? targetExcludedMeasured : targetMeasured).get(
+      verdict.unitKey,
+    );
+    if (!unit || unit.decision === verdict.expectedDecision) continue;
+    add(verdict.unitKey, verdict.classification === 'system_error' ? 1 : 3);
   }
-  for (const [key, values] of decisions) if (values.size > 1) add(key, 4);
+  for (const cohort of [
+    input.variant.replicateFacts ?? [],
+    input.targetExcluded?.controlReplicateFacts ?? [],
+    input.targetExcluded?.excludedReplicateFacts ?? [],
+  ]) {
+    const decisions = new Map<string, Set<string>>();
+    for (const replicate of cohort) {
+      for (const unit of replicate.units) {
+        const values = decisions.get(unit.key) ?? new Set<string>();
+        values.add(unit.decision);
+        decisions.set(unit.key, values);
+      }
+    }
+    for (const [key, values] of decisions) if (values.size > 1) add(key, 4);
+  }
   if (priority.size === 0) {
     for (const unit of input.variant.facts?.units ?? []) add(unit.key, 5);
   }
@@ -250,6 +299,41 @@ function selectFocusUnits(input: AssembleDiagnosisInput): {
     .slice(0, MAX_FOCUS_UNITS)
     .map(([key]) => key);
   return { keys: new Set(selected), candidateCount: priority.size };
+}
+
+function artifactLineageArm(relativeDirectory: string): {
+  arm: DiagnosisLineageArm;
+  executionScope: string | null;
+} {
+  const segments = relativeDirectory.split('/');
+  const targetIndex = segments.indexOf('target-excluded');
+  const targetDepth = targetIndex < 0 ? 0 : segments.length - targetIndex;
+  if (targetDepth < 3) return { arm: 'standard', executionScope: null };
+  const nestedArm = segments[targetIndex + 1];
+  if (targetDepth >= 4 && (nestedArm === 'control' || nestedArm === 'excluded')) {
+    return { arm: nestedArm, executionScope: nestedArm };
+  }
+  return { arm: 'excluded', executionScope: 'target-excluded' };
+}
+
+function artifactExecution(
+  input: AssembleDiagnosisInput,
+  benchmark: string,
+  replicate: number,
+  arm: DiagnosisLineageArm,
+  executionScope: string | null,
+) {
+  const expectedBenchmark = arm === 'standard' ? benchmark : `${benchmark}:${executionScope}`;
+  const executions =
+    arm === 'standard'
+      ? input.variant.executionState?.executions ?? []
+      : [
+          ...(input.targetExcluded?.executionState?.executions ?? []),
+          ...(input.variant.executionState?.executions ?? []),
+        ];
+  return executions.find(
+    (candidate) => candidate.replicate === replicate && candidate.benchmark === expectedBenchmark,
+  );
 }
 
 function normalizedSourceCandidate(value: string): string | null {
@@ -296,6 +380,30 @@ export function diagnosisManifestPath(artifactDirectory: string, inputSha256: st
     'diagnosis',
     `diagnosis-manifest-${inputSha256.slice('sha256:'.length)}.json`,
   );
+}
+
+export function diagnosisResultPath(artifactDirectory: string, inputSha256: string): string {
+  return path.join(
+    artifactDirectory,
+    'diagnosis',
+    `diagnosis-result-${inputSha256.slice('sha256:'.length)}.json`,
+  );
+}
+
+export async function verifyDiagnosisResult(
+  artifactDirectory: string,
+  inputSha256: string,
+  resultSha256: string,
+): Promise<DiagnosisOutput> {
+  const filePath = diagnosisResultPath(artifactDirectory, inputSha256);
+  if ((await sha256File(filePath)) !== resultSha256) {
+    throw new Error('persisted diagnosis result hash does not match the variant record');
+  }
+  const result = DiagnosisOutputSchema.parse(JSON.parse(await readFile(filePath, 'utf8')) as unknown);
+  if (result.inputSha256 !== inputSha256) {
+    throw new Error('persisted diagnosis result binds another diagnosis input');
+  }
+  return result;
 }
 
 export async function readDiagnosisInput(
@@ -348,6 +456,10 @@ export async function verifyDiagnosisArtifacts(
 
 export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Promise<AssembledDiagnosis> {
   const artifactRoot = path.resolve(input.artifactDirectory);
+  const targetExcludedSourceManifestSha256 = input.targetExcludedSourceManifestPath &&
+    (await stat(input.targetExcludedSourceManifestPath).catch(() => null))?.isFile()
+    ? await sha256File(input.targetExcludedSourceManifestPath)
+    : null;
   const focus = selectFocusUnits(input);
   const inventory = new Map<string, ArtifactInventoryItem>();
   const evidence = new Map<string, DiagnosisEvidence>();
@@ -413,7 +525,10 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
   };
 
   const benchmarkByName = new Map(input.campaign.config.benchmarks.map((value) => [value.name, value]));
-  const artifactFiles = await walkFiles(artifactRoot);
+  const artifactFiles = (await walkFiles(artifactRoot)).filter(
+    (filePath) =>
+      !safeRelativePath(artifactRoot, filePath).startsWith('target-excluded-attempts/'),
+  );
   const replicateDirectories = [
     ...new Set(
       artifactFiles
@@ -424,6 +539,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
 
   for (const directory of replicateDirectories) {
     const relativeDirectory = safeRelativePath(artifactRoot, directory);
+    const { arm, executionScope } = artifactLineageArm(relativeDirectory);
     const replicate = Number.parseInt(path.basename(directory).slice('replicate-'.length), 10);
     const benchmarkName = path.basename(path.dirname(directory));
     const benchmark = benchmarkByName.get(benchmarkName);
@@ -438,17 +554,18 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
     const resultArtifact = await readJsonArtifact(path.join(directory, 'result.json'));
     const analysisArtifact = await readJsonArtifact(path.join(directory, 'analysis.json'));
     const lineage = extractLineage(resultArtifact?.value ?? analysisArtifact?.value);
-    input.variant.executionState?.executions
-      .filter(
-        (execution) =>
-          execution.replicate === replicate &&
-          (execution.benchmark === benchmarkName || execution.benchmark.endsWith(`:${scope}`)),
-      )
-      .forEach((execution) => {
-        lineage.caseId ??= execution.caseId;
-        lineage.runId ??= execution.runId;
-        if (lineage.status === 'unknown') lineage.status = execution.status;
-      });
+    const execution = artifactExecution(
+      input,
+      benchmarkName,
+      replicate,
+      arm,
+      executionScope,
+    );
+    if (execution) {
+      lineage.caseId ??= execution.caseId;
+      lineage.runId ??= execution.runId;
+      if (lineage.status === 'unknown') lineage.status = execution.status;
+    }
 
     const lineageEvidence = addEvidence(`lineage|${relativeDirectory}`, {
       kind: 'case_run_lineage',
@@ -465,7 +582,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
         unitKey: null,
         limitation: lineage.caseId && lineage.runId ? null : 'Case or run identity was not captured.',
       },
-      data: boundedJson({ ...lineage, benchmark: scopeName, replicate }),
+      data: boundedJson({ ...lineage, benchmark: scopeName, arm, replicate }),
     });
     void lineageEvidence;
 
@@ -654,13 +771,17 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
 
   const lineage = replicateDirectories.flatMap((directory) => {
     const relativeDirectory = safeRelativePath(artifactRoot, directory);
+    const { arm, executionScope } = artifactLineageArm(relativeDirectory);
     const benchmarkName = path.basename(path.dirname(directory));
     const benchmark = benchmarkByName.get(benchmarkName);
     if (!benchmark) return [];
-    const execution = input.variant.executionState?.executions.find(
-      (candidate) =>
-        candidate.replicate === Number.parseInt(path.basename(directory).slice(10), 10) &&
-        candidate.benchmark.startsWith(benchmarkName),
+    const replicate = Number.parseInt(path.basename(directory).slice(10), 10);
+    const execution = artifactExecution(
+      input,
+      benchmarkName,
+      replicate,
+      arm,
+      executionScope,
     );
     const lineageEvidence = evidence.get(evidenceId(`lineage|${relativeDirectory}`));
     const data = isRecord(lineageEvidence?.data) ? lineageEvidence.data : {};
@@ -668,7 +789,8 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
       {
         benchmark: benchmarkName,
         role: benchmark.role,
-        replicate: Number.parseInt(path.basename(directory).slice(10), 10),
+        arm,
+        replicate,
         caseId: typeof data.caseId === 'string' ? data.caseId : execution?.caseId ?? null,
         runId: typeof data.runId === 'string' ? data.runId : execution?.runId ?? null,
         status: typeof data.status === 'string' ? data.status : execution?.status ?? 'unknown',
@@ -687,14 +809,19 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
         : ['Some replicate case/run identifiers were not captured.'],
   });
 
-  const addReplicateEvidence = (benchmark: string, replicates: RunFacts[] | null): void => {
+  const addReplicateEvidence = (
+    benchmark: string,
+    replicates: RunFacts[] | null,
+    expected = input.campaign.config.evaluation.replicates,
+    enforceExpected = false,
+  ): void => {
     if (!replicates) {
       completeness.push({
         component: 'replicate_facts',
         scope: benchmark,
         status: 'unavailable',
         captured: 0,
-        expected: input.campaign.config.evaluation.replicates,
+        expected,
         limitations: ['Replicate facts are unavailable.'],
       });
       return;
@@ -747,10 +874,18 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
     completeness.push({
       component: 'replicate_facts',
       scope: benchmark,
-      status: replicates.length > 0 ? 'complete' : 'unavailable',
+      status:
+        replicates.length === 0
+          ? 'unavailable'
+          : enforceExpected && replicates.length !== expected
+            ? 'partial'
+            : 'complete',
       captured: replicates.length,
-      expected: input.campaign.config.evaluation.replicates,
-      limitations: [],
+      expected,
+      limitations:
+        enforceExpected && replicates.length !== expected
+          ? [`Captured ${replicates.length} of ${expected} expected replicate fact sets.`]
+          : [],
     });
   };
   addReplicateEvidence(
@@ -759,6 +894,53 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
   );
   for (const benchmark of input.campaign.config.benchmarks.filter((value) => value.role === 'holdout')) {
     addReplicateEvidence(benchmark.name, input.variant.holdoutReplicateFacts?.[benchmark.name] ?? null);
+  }
+  if (input.targetExcluded) {
+    const target = input.targetExcluded;
+    const primary =
+      input.campaign.config.benchmarks.find((benchmark) => benchmark.role === 'primary')?.name ??
+      'primary';
+    const targetExpectedReplicates = (
+      arm: 'control' | 'excluded',
+      aggregate: RunFacts | null,
+      replicates: RunFacts[] | null,
+    ): number => {
+      const executionBenchmarks =
+        arm === 'control'
+          ? new Set([`${primary}:control`])
+          : new Set([`${primary}:excluded`, `${primary}:target-excluded`]);
+      const counts = [
+        ...(target.executionState?.executions
+          .filter((execution) => executionBenchmarks.has(execution.benchmark))
+          .map((execution) => execution.replicateCount) ?? []),
+        ...(arm === 'control'
+          ? (input.variant.executionState?.executions
+              .filter((execution) => execution.benchmark === primary)
+              .map((execution) => execution.replicateCount) ?? [])
+          : []),
+        aggregate?.sampleSize,
+      ].filter(
+        (count): count is number =>
+          typeof count === 'number' && Number.isSafeInteger(count) && count > 0,
+      );
+      return counts.length > 0
+        ? Math.max(...counts)
+        : replicates && replicates.length > 0
+          ? replicates.length
+          : input.campaign.config.evaluation.replicates;
+    };
+    addReplicateEvidence(
+      `target-excluded/control/${primary}`,
+      target.controlReplicateFacts,
+      targetExpectedReplicates('control', target.controlFacts, target.controlReplicateFacts),
+      true,
+    );
+    addReplicateEvidence(
+      `target-excluded/excluded/${primary}`,
+      target.excludedReplicateFacts,
+      targetExpectedReplicates('excluded', target.excludedFacts, target.excludedReplicateFacts),
+      true,
+    );
   }
 
   const s3Files = artifactFiles.filter((filePath) =>
@@ -1153,7 +1335,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
     limitations: langfuse.limitations,
   });
 
-  const judgments: Array<{ benchmark: string; judgment: VariantRecord['judgment'] }> = [
+  const variantJudgments: Array<{ benchmark: string; judgment: VariantRecord['judgment'] }> = [
     {
       benchmark:
         input.campaign.config.benchmarks.find((benchmark) => benchmark.role === 'primary')?.name ??
@@ -1164,6 +1346,12 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
       benchmark,
       judgment,
     })),
+  ];
+  const judgments: Array<{ benchmark: string; judgment: VariantRecord['judgment'] }> = [
+    ...variantJudgments,
+    ...(input.targetExcluded?.judgment
+      ? [{ benchmark: 'target-excluded', judgment: input.targetExcluded.judgment }]
+      : []),
   ];
   for (const { benchmark, judgment } of judgments) {
     if (!judgment) continue;
@@ -1192,10 +1380,22 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
     component: 'judge',
     scope: 'variant',
     status: input.variant.judgment ? 'complete' : 'unavailable',
-    captured: judgments.reduce((sum, item) => sum + (item.judgment?.verdicts.length ?? 0), 0),
+    captured: variantJudgments.reduce((sum, item) => sum + (item.judgment?.verdicts.length ?? 0), 0),
     expected: input.variant.facts?.unitCount ?? null,
     limitations: input.variant.judgment ? [] : ['Primary blind-judge output is unavailable.'],
   });
+  if (input.targetExcluded) {
+    completeness.push({
+      component: 'judge',
+      scope: 'target-excluded',
+      status: input.targetExcluded.judgment ? 'complete' : 'unavailable',
+      captured: input.targetExcluded.judgment?.verdicts.length ?? 0,
+      expected: input.targetExcluded.excludedFacts?.unitCount ?? null,
+      limitations: input.targetExcluded.judgment
+        ? ['Target blind-judge output remains model inference and is not human-verified truth.']
+        : ['Target blind-judge output is unavailable.'],
+    });
+  }
 
   for (const label of input.labels) {
     addEvidence(`label|${label.benchmark}|${label.unitKey}`, {
@@ -1236,6 +1436,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
     ...(input.variant.replicateFacts ?? []),
     ...Object.values(input.variant.holdoutFacts ?? {}),
     ...Object.values(input.variant.holdoutReplicateFacts ?? {}).flat(),
+    ...targetRunFacts(input.targetExcluded),
   ].filter((facts): facts is RunFacts => facts !== null);
   for (const facts of allFacts) {
     for (const unit of facts.units) {
@@ -1302,8 +1503,50 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
     ],
   });
 
+  const comparisonArtifactHashes: Array<{
+    replicate: number;
+    reportHash: string | null;
+    artifactSha256: string;
+  }> = [];
   if (input.targetExcluded) {
     const target = input.targetExcluded;
+    const comparisonsByReplicate = new Map(
+      (target.comparisons ?? []).map((comparison) => [comparison.replicate, comparison]),
+    );
+    for (const filePath of artifactFiles) {
+      const relativePath = safeRelativePath(artifactRoot, filePath);
+      const match = /^target-excluded\/comparisons\/replicate-(\d+)\.json$/.exec(relativePath);
+      if (!match) continue;
+      const replicate = Number.parseInt(match[1]!, 10);
+      const comparison = comparisonsByReplicate.get(replicate);
+      if (!comparison) continue;
+      const report = await readJsonArtifact(filePath);
+      if (!report) continue;
+      const embeddedHash = stringField(report.value, 'hash');
+      if (comparison.reportHash && embeddedHash !== comparison.reportHash) continue;
+      addEvidence(`target-excluded-comparison|${replicate}|${report.sha256}`, {
+        kind: 'target_excluded_comparison',
+        summary: `Target comparison replicate ${replicate} was read from the archived JSON report and verified by content hash.`,
+        affectedUnitKeys: [],
+        provenance: {
+          classification: 'observed_durable',
+          source: 'harness',
+          artifactPath: report.relativePath,
+          artifactSha256: report.sha256,
+          integrity: 'verified',
+          caseId: null,
+          runId: null,
+          unitKey: null,
+          limitation: null,
+        },
+        data: boundedJson(report.value),
+      });
+      comparisonArtifactHashes.push({
+        replicate,
+        reportHash: comparison.reportHash,
+        artifactSha256: report.sha256,
+      });
+    }
     addEvidence(`target-excluded|${target.variantId}`, {
       kind: 'target_excluded_summary',
       summary: `Target-excluded guard status is ${target.status} with gate ${target.gate?.status ?? 'pending'}; it is a guard, not a fitness reward.`,
@@ -1321,8 +1564,17 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
       },
       data: boundedJson({
         status: target.status,
+        error: target.error,
+        questionResolution: target.questionResolution,
+        artifactCollectionComplete: target.artifactCollectionComplete,
         gate: target.gate,
         comparisons: target.comparisons,
+        comparisonHashes: [...(target.comparisons ?? [])]
+          .sort((left, right) => left.replicate - right.replicate)
+          .flatMap(({ reportHash }) => (reportHash ? [reportHash] : [])),
+        comparisonArtifactHashes: comparisonArtifactHashes.sort(
+          (left, right) => left.replicate - right.replicate,
+        ),
         excludedDecisions: target.excludedFacts?.decisions,
         controlDecisions: target.controlFacts?.decisions,
         score: target.score,
@@ -1440,6 +1692,21 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
         role,
         sha256: sha256 ?? null,
       })),
+      ...(input.targetExcludedConfig
+        ? {
+            targetExcludedProtocol: {
+              targetImplementationWorkflow:
+                input.targetExcludedConfig.targetImplementationWorkflow,
+              baselineVariantId: input.targetExcludedConfig.baselineVariantId,
+              comparatorImage: input.targetExcludedConfig.comparatorImage,
+              replicates: input.targetExcludedConfig.replicates,
+              concurrency: input.targetExcludedConfig.concurrency,
+              warningBuildDropRatio: input.targetExcludedConfig.warningBuildDropRatio,
+              blockBuildDropRatio: input.targetExcludedConfig.blockBuildDropRatio,
+              sourceManifestSha256: targetExcludedSourceManifestSha256,
+            },
+          }
+        : {}),
     },
     variant: {
       id: input.variant.id,
@@ -1448,7 +1715,9 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
       artifactCollectionComplete: input.variant.artifactCollectionComplete,
     },
     lineage: lineage.sort((left, right) =>
-      `${left.benchmark}:${left.replicate}`.localeCompare(`${right.benchmark}:${right.replicate}`),
+      `${left.benchmark}:${left.arm}:${left.replicate}`.localeCompare(
+        `${right.benchmark}:${right.arm}:${right.replicate}`,
+      ),
     ),
     completeness: {
       status: overallPartial ? 'partial' : 'complete',

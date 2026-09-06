@@ -15,7 +15,7 @@ import {
 } from './types.js';
 import { runCommand } from './process.js';
 import { sha256File } from './config.js';
-import { validateDiagnosisFindingReferences } from './diagnosis.js';
+import { diagnosisResultPath, validateDiagnosisFindingReferences } from './diagnosis.js';
 
 const StrategyOutputSchema = z.object({
   hypotheses: z.array(HypothesisSchema).min(1).max(3),
@@ -198,7 +198,7 @@ Rules:
       JSON.parse(await readFile(diagnosisInputPath, 'utf8')) as unknown,
     );
     const suffix = inputSha256.slice('sha256:'.length);
-    const resultPath = path.join(artifactDirectory, 'diagnosis', `diagnosis-result-${suffix}.json`);
+    const resultPath = diagnosisResultPath(artifactDirectory, inputSha256);
     const existing = await readFile(resultPath, 'utf8').catch(() => null);
     if (existing !== null) {
       const output = DiagnosisOutputSchema.parse(JSON.parse(existing) as unknown);

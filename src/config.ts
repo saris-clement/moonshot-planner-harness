@@ -104,3 +104,19 @@ export async function readEnvironmentFile(filePath: string): Promise<NodeJS.Proc
   }
   return values;
 }
+
+export function withPlannerAnalysisLimits(
+  content: string,
+  timeoutMs: number,
+  maxCostUsd: number,
+): string {
+  const retained = content
+    .split(/\r?\n/)
+    .filter(
+      (line) =>
+        !/^\s*PLANNER_ANALYSIS_TIMEOUT_MS\s*=/.test(line) &&
+        !/^\s*PLANNER_ANALYSIS_MAX_COST_USD\s*=/.test(line),
+    );
+  while (retained.at(-1) === '') retained.pop();
+  return `${retained.join('\n')}\nPLANNER_ANALYSIS_TIMEOUT_MS=${timeoutMs}\nPLANNER_ANALYSIS_MAX_COST_USD=${maxCostUsd}\n`;
+}

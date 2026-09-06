@@ -30,6 +30,11 @@ test('PlannerClient drives upload through completed Phase 2 without Phase 3', as
     else if (request.url?.endsWith('/runs') && request.method === 'POST') response.end('{"run":{"id":"run-a","status":"queued"},"runtime":{"status":"queued"}}');
     else if (request.url?.endsWith('/runs/run-a')) {
       runPolls += 1;
+      if (runPolls === 1) {
+        response.statusCode = 400;
+        response.end('{"error":"InvalidRequest"}');
+        return;
+      }
       response.end(JSON.stringify({
         run: { id: 'run-a', status: 'completed' },
         runtime: {
@@ -69,6 +74,7 @@ test('PlannerClient drives upload through completed Phase 2 without Phase 3', as
       },
     );
     assert.equal(result.status, 'completed');
+    assert.equal(runPolls, 2);
     assert.equal(result.facts?.decisions.build, 1);
     assert.equal(result.facts?.usage.totalTokens, 12);
     assert.deepEqual(result.facts?.pins, { source: 'sha' });

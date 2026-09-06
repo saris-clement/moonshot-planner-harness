@@ -94,6 +94,14 @@ test('campaign initialization freezes environment and pack bytes', async () => {
     assert.match(campaign.environmentSha, /^sha256:[a-f0-9]{64}$/);
     assert.equal(campaign.workflowsRemoteUrl, 'https://github.com/Saris-AI/workflows.git');
     assert.equal(campaign.config.environmentFile, path.join(data, 'campaigns/freeze-test/environment.env'));
+    assert.match(
+      await readFile(campaign.config.environmentFile, 'utf8'),
+      /PLANNER_ANALYSIS_TIMEOUT_MS=36000000/,
+    );
+    assert.match(
+      await readFile(campaign.config.environmentFile, 'utf8'),
+      /PLANNER_ANALYSIS_MAX_COST_USD=2000/,
+    );
     assert.equal(
       await readFile(campaign.config.benchmarks[0]!.zipPath, 'utf8'),
       'primary bytes',

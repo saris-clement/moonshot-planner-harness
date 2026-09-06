@@ -47,8 +47,9 @@ export const CampaignConfigSchema = z
       .object({
         replicates: z.number().int().min(1).max(10).default(3),
         replicateConcurrency: z.number().int().min(1).max(3).default(2),
+        analysisMaxCostUsd: z.number().finite().positive().max(1_000_000).default(2_000),
       })
-      .default({ replicates: 3, replicateConcurrency: 2 }),
+      .default({ replicates: 3, replicateConcurrency: 2, analysisMaxCostUsd: 2_000 }),
     limits: z
       .object({
         concurrency: z.number().int().min(1).max(3).default(3),
@@ -308,10 +309,14 @@ export const DiagnosisReconstructionSignalSchema = z
   .strict();
 export type DiagnosisReconstructionSignal = z.infer<typeof DiagnosisReconstructionSignalSchema>;
 
+export const DiagnosisLineageArmSchema = z.enum(['standard', 'control', 'excluded']);
+export type DiagnosisLineageArm = z.infer<typeof DiagnosisLineageArmSchema>;
+
 const DiagnosisLineageSchema = z
   .object({
     benchmark: z.string().min(1).max(128),
     role: z.enum(['primary', 'holdout']),
+    arm: DiagnosisLineageArmSchema.default('standard'),
     replicate: z.number().int().positive(),
     caseId: z.string().min(1).max(256).nullable(),
     runId: z.string().min(1).max(256).nullable(),
@@ -340,7 +345,20 @@ export const DiagnosisInputSchema = z
               sha256: Sha256Schema.nullable(),
             })
             .strict(),
-        ),
+          ),
+        targetExcludedProtocol: z
+          .object({
+            targetImplementationWorkflow: WorkflowKeySchema,
+            baselineVariantId: z.string().min(1).max(256),
+            comparatorImage: Sha256Schema,
+            replicates: z.literal(2),
+            concurrency: z.literal(2),
+            warningBuildDropRatio: z.literal(0.08),
+            blockBuildDropRatio: z.literal(0.15),
+            sourceManifestSha256: Sha256Schema.nullable(),
+          })
+          .strict()
+          .optional(),
       })
       .strict(),
     variant: z
@@ -681,6 +699,7 @@ export interface VariantRecord {
   executionState: VariantExecutionState | null;
   diagnosisStatus: DiagnosisStatus;
   diagnosisInputHash: string | null;
+  diagnosisResultHash: string | null;
   diagnosis: DiagnosisOutput | null;
   diagnosisError: string | null;
   error: string | null;

@@ -136,6 +136,8 @@ export function buildTargetExcludedComparisonDockerCommand(
       '--network',
       'none',
       '--read-only',
+      '--tmpfs',
+      '/tmp:rw,noexec,nosuid,size=64m',
       '--cap-drop',
       'ALL',
       '--security-opt',

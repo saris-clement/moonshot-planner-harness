@@ -39,6 +39,12 @@ export interface ResolvedBenchmarkPack {
   summary: BenchmarkQuestionResolution;
 }
 
+interface ResolvedAnswerCandidate {
+  answer: string;
+  evidence: string[];
+  resolution: 'requirements_agent' | 'source_fallback';
+}
+
 const digest = (bytes: Uint8Array): string =>
   `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 
@@ -155,6 +161,8 @@ export async function resolveBenchmarkQuestions(input: {
   workflowsSource: string;
   sharedDirectory: string;
   artifactDirectory: string;
+  answerAllowed?: (candidate: ResolvedAnswerCandidate) => boolean;
+  agent?: Pick<AgentRunner, 'answerUpstreamQuestion'>;
 }): Promise<ResolvedBenchmarkPack> {
   await Promise.all([
     mkdir(input.sharedDirectory, { recursive: true }),
@@ -168,6 +176,21 @@ export async function resolveBenchmarkQuestions(input: {
   ) {
     const persisted = JSON.parse(await readFile(sharedSummaryPath, 'utf8')) as BenchmarkQuestionResolution;
     if (persisted.derivationVersion === 2) {
+      if (
+        input.answerAllowed &&
+        persisted.entries.some((entry) =>
+          !input.answerAllowed!({
+            answer: entry.answer,
+            evidence: entry.evidence,
+            resolution:
+              entry.resolution === 'requirements_agent'
+                ? 'requirements_agent'
+                : 'source_fallback',
+          }),
+        )
+      ) {
+        throw new Error(`persisted resolved pack contains a disallowed answer: ${input.benchmark.name}`);
+      }
       const summary = {
         ...persisted,
         requirementsAgentRequests: 0,
@@ -204,25 +227,35 @@ export async function resolveBenchmarkQuestions(input: {
   let advisorAnswers = 0;
   let sourceAnswers = 0;
   const answeredAt = new Date().toISOString();
-  const agent = new AgentRunner(input.campaign);
+  const agent = input.agent ?? new AgentRunner(input.campaign);
 
   for (const [fileName, question] of openQuestions) {
     const advisor = await askRequirementsAgent(input.campaign, question, input.artifactDirectory);
-    let answer: string;
-    let evidence: string[];
-    let resolution: QuestionResolutionEntry['resolution'];
+    let answer: string | undefined;
+    let evidence: string[] | undefined;
+    let resolution: QuestionResolutionEntry['resolution'] | undefined;
     if (advisor.resolution === 'answered' && typeof advisor.answer === 'string') {
-      answer = advisor.answer.trim();
+      const advisorAnswer = advisor.answer.trim();
       const citations = Array.isArray(advisor.citations)
         ? (advisor.citations as Array<{ entity: string; anchor?: string; quote?: string }>)
         : [];
-      evidence = citations.map((citation) =>
+      const advisorEvidence = citations.map((citation) =>
         citation.anchor ? `${citation.entity}#${citation.anchor}` : citation.entity,
       );
-      if (evidence.length === 0) evidence.push('requirements-agent returned a grounded answer');
-      resolution = 'requirements_agent';
-      advisorAnswers += 1;
-    } else {
+      if (advisorEvidence.length === 0) advisorEvidence.push('requirements-agent returned a grounded answer');
+      const candidate: ResolvedAnswerCandidate = {
+        answer: advisorAnswer,
+        evidence: advisorEvidence,
+        resolution: 'requirements_agent',
+      };
+      if (!input.answerAllowed || input.answerAllowed(candidate)) {
+        answer = candidate.answer;
+        evidence = candidate.evidence;
+        resolution = candidate.resolution;
+        advisorAnswers += 1;
+      }
+    }
+    if (!answer) {
       const source = await agent.answerUpstreamQuestion(
         {
           id: question.id,
@@ -241,7 +274,13 @@ export async function resolveBenchmarkQuestions(input: {
       answer = source.answer.trim();
       evidence = source.evidence;
       resolution = 'source_fallback';
+      if (input.answerAllowed && !input.answerAllowed({ answer, evidence, resolution })) {
+        throw new Error(`blocking question ${question.id} produced a disallowed source answer`);
+      }
       sourceAnswers += 1;
+    }
+    if (!answer || !evidence || !resolution) {
+      throw new Error(`blocking question ${question.id} did not produce a complete answer`);
     }
     files[fileName] = strToU8(
       stringify(applyAnswer(question, answer, `planner-eval-harness/${resolution}`, answeredAt)),

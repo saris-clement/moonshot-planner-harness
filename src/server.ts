@@ -282,7 +282,7 @@ export function startDashboard(input: {
           plannerRepo,
           workflowsRepo: path.resolve(process.cwd(), '../workflows'),
           environmentFile: path.join(plannerRepo, '.env'),
-          seedRevision: 'feat/counterfactual-source-policy',
+          seedRevision: 'a0dac3ec7b416b27dd3b4260717cdfea7dd8232a',
           workflowsRevision: 'HEAD',
         });
         return;

@@ -4,7 +4,7 @@
   "plannerRepo": "/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner",
   "workflowsRepo": "/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/workflows",
   "environmentFile": "/absolute/path/to/planner-eval.env",
-  "seedRevision": "feat/counterfactual-source-policy",
+  "seedRevision": "a0dac3ec7b416b27dd3b4260717cdfea7dd8232a",
   "workflowsRevision": "REPLACE_WITH_EXACT_WORKFLOWS_SHA",
   "benchmarks": [
     {
@@ -20,8 +20,9 @@
   ],
   "mode": "supervised",
   "evaluation": {
-    "replicates": 3,
-    "replicateConcurrency": 2
+    "replicates": 2,
+    "replicateConcurrency": 2,
+    "analysisMaxCostUsd": 2000
   },
   "limits": {
     "concurrency": 3,

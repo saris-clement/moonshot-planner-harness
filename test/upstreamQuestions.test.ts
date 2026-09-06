@@ -154,3 +154,92 @@ test('requirements-agent answers produce one reusable derived pack', async () =>
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('target-safe resolution rejects advisor leakage and falls back to the filtered source agent', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'planner-eval-target-safe-'));
+  const server = createServer((_request, response) => {
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({
+      resolution: 'answered',
+      answer: 'Use trumark/deceased-accounts implementation behavior.',
+      citations: [{ entity: 'src/customers/trumark/deceased-accounts/index.ts' }],
+    }));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('question test server did not bind');
+  const environmentFile = path.join(root, 'planner.env');
+  await writeFile(
+    environmentFile,
+    `PLANNER_REQUIREMENTS_AGENT_BASE_URL=http://127.0.0.1:${address.port}\nPLANNER_REQUIREMENTS_AGENT_SERVICE_SECRET=${'s'.repeat(32)}\n`,
+  );
+  const question = {
+    id: 'question-safe',
+    type: 'data_request',
+    workflow: 'trumark/deceased-account',
+    question: 'Which read boundary applies?',
+    severity: 'blocking',
+    status: 'open',
+    options: [{ id: 'option-safe', label: 'Provide', description: 'Provide the value.' }],
+  };
+  const bytes = zipSync({
+    'manifest.yaml': strToU8(stringify({ workflow: question.workflow, questions: { open: 1, answered: 0, total: 1 } })),
+    'SUMMARY.yaml': strToU8(stringify({ exportHash: 'original', binding: { openQuestions: [question] } })),
+    'questions/question-safe.yaml': strToU8(stringify(question)),
+  });
+  const zipPath = path.join(root, 'pack.zip');
+  await writeFile(zipPath, bytes);
+  const config = CampaignConfigSchema.parse({
+    id: 'target-safe',
+    goal: 'Resolve one target-safe imported question for a counterfactual pair.',
+    plannerRepo: root,
+    workflowsRepo: root,
+    environmentFile,
+    seedRevision: 'seed',
+    workflowsRevision: 'source',
+    benchmarks: [
+      { name: 'primary', role: 'primary', zipPath },
+      { name: 'holdout', role: 'holdout', zipPath },
+    ],
+  });
+  const campaign: CampaignRecord = {
+    id: config.id,
+    status: 'ready',
+    config,
+    seedSha: 'a'.repeat(40),
+    workflowsSha: 'b'.repeat(40),
+    environmentSha: `sha256:${'c'.repeat(64)}`,
+    workflowsRemoteUrl: 'https://github.com/Saris-AI/workflows.git',
+    currentParentVariantId: null,
+    noImprovementRounds: 0,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  try {
+    const resolved = await resolveBenchmarkQuestions({
+      campaign,
+      benchmark: config.benchmarks[0]!,
+      workflowsSource: root,
+      sharedDirectory: path.join(root, 'safe'),
+      artifactDirectory: path.join(root, 'artifacts'),
+      answerAllowed: ({ answer, evidence }) =>
+        !`${answer}\n${evidence.join('\n')}`.includes('trumark/deceased-accounts'),
+      agent: {
+        answerUpstreamQuestion: async () => ({
+          resolution: 'answered',
+          answer: 'Use the shared read-only integration boundary.',
+          evidence: ['src/modules/shared/read.ts:1'],
+        }),
+      },
+    });
+    assert.equal(resolved.summary.requirementsAgentAnswers, 0);
+    assert.equal(resolved.summary.sourceFallbackAnswers, 1);
+    assert.equal(resolved.summary.entries[0]?.answer, 'Use the shared read-only integration boundary.');
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    await rm(root, { recursive: true, force: true });
+  }
+});

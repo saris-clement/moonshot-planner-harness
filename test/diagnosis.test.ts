@@ -6,10 +6,12 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   assembleDiagnosisInput,
+  diagnosisResultPath,
   verifyDiagnosisArtifacts,
+  verifyDiagnosisResult,
 } from '../src/diagnosis.js';
 import { HarnessDatabase } from '../src/db.js';
-import { CampaignConfigSchema, type RunFacts } from '../src/types.js';
+import { CampaignConfigSchema, DiagnosisInputSchema, type RunFacts } from '../src/types.js';
 
 function stable(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stable);
@@ -69,6 +71,55 @@ function facts(): RunFacts {
         uncoveredSemantics: ['account alias'],
       },
     ],
+  };
+}
+
+function armFacts(
+  key: string,
+  decision: 'build' | 'reuse',
+  sourcePath: string,
+  sampleSize = 1,
+): RunFacts {
+  const value = facts();
+  return {
+    ...value,
+    sampleSize,
+    decisions: {
+      ...value.decisions,
+      build: decision === 'build' ? 1 : 0,
+      reuse: decision === 'reuse' ? 1 : 0,
+    },
+    units: [
+      {
+        ...value.units[0]!,
+        id: key.replaceAll(/[^a-z0-9]+/g, '-'),
+        key,
+        decision,
+        sourceRefs: [{ path: sourcePath, symbol: 'TargetAccountAlias' }],
+      },
+    ],
+  };
+}
+
+function comparisonReport(replicate: number, reportHash: string): Record<string, unknown> {
+  return {
+    kind: 'ainative-planner/evidence-visibility-comparison',
+    schemaVersion: 1,
+    generatedAt: `2026-09-06T00:00:0${replicate}.000Z`,
+    validity: {
+      valid: true,
+      arms: {
+        normal: { valid: true, errors: [] },
+        excluded: { valid: true, errors: [] },
+      },
+      pair: { valid: true, mismatches: [] },
+    },
+    leakage: { detected: false, count: 0, paths: [] },
+    measurements: {
+      fullBoundedDetail: `comparison-${replicate}`,
+      nested: { decisions: ['build', 'reuse'] },
+    },
+    hash: reportHash,
   };
 }
 
@@ -429,4 +480,299 @@ test('diagnosis assembly preserves explicit V1 hash-only and unavailable fields'
     value.database.close();
     await rm(value.root, { recursive: true, force: true });
   }
+});
+
+test('diagnosis lineage classifies standard and integrated excluded arms with both execution states', async () => {
+  const value = await fixture(2);
+  try {
+    const campaign = value.database.getCampaign(value.campaignId);
+    const variant = value.database.getVariant(value.variantId);
+    const excludedFacts = armFacts('solution/target#field-a', 'build', 'src/right.ts');
+    await writeJson(
+      path.join(value.artifacts, 'target-excluded', 'primary-pack', 'replicate-1', 'facts.json'),
+      excludedFacts,
+    );
+    value.database.createTargetExcludedEvaluation(value.campaignId, value.variantId);
+    const targetExcluded = value.database.updateTargetExcludedEvaluation(value.variantId, {
+      status: 'running',
+      excludedFacts,
+      excludedReplicateFacts: [excludedFacts],
+      executionState: {
+        executions: [
+          {
+            benchmark: 'primary-pack:target-excluded',
+            role: 'primary',
+            replicate: 1,
+            replicateCount: 1,
+            caseId: 'case-excluded-integrated',
+            runId: 'run-excluded-integrated',
+            status: 'completed',
+            stage: 'publishing',
+            progress: { completedUnits: 1, totalUnits: 1 },
+            decisions: excludedFacts.decisions,
+            questions: [],
+            updatedAt: '2026-09-06T00:00:01.000Z',
+          },
+        ],
+      },
+    });
+
+    const assembled = await assembleDiagnosisInput({
+      artifactDirectory: value.artifacts,
+      campaign,
+      variant,
+      labels: value.database.listLabels(value.campaignId),
+      targetExcluded,
+      workflowsSource: value.workflows,
+      environment: {},
+    });
+    const standard = assembled.input.lineage.find(
+      (item) => item.benchmark === 'primary-pack' && item.caseId === 'case-a',
+    );
+    const excluded = assembled.input.lineage.find(
+      (item) => item.benchmark === 'primary-pack' && item.caseId === 'case-excluded-integrated',
+    );
+    assert.equal(standard?.arm, 'standard');
+    assert.equal(excluded?.arm, 'excluded');
+    assert.equal(excluded?.runId, 'run-excluded-integrated');
+
+    const legacyParsed = DiagnosisInputSchema.parse({
+      ...assembled.input,
+      lineage: assembled.input.lineage.map((item) => {
+        const { arm: _arm, ...legacy } = item;
+        return legacy;
+      }),
+    });
+    assert.ok(legacyParsed.lineage.every((item) => item.arm === 'standard'));
+  } finally {
+    value.database.close();
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test('diagnosis includes target arm facts, judgment, reports, summary, and backfill lineage', async () => {
+  const value = await fixture(2);
+  try {
+    const campaign = value.database.getCampaign(value.campaignId);
+    const variant = value.database.getVariant(value.variantId);
+    const targetSource = 'src/target.ts';
+    await writeFile(
+      path.join(value.workflows, targetSource),
+      'export type TargetAccountAlias = string;\n',
+    );
+    const controlReplicates = [
+      armFacts('solution/control#field-a', 'build', targetSource),
+      armFacts('solution/control#field-a', 'reuse', targetSource),
+    ];
+    const excludedReplicates = [
+      armFacts('solution/target#field-a', 'build', targetSource),
+      armFacts('solution/target#field-a', 'reuse', targetSource),
+    ];
+    const controlFacts = armFacts('solution/control#field-a', 'build', targetSource, 2);
+    const excludedFacts = armFacts('solution/target#field-a', 'build', targetSource, 2);
+    for (const [arm, runFacts] of [
+      ['control', controlReplicates[0]],
+      ['excluded', excludedReplicates[0]],
+    ] as const) {
+      await writeJson(
+        path.join(
+          value.artifacts,
+          'target-excluded',
+          arm,
+          'primary-pack',
+          'replicate-1',
+          'facts.json',
+        ),
+        runFacts,
+      );
+    }
+    const comparisonHashes = [`sha256:${'6'.repeat(64)}`, `sha256:${'7'.repeat(64)}`];
+    const reports = comparisonHashes.map((hash, index) => comparisonReport(index + 1, hash));
+    for (const [index, report] of reports.entries()) {
+      await writeJson(
+        path.join(
+          value.artifacts,
+          'target-excluded',
+          'comparisons',
+          `replicate-${index + 1}.json`,
+        ),
+        report,
+      );
+    }
+
+    value.database.createTargetExcludedEvaluation(value.campaignId, value.variantId);
+    const targetExcluded = value.database.updateTargetExcludedEvaluation(value.variantId, {
+      status: 'failed',
+      controlFacts,
+      controlReplicateFacts: controlReplicates,
+      excludedFacts,
+      excludedReplicateFacts: excludedReplicates,
+      judgment: {
+        summary: 'The target-blind source suggests reuse.',
+        verdicts: [
+          {
+            unitKey: 'solution/target#field-a',
+            expectedDecision: 'reuse',
+            classification: 'system_error',
+            confidence: 'high',
+            rationale: 'The remaining source contains a shared alias.',
+            evidence: ['src/target.ts:1'],
+          },
+        ],
+      },
+      questionResolution: {
+        derivationVersion: 2,
+        benchmark: 'primary-pack',
+        originalArtifactSha: `sha256:${'8'.repeat(64)}`,
+        resolvedArtifactSha: `sha256:${'9'.repeat(64)}`,
+        blockingQuestions: 1,
+        requirementsAgentRequests: 1,
+        requirementsAgentAnswers: 1,
+        sourceFallbackAnswers: 0,
+        reusedAnswers: 0,
+        plannerQuestions: 0,
+        plannerRequirementsAgentRequests: 0,
+        plannerRequirementsAgentAnswers: 0,
+        plannerSourceFallbackAnswers: 0,
+        plannerReusedAnswers: 0,
+        entries: [
+          {
+            id: 'question-a',
+            question: 'Which alias remains available?',
+            resolution: 'requirements_agent',
+            answer: 'Use the shared alias.',
+            evidence: ['src/target.ts:1'],
+          },
+        ],
+      },
+      executionState: {
+        executions: [
+          ...(['control', 'excluded'] as const).map((arm) => ({
+            benchmark: `primary-pack:${arm}`,
+            role: 'primary' as const,
+            replicate: 1,
+            replicateCount: 2,
+            caseId: `case-${arm}`,
+            runId: `run-${arm}`,
+            status: 'completed',
+            stage: 'publishing',
+            progress: { completedUnits: 1, totalUnits: 1 },
+            decisions: arm === 'control' ? controlFacts.decisions : excludedFacts.decisions,
+            questions: [],
+            updatedAt: '2026-09-06T00:00:02.000Z',
+          })),
+        ],
+      },
+      comparisons: comparisonHashes.map((reportHash, index) => ({
+        replicate: index + 1,
+        valid: true,
+        mismatches: [],
+        leakagePaths: [],
+        reportHash,
+      })),
+      artifactCollectionComplete: false,
+      error: 'target archive interrupted',
+    });
+
+    const assembled = await assembleDiagnosisInput({
+      artifactDirectory: value.artifacts,
+      campaign,
+      variant,
+      labels: value.database.listLabels(value.campaignId),
+      targetExcluded,
+      workflowsSource: value.workflows,
+      environment: {},
+    });
+
+    for (const arm of ['control', 'excluded'] as const) {
+      const lineage = assembled.input.lineage.find(
+        (item) => item.benchmark === 'primary-pack' && item.caseId === `case-${arm}`,
+      );
+      assert.equal(lineage?.arm, arm);
+      assert.equal(lineage?.runId, `run-${arm}`);
+      const completeness = assembled.input.completeness.items.find(
+        (item) => item.component === 'replicate_facts' && item.scope.includes(arm),
+      );
+      assert.equal(completeness?.captured, 2);
+      assert.equal(completeness?.expected, 2);
+      assert.ok(
+        assembled.input.reconstructionSignals.some(
+          (item) =>
+            item.category === 'replicate_instability' &&
+            item.affectedUnitKeys.includes(
+              arm === 'control' ? 'solution/control#field-a' : 'solution/target#field-a',
+            ),
+        ),
+      );
+    }
+    assert.ok(
+      assembled.input.evidence.some(
+        (item) =>
+          item.kind === 'judge_verdict' &&
+          item.affectedUnitKeys.includes('solution/target#field-a') &&
+          JSON.stringify(item.data).includes('target-excluded'),
+      ),
+    );
+    assert.ok(
+      assembled.input.evidence.some(
+        (item) =>
+          item.kind === 'frozen_source_reference' &&
+          JSON.stringify(item.data).includes(targetSource),
+      ),
+    );
+
+    const comparisonEvidence = assembled.input.evidence
+      .filter((item) => item.kind === 'target_excluded_comparison')
+      .sort((left, right) =>
+        String(left.provenance.artifactPath).localeCompare(String(right.provenance.artifactPath)),
+      );
+    assert.equal(comparisonEvidence.length, 2);
+    for (const [index, item] of comparisonEvidence.entries()) {
+      const reportPath = path.join(
+        value.artifacts,
+        'target-excluded',
+        'comparisons',
+        `replicate-${index + 1}.json`,
+      );
+      assert.equal(item.provenance.integrity, 'verified');
+      assert.equal(item.provenance.artifactSha256, digest(await readFile(reportPath)));
+      assert.deepEqual(item.data, stable(reports[index]));
+    }
+
+    const summary = assembled.input.evidence.find(
+      (item) => item.kind === 'target_excluded_summary',
+    );
+    const summaryData = summary?.data as Record<string, unknown> | undefined;
+    assert.equal(summaryData?.error, 'target archive interrupted');
+    assert.equal(summaryData?.artifactCollectionComplete, false);
+    assert.deepEqual(summaryData?.comparisonHashes, comparisonHashes);
+    assert.deepEqual(summaryData?.questionResolution, stable(targetExcluded.questionResolution));
+  } finally {
+    value.database.close();
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test('diagnosis result verification binds SQLite state to immutable result bytes', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'planner-eval-diagnosis-result-'));
+  const inputSha256 = `sha256:${'a'.repeat(64)}`;
+  const result = {
+    kind: 'ainative-planner-eval/model-diagnosis' as const,
+    schemaVersion: 1 as const,
+    interpretationStatus: 'unverified_model_judgment' as const,
+    inputSha256,
+    summary: 'One bounded diagnosis.',
+    findings: [],
+    limitations: ['Fixture diagnosis has no findings.'],
+  };
+  const resultPath = diagnosisResultPath(root, inputSha256);
+  await writeJson(resultPath, result);
+  const resultHash = digest(await readFile(resultPath));
+  assert.deepEqual(await verifyDiagnosisResult(root, inputSha256, resultHash), result);
+  await writeJson(resultPath, { ...result, summary: 'Tampered.' });
+  await assert.rejects(
+    verifyDiagnosisResult(root, inputSha256, resultHash),
+    /result hash does not match/,
+  );
+  await rm(root, { recursive: true, force: true });
 });

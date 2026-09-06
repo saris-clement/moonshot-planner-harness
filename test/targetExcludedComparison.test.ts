@@ -43,12 +43,14 @@ test('buildTargetExcludedComparisonDockerCommand isolates inputs and preserves a
   });
 
   assert.equal(command.command, 'docker');
-  assert.deepEqual(command.args.slice(0, 11), [
+  assert.deepEqual(command.args.slice(0, 13), [
     'run',
     '--rm',
     '--network',
     'none',
     '--read-only',
+    '--tmpfs',
+    '/tmp:rw,noexec,nosuid,size=64m',
     '--cap-drop',
     'ALL',
     '--security-opt',

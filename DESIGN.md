@@ -78,7 +78,7 @@ This separation reduces, but cannot eliminate, correlated errors from using one 
 
 Primary scoring is lexicographic: verified accuracy, verified errors, provisional accuracy, then provisional errors. Cost and latency remain comparison dimensions rather than correctness weights.
 
-Every variant runs three repetitions of the primary pack and every unrelated holdout. Scoring uses a deterministic per-unit majority consensus while preserving all individual run facts and total cost. A holdout regression against the current parent blocks promotion. Provider output is stochastic, so decision agreement remains a first-class result rather than being hidden by the consensus.
+Every variant runs two repetitions of the primary pack and every unrelated holdout in parallel. Scoring uses a deterministic per-unit consensus while preserving all individual run facts and total cost. A holdout regression against the current parent blocks promotion. Provider output is stochastic, so decision agreement remains a first-class result rather than being hidden by the consensus.
 
 ## Security
 
@@ -122,7 +122,7 @@ Replicate matrices are configured-slot projections, not lists of observed runs. 
 
 ### 2026-09-05 - Initial UI-first harness
 
-Implemented frozen campaign intake, three-wide agent search, three-run primary and holdout consensus, isolated planner stacks, blind judging, human labels, artifact preservation, generated experiment Markdown, and browser-driven validation. The design favors accuracy and provenance over runtime and model cost.
+Implemented frozen campaign intake, three-wide agent search, two-run primary and holdout consensus, isolated planner stacks, blind judging, human labels, artifact preservation, generated experiment Markdown, and browser-driven validation. The design favors accuracy and provenance over runtime and model cost.
 
 ### 2026-09-06 - Live engineering console
 

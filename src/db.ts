@@ -20,7 +20,12 @@ import type {
   VariantRecord,
   VariantStatus,
 } from './types.js';
-import { CampaignConfigSchema, HypothesisSchema, TargetExcludedConfigSchema } from './types.js';
+import {
+  CampaignConfigSchema,
+  DiagnosisOutputSchema,
+  HypothesisSchema,
+  TargetExcludedConfigSchema,
+} from './types.js';
 import { mergeExecutionSnapshot } from './executionState.js';
 
 type Row = Record<string, unknown>;
@@ -96,8 +101,12 @@ function variantFromRow(row: Row): VariantRecord {
     diagnosisStatus: String(row.diagnosis_status) as DiagnosisStatus,
     diagnosisInputHash:
       row.diagnosis_input_hash === null ? null : String(row.diagnosis_input_hash),
+    diagnosisResultHash:
+      row.diagnosis_result_hash === null ? null : String(row.diagnosis_result_hash),
     diagnosis:
-      row.diagnosis_json === null ? null : parseJson<DiagnosisOutput>(row.diagnosis_json),
+      row.diagnosis_json === null
+        ? null
+        : DiagnosisOutputSchema.parse(parseJson<DiagnosisOutput>(row.diagnosis_json)),
     diagnosisError: row.diagnosis_error === null ? null : String(row.diagnosis_error),
     error: row.error === null ? null : String(row.error),
     startedAt: row.started_at === null ? null : String(row.started_at),
@@ -240,6 +249,7 @@ export class HarnessDatabase {
         execution_state_json TEXT,
         diagnosis_status TEXT NOT NULL DEFAULT 'not_started',
         diagnosis_input_hash TEXT,
+        diagnosis_result_hash TEXT,
         diagnosis_json TEXT,
         diagnosis_error TEXT,
         error TEXT,
@@ -331,6 +341,7 @@ export class HarnessDatabase {
     this.ensureColumn('variants', 'execution_state_json', 'TEXT');
     this.ensureColumn('variants', 'diagnosis_status', "TEXT NOT NULL DEFAULT 'not_started'");
     this.ensureColumn('variants', 'diagnosis_input_hash', 'TEXT');
+    this.ensureColumn('variants', 'diagnosis_result_hash', 'TEXT');
     this.ensureColumn('variants', 'diagnosis_json', 'TEXT');
     this.ensureColumn('variants', 'diagnosis_error', 'TEXT');
     this.ensureColumn('variants', 'started_at', 'TEXT');
@@ -516,6 +527,7 @@ export class HarnessDatabase {
       executionState: VariantExecutionState | null;
       diagnosisStatus: DiagnosisStatus;
       diagnosisInputHash: string | null;
+      diagnosisResultHash: string | null;
       diagnosis: DiagnosisOutput | null;
       diagnosisError: string | null;
       error: string | null;
@@ -547,6 +559,7 @@ export class HarnessDatabase {
       executionState: 'execution_state_json',
       diagnosisStatus: 'diagnosis_status',
       diagnosisInputHash: 'diagnosis_input_hash',
+      diagnosisResultHash: 'diagnosis_result_hash',
       diagnosis: 'diagnosis_json',
       diagnosisError: 'diagnosis_error',
       error: 'error',
@@ -687,6 +700,10 @@ export class HarnessDatabase {
       )
       .run(campaignId, JSON.stringify(config), timestamp, timestamp);
     this.addEvent(campaignId, null, 'target_excluded.configured', config);
+    this.markCampaignDiagnosesStale(
+      campaignId,
+      `Target-excluded protocol configured for ${config.targetImplementationWorkflow}.`,
+    );
     return config;
   }
 

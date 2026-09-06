@@ -96,6 +96,7 @@ async function fixture(): Promise<{
     executionState: null,
     diagnosisStatus: 'not_started',
     diagnosisInputHash: null,
+    diagnosisResultHash: null,
     diagnosis: null,
     diagnosisError: null,
     error: null,

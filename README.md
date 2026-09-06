@@ -16,7 +16,7 @@ It is deliberately a one-machine tool: one coordinator process, SQLite state, di
 - Persists human-reviewed labels independently from model suggestions.
 - Reconstructs bounded, cited post-run diagnoses from durable planner/S3 artifacts, optional Langfuse observations, frozen source references, judge evidence, labels, and replicate facts before proposing a planner mutation.
 - Generates one Markdown record per experiment under `docs/experiments/<campaign>/`.
-- Runs three primary and three holdout repetitions for every variant, then scores their unit-level consensus.
+- Runs two primary and two holdout repetitions in parallel for every variant, then scores their unit-level consensus.
 
 ## Prerequisites
 
@@ -128,7 +128,7 @@ The test suite covers persistence, scoring precedence, cohort drift, command arg
 ## Current Operational Limits
 
 - A stop request prevents the next iteration and automatic promotion, but does not terminate a model call already in flight.
-- Three repetitions are the default. Increase `evaluation.replicates` for confirmation campaigns when decision agreement remains weak.
+- Two repetitions are the default. Increase `evaluation.replicates` for confirmation campaigns when decision agreement remains weak.
 - Campaign execution is single-coordinator. Do not run dashboard and mutating CLI commands against the same campaign simultaneously.
 - Node currently labels built-in SQLite as experimental; all state is also represented by raw artifacts and generated Markdown.
 - Live execution projections must be persisted in SQLite. The server does not hydrate missing execution state from archived artifacts.

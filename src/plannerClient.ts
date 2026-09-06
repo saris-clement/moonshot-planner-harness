@@ -9,6 +9,17 @@ import type { Phase2RunSnapshot, RunFacts } from './types.js';
 
 type JsonRecord = Record<string, unknown>;
 
+class PlannerHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string | null,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'PlannerHttpError';
+  }
+}
+
 function isRecord(value: unknown): value is JsonRecord {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -114,7 +125,11 @@ export class PlannerClient {
       `${JSON.stringify(value, null, 2)}\n`,
     );
     if (!response.ok) {
-      throw new Error(`${init.method ?? 'GET'} ${requestPath} failed (${response.status}): ${text.slice(0, 2_000)}`);
+      throw new PlannerHttpError(
+        response.status,
+        isRecord(value) && typeof value.error === 'string' ? value.error : null,
+        `${init.method ?? 'GET'} ${requestPath} failed (${response.status}): ${text.slice(0, 2_000)}`,
+      );
     }
     return value;
   }
@@ -222,7 +237,16 @@ export class PlannerClient {
     };
     await emitSnapshot(created, null);
 
-    await this.request('analysis-readiness', `/api/planning-cases/${caseId}/analysis-readiness`);
+    const readiness = await this.request(
+      'analysis-readiness',
+      `/api/planning-cases/${caseId}/analysis-readiness`,
+    );
+    if (isRecord(readiness) && readiness.ready === false) {
+      const blockers = Array.isArray(readiness.blockerCodes)
+        ? readiness.blockerCodes.filter((value): value is string => typeof value === 'string')
+        : [];
+      throw new Error(`analysis readiness blocked${blockers.length ? `: ${blockers.join(', ')}` : ''}`);
+    }
     const admitted = await this.request('analysis-admitted', `/api/planning-cases/${caseId}/runs`, {
       method: 'POST',
       headers: {
@@ -238,14 +262,29 @@ export class PlannerClient {
     const deadline = Date.now() + timeoutMs;
     let run: unknown = admitted;
     let status = runStatus(run);
+    let transientPollFailures = 0;
     while (true) {
       while (status === 'queued' || status === 'running') {
         if (Date.now() >= deadline) throw new Error(`Phase 2 run timed out after ${timeoutMs}ms`);
         await new Promise((resolve) => setTimeout(resolve, 1_000));
-        run = await this.request(
-          'analysis-run-latest',
-          `/api/planning-cases/${caseId}/runs/${runId}`,
-        );
+        try {
+          run = await this.request(
+            'analysis-run-latest',
+            `/api/planning-cases/${caseId}/runs/${runId}`,
+          );
+          transientPollFailures = 0;
+        } catch (error) {
+          if (
+            error instanceof PlannerHttpError &&
+            error.status === 400 &&
+            error.code === 'InvalidRequest' &&
+            transientPollFailures < 30
+          ) {
+            transientPollFailures += 1;
+            continue;
+          }
+          throw error;
+        }
         status = runStatus(run);
         await emitSnapshot(run, runId);
       }
