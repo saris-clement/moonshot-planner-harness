@@ -50,6 +50,7 @@ import {
   ensureVariantArtifactDirectory,
   loadCampaignEnvironment,
   prepareVariantWorktree,
+  reattachVariantStack,
   runVariantGates,
   startVariantStack,
   stopVariantStack,
@@ -190,27 +191,28 @@ interface PendingTargetAnswer {
   reject: (error: Error) => void;
 }
 
-function withRuntimeQuestions(
+export function withRuntimeQuestions(
   summary: NonNullable<VariantRecord['questionResolutions']>[string],
   questions: readonly Phase2QuestionAudit[],
+  arm?: 'control' | 'excluded',
 ): NonNullable<VariantRecord['questionResolutions']>[string] {
   return {
     ...summary,
-    plannerQuestions: questions.length,
-    plannerRequirementsAgentRequests: questions.reduce(
+    plannerQuestions: summary.plannerQuestions + questions.length,
+    plannerRequirementsAgentRequests: summary.plannerRequirementsAgentRequests + questions.reduce(
       (total, question) => total + question.requirementsAgentRequests,
       0,
     ),
-    plannerRequirementsAgentAnswers: questions.filter(
+    plannerRequirementsAgentAnswers: summary.plannerRequirementsAgentAnswers + questions.filter(
       (question) => question.resolution === 'requirements_agent',
     ).length,
-    plannerSourceFallbackAnswers: questions.filter(
+    plannerSourceFallbackAnswers: summary.plannerSourceFallbackAnswers + questions.filter(
       (question) => question.resolution === 'source_fallback',
     ).length,
-    plannerReusedAnswers: questions.filter(
+    plannerReusedAnswers: summary.plannerReusedAnswers + questions.filter(
       (question) => question.resolution === 'reused_source_answer',
     ).length,
-    plannerHumanAnswers: questions.filter(
+    plannerHumanAnswers: (summary.plannerHumanAnswers ?? 0) + questions.filter(
       (question) => question.resolution === 'human_answer',
     ).length,
     entries: [
@@ -221,6 +223,7 @@ function withRuntimeQuestions(
         resolution: question.resolution,
         answer: question.answer,
         evidence: question.evidence,
+        ...(arm ? { arm } : {}),
       })),
     ],
   };
@@ -336,6 +339,270 @@ export class CampaignOrchestrator {
       const config = this.database.getTargetExcludedConfig(campaignId);
       if (!config) throw new Error('target-excluded protocol is not configured');
       return await this.runTargetExcludedBackfill(campaign, variant, config);
+    });
+  }
+
+  async finalizeLiveTargetExcluded(
+    campaignId: string,
+    variantId: string,
+  ): Promise<TargetExcludedEvaluationRecord> {
+    return await this.withCampaignLock(campaignId, async () => {
+      const campaign = this.database.getCampaign(campaignId);
+      const variant = this.database.getVariant(variantId);
+      const config = this.database.getTargetExcludedConfig(campaignId);
+      const existing = this.database.getTargetExcludedEvaluation(variantId);
+      if (!config || !existing || variant.campaignId !== campaignId) {
+        throw new Error('target-excluded live evaluation is not configured');
+      }
+      if (existing.status === 'completed' && existing.artifactCollectionComplete) {
+        return existing;
+      }
+      const artifactDirectory = path.join(
+        variantArtifactDirectory(this.paths, campaign.id, variant.id),
+        'target-excluded',
+      );
+      const stack = await reattachVariantStack(
+        campaign,
+        variant,
+        artifactDirectory,
+        await this.ensureFrozenPlannerSource(campaign),
+      );
+      const token = stack.environment.PLANNER_EVAL_API_TOKEN || stack.environment.PLANNER_API_TOKEN;
+      const primary = primaryBenchmark(campaign);
+      const excludedExecutions = existing.executionState?.executions
+        .filter((execution) => execution.benchmark === `${primary.name}:excluded`)
+        .sort((left, right) => left.replicate - right.replicate) ?? [];
+      if (excludedExecutions.length !== config.replicates) {
+        throw new Error('live target-excluded execution set is incomplete');
+      }
+      const results = [] as Phase2Result[];
+      for (const execution of excludedExecutions) {
+        if (!execution.caseId) throw new Error('live target-excluded execution omitted its case ID');
+        const response = await fetch(
+          `${stack.baseUrl}/api/planning-cases/${execution.caseId}/runs`,
+          {
+            headers: token
+              ? { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+              : { Accept: 'application/json' },
+            signal: AbortSignal.timeout(120_000),
+          },
+        );
+        if (!response.ok) throw new Error(`failed to list live target runs (${response.status})`);
+        const body = await response.json() as { runs?: unknown[] };
+        const completed = (body.runs ?? [])
+          .filter(isRecord)
+          .filter((candidate) =>
+            (isRecord(candidate.runtime) && candidate.runtime.status === 'completed') ||
+            (isRecord(candidate.run) && candidate.run.status === 'completed'),
+          )
+          .sort((left, right) =>
+            Date.parse(String((isRecord(right.run) ? right.run.updatedAt : '') ?? '')) -
+            Date.parse(String((isRecord(left.run) ? left.run.updatedAt : '') ?? '')),
+          )[0];
+        const runId = isRecord(completed?.run) && typeof completed.run.id === 'string'
+          ? completed.run.id
+          : null;
+        if (!runId) {
+          throw new Error(`target-excluded replicate ${execution.replicate} is still running`);
+        }
+        const directory = path.join(
+          artifactDirectory,
+          'excluded',
+          primary.name,
+          `replicate-${execution.replicate}`,
+        );
+        const result = await new PlannerClient(stack.baseUrl, directory, token)
+          .collectCompletedPhase2(execution.caseId, runId);
+        await writeFile(path.join(directory, 'result.json'), `${JSON.stringify(result, null, 2)}\n`);
+        if (result.facts) {
+          const completedAt = new Date().toISOString();
+          const elapsedMs = execution.startedAt
+            ? Math.max(0, Date.parse(completedAt) - Date.parse(execution.startedAt))
+            : null;
+          this.database.updateTargetExcludedExecution(variant.id, {
+            benchmark: `${primary.name}:excluded`,
+            role: 'primary',
+            replicate: execution.replicate,
+            replicateCount: config.replicates,
+            snapshot: {
+              caseId: execution.caseId,
+              runId,
+              status: 'completed',
+              stage: 'completed',
+              progress: {
+                completedUnits: result.facts.unitCount,
+                totalUnits: result.facts.unitCount,
+              },
+              decisions: result.facts.decisions,
+              questions: result.questions.map((question) => ({
+                id: question.questionId,
+                type: 'unknown',
+                ownerRole: 'unknown',
+                priority: 'blocking',
+                prompt: question.prompt,
+                rationale: '',
+                status: 'answered',
+                answer: question.answer,
+                resolution: question.resolution,
+                evidence: question.evidence,
+                createdAt: null,
+                updatedAt: null,
+              })),
+              completedAt,
+              elapsedMs,
+              usage: result.facts.usage,
+              updatedAt: completedAt,
+            },
+          });
+        }
+        results.push(result);
+      }
+      const excludedReplicates = results.map(({ facts }, index) => {
+        if (!facts) throw new Error(`target-excluded replicate ${index + 1} omitted facts`);
+        validateMeaningfulFacts(facts);
+        return facts;
+      });
+      const excludedFacts = consensusRunFacts(excludedReplicates);
+      const excludedRoot = path.join(artifactDirectory, 'excluded', primary.name);
+      await Promise.all([
+        writeFile(path.join(excludedRoot, 'facts.json'), `${JSON.stringify(excludedFacts, null, 2)}\n`),
+        writeFile(path.join(excludedRoot, 'replicates.json'), `${JSON.stringify(excludedReplicates, null, 2)}\n`),
+      ]);
+      const controlFacts = JSON.parse(
+        await readFile(path.join(artifactDirectory, 'control', primary.name, 'facts.json'), 'utf8'),
+      ) as RunFacts;
+      const controlReplicates = JSON.parse(
+        await readFile(path.join(artifactDirectory, 'control', primary.name, 'replicates.json'), 'utf8'),
+      ) as RunFacts[];
+      const controlQuestions = (
+        await Promise.all(
+          Array.from({ length: config.replicates }, async (_, index) =>
+            JSON.parse(
+              await readFile(
+                path.join(
+                  artifactDirectory,
+                  'control',
+                  primary.name,
+                  `replicate-${index + 1}`,
+                  'result.json',
+                ),
+                'utf8',
+              ),
+            ) as Phase2Result,
+          ),
+        )
+      ).flatMap(({ questions }) => questions);
+      const holdoutFacts: Record<string, RunFacts> = {};
+      const holdoutReplicateFacts: Record<string, RunFacts[]> = {};
+      for (const holdout of campaign.config.benchmarks.filter(({ role }) => role === 'holdout')) {
+        holdoutFacts[holdout.name] = JSON.parse(
+          await readFile(path.join(artifactDirectory, 'control', holdout.name, 'facts.json'), 'utf8'),
+        ) as RunFacts;
+        holdoutReplicateFacts[holdout.name] = JSON.parse(
+          await readFile(path.join(artifactDirectory, 'control', holdout.name, 'replicates.json'), 'utf8'),
+        ) as RunFacts[];
+      }
+      const comparisonDirectory = path.join(artifactDirectory, 'comparisons');
+      await mkdir(comparisonDirectory, { recursive: true });
+      const comparisons = await Promise.all(
+        Array.from({ length: config.replicates }, (_, index) =>
+          runTargetExcludedComparison({
+            normalArtifactDirectory: path.join(
+              artifactDirectory,
+              'control',
+              primary.name,
+              `replicate-${index + 1}`,
+            ),
+            excludedArtifactDirectory: path.join(
+              artifactDirectory,
+              'excluded',
+              primary.name,
+              `replicate-${index + 1}`,
+            ),
+            outputPath: path.join(comparisonDirectory, `replicate-${index + 1}.json`),
+            imageTag: config.comparatorImage,
+            replicate: index + 1,
+          }),
+        ),
+      );
+      const summaryPath = path.join(
+        campaignDirectory(this.paths, campaign.id),
+        'target-excluded-resolved-packs',
+        `${primary.name}.questions.json`,
+      );
+      const summary = JSON.parse(await readFile(summaryPath, 'utf8')) as NonNullable<
+        VariantRecord['questionResolutions']
+      >[string];
+      const questionResolution = withRuntimeQuestions(
+        withRuntimeQuestions(summary, controlQuestions, 'control'),
+        results.flatMap(({ questions }) => questions),
+        'excluded',
+      );
+      this.database.updateTargetExcludedEvaluation(variant.id, {
+        status: 'judging',
+        controlFacts,
+        controlReplicateFacts: controlReplicates,
+        holdoutFacts,
+        holdoutReplicateFacts,
+        excludedFacts,
+        excludedReplicateFacts: excludedReplicates,
+        questionResolution,
+        comparisons,
+      });
+      const judged = await this.judgeTargetExcluded(
+        campaign,
+        variant,
+        primary,
+        excludedFacts,
+        config,
+        excludedRoot,
+      );
+      const comparisonValid = comparisons.length === config.replicates &&
+        comparisons.every(({ valid }) => valid);
+      const leakageDetected = comparisons.some(({ leakagePaths }) => leakagePaths.length > 0) ||
+        containsTargetIdentityLeak(judged.judgment, config.targetImplementationWorkflow);
+      const baseline = this.database.getTargetExcludedEvaluation(config.baselineVariantId);
+      const baselineRuns = variant.id === config.baselineVariantId
+        ? excludedReplicates
+        : baseline?.excludedReplicateFacts ?? [];
+      const gate = computeTargetExcludedGate(
+        baselineRuns,
+        excludedReplicates,
+        comparisonValid,
+        leakageDetected,
+        config.warningBuildDropRatio,
+        config.blockBuildDropRatio,
+      );
+      this.database.updateTargetExcludedEvaluation(variant.id, {
+        status: 'completed',
+        judgment: judged.judgment,
+        score: judged.score,
+        gate,
+        completedAt: new Date().toISOString(),
+      });
+      let collectionComplete = true;
+      try {
+        await collectStackArtifacts(stack);
+      } catch (error) {
+        collectionComplete = false;
+        this.database.addEvent(campaign.id, variant.id, 'target_excluded.artifacts_failed', {
+          error: errorMessage(error),
+        });
+      }
+      await stopVariantStack(stack, collectionComplete);
+      const evaluation = this.database.updateTargetExcludedEvaluation(variant.id, {
+        artifactCollectionComplete: collectionComplete,
+        ...(collectionComplete
+          ? {}
+          : { status: 'failed', error: 'required target-excluded artifacts were not completely archived' }),
+      });
+      await this.runDiagnosis(
+        campaign,
+        this.database.getVariant(variant.id),
+        variantArtifactDirectory(this.paths, campaign.id, variant.id),
+      );
+      await this.refreshReports(campaign.id);
+      return evaluation;
     });
   }
 
@@ -1265,8 +1532,9 @@ export class CampaignOrchestrator {
               excludedFacts: targetExcludedRuns.facts,
               excludedReplicateFacts: targetExcludedRuns.replicates,
               questionResolution: withRuntimeQuestions(
-                withRuntimeQuestions(targetPair.summary, targetControlRuns.questions),
+                withRuntimeQuestions(targetPair.summary, targetControlRuns.questions, 'control'),
                 targetExcludedRuns.questions,
+                'excluded',
               ),
               comparisons: targetComparisons,
               status: 'judging',
@@ -1936,8 +2204,9 @@ export class CampaignOrchestrator {
         excludedFacts: excluded.facts,
         excludedReplicateFacts: excluded.replicates,
         questionResolution: withRuntimeQuestions(
-          withRuntimeQuestions(resolutions[primary.name]!, control.questions),
+          withRuntimeQuestions(resolutions[primary.name]!, control.questions, 'control'),
           excluded.questions,
+          'excluded',
         ),
         comparisons,
       });

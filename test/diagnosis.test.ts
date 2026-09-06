@@ -101,8 +101,8 @@ function armFacts(
   };
 }
 
-function comparisonReport(replicate: number, reportHash: string): Record<string, unknown> {
-  return {
+function comparisonReport(replicate: number): Record<string, unknown> {
+  const value = {
     kind: 'ainative-planner/evidence-visibility-comparison',
     schemaVersion: 1,
     generatedAt: `2026-09-06T00:00:0${replicate}.000Z`,
@@ -119,8 +119,8 @@ function comparisonReport(replicate: number, reportHash: string): Record<string,
       fullBoundedDetail: `comparison-${replicate}`,
       nested: { decisions: ['build', 'reuse'] },
     },
-    hash: reportHash,
   };
+  return { ...value, hash: digest(canonical(value)) };
 }
 
 async function transcriptRef(
@@ -586,8 +586,8 @@ test('diagnosis includes target arm facts, judgment, reports, summary, and backf
         runFacts,
       );
     }
-    const comparisonHashes = [`sha256:${'6'.repeat(64)}`, `sha256:${'7'.repeat(64)}`];
-    const reports = comparisonHashes.map((hash, index) => comparisonReport(index + 1, hash));
+    const reports = [comparisonReport(1), comparisonReport(2)];
+    const comparisonHashes = reports.map((report) => String(report.hash));
     for (const [index, report] of reports.entries()) {
       await writeJson(
         path.join(

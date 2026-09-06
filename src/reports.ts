@@ -138,6 +138,8 @@ Status: \`${variant.diagnosisStatus}\`
 
 Input hash: ${variant.diagnosisInputHash ? `\`${variant.diagnosisInputHash}\`` : 'unavailable'}
 
+Result hash: ${variant.diagnosisResultHash ? `\`${variant.diagnosisResultHash}\`` : 'unavailable'}
+
 ${quote(variant.diagnosis?.summary ?? variant.diagnosisError ?? 'No model-generated diagnosis is available.')}
 
 ${diagnosisFindings || 'No diagnosis findings are available.'}
@@ -162,6 +164,7 @@ ${
 | Planner requirements-agent answers | ${resolution.plannerRequirementsAgentAnswers} |
 | Planner source fallback answers | ${resolution.plannerSourceFallbackAnswers} |
 | Planner reused answers | ${resolution.plannerReusedAnswers} |
+| Planner human answers | ${resolution.plannerHumanAnswers ?? 0} |
 
 ${
   resolution.entries.length === 0
@@ -215,9 +218,28 @@ Candidate mean build rate: ${percentage(targetExcluded.gate?.candidateMeanBuildR
 
 Build-rate drop: ${percentage(targetExcluded.gate?.buildDropRatio ?? null)}
 
-Pair validity: ${targetExcluded.comparisons?.every((comparison) => comparison.valid) ? 'valid' : 'invalid or pending'}
+Pair validity: ${targetExcluded.comparisons?.length && targetExcluded.comparisons.every((comparison) => comparison.valid) ? 'valid' : 'invalid or pending'}
 
 Leakage paths: ${targetExcluded.comparisons?.reduce((total, comparison) => total + comparison.leakagePaths.length, 0) ?? 0}
+
+Control decisions: ${targetExcluded.controlFacts ? `build=${targetExcluded.controlFacts.decisions.build}, reuse=${targetExcluded.controlFacts.decisions.reuse}, extend=${targetExcluded.controlFacts.decisions.extend}, defer=${targetExcluded.controlFacts.decisions.defer}, question=${targetExcluded.controlFacts.decisions.question}` : 'unavailable'}
+
+Excluded decisions: ${targetExcluded.excludedFacts ? `build=${targetExcluded.excludedFacts.decisions.build}, reuse=${targetExcluded.excludedFacts.decisions.reuse}, extend=${targetExcluded.excludedFacts.decisions.extend}, defer=${targetExcluded.excludedFacts.decisions.defer}, question=${targetExcluded.excludedFacts.decisions.question}` : 'unavailable'}
+
+Comparison mismatches: ${targetExcluded.comparisons?.flatMap((comparison) => comparison.mismatches).join('; ') || 'none'}
+
+Recorded error: ${targetExcluded.error ? `\`${markdown(targetExcluded.error)}\`` : 'none'}
+
+Target-arm questions: ${targetExcluded.questionResolution?.plannerQuestions ?? 0}
+
+${
+  targetExcluded.questionResolution?.entries
+    .filter((entry) => entry.arm)
+    .map(
+      (entry) => `- ${entry.arm}: ${markdown(entry.question)} -> ${markdown(entry.answer)} (${entry.resolution})`,
+    )
+    .join('\n') || 'No target-arm runtime question was recorded.'
+}
 
 This arm is a promotion guard, not a fitness reward. Target-blind labels and suggestions remain separate from normal evaluation truth.`
     : 'Not configured or not run for this variant.'

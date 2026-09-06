@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, open, readFile, rm, stat, writeFile } from 'node:fs/pro
 import os from 'node:os';
 import path from 'node:path';
 import { runCommand } from './process.js';
+import { canonicalHash } from './metrics.js';
 import type { TargetExcludedComparison } from './types.js';
 
 const IMAGE_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._/:@-]*$/;
@@ -247,13 +248,17 @@ export function summarizeTargetExcludedComparisonReport(
   if (typeof report.hash !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(report.hash)) {
     throw new Error('comparison report hash is invalid');
   }
+  const { hash, ...reportWithoutHash } = report;
+  if (canonicalHash(reportWithoutHash) !== hash) {
+    throw new Error('comparison report hash does not bind its canonical content');
+  }
 
   return {
     replicate,
     valid: validity.valid,
     mismatches,
     leakagePaths: leakagePaths as string[],
-    reportHash: report.hash,
+    reportHash: hash,
   };
 }
 

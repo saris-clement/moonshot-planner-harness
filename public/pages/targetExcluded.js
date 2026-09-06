@@ -171,6 +171,12 @@ export function targetExcludedPanel(context, campaign, variant) {
       element('div', {}, [element('span', { text: 'Promotion gate' }), statusLabel(gate?.status ?? 'pending')]),
     ]),
     retry,
+    evaluation.error
+      ? element('section', { className: 'error-panel' }, [
+          element('h2', { text: 'Recorded target-arm failure' }),
+          element('p', { text: evaluation.error }),
+        ])
+      : null,
     pendingQuestions,
     element('section', {}, [sectionHeading('Execution', 'Control, holdout, and excluded runs'), runTable(evaluation)]),
     element('section', { className: 'counterfactual-results' }, [
@@ -180,11 +186,34 @@ export function targetExcludedPanel(context, campaign, variant) {
         element('div', {}, [element('dt', { text: 'Baseline build rate' }), element('dd', { text: formatPercent(gate?.baselineMeanBuildRate) })]),
         element('div', {}, [element('dt', { text: 'Candidate build rate' }), element('dd', { text: formatPercent(gate?.candidateMeanBuildRate) })]),
         element('div', {}, [element('dt', { text: 'Relative drop' }), element('dd', { text: formatPercent(gate?.buildDropRatio) })]),
-        element('div', {}, [element('dt', { text: 'Pair validity' }), element('dd', { text: comparisons.length && comparisons.every((item) => item.valid) ? 'Valid' : 'Pending or invalid' })]),
+        element('div', {}, [element('dt', { text: 'Pair validity' }), element('dd', { text: comparisons.length === config.replicates && comparisons.every((item) => item.valid) ? 'Valid' : 'Pending or invalid' })]),
         element('div', {}, [element('dt', { text: 'Leakage paths' }), element('dd', { text: formatNumber(comparisons.reduce((sum, item) => sum + item.leakagePaths.length, 0)) })]),
       ]),
       gate?.reasons?.length ? element('ul', { className: 'counterfactual-reasons' }, gate.reasons.map((reason) => element('li', { text: reason }))) : null,
+      comparisons.some((comparison) => comparison.mismatches.length)
+        ? element('ul', { className: 'counterfactual-reasons' },
+            comparisons.flatMap((comparison) =>
+              comparison.mismatches.map((mismatch) =>
+                element('li', { text: `Run ${comparison.replicate}: ${mismatch}` }),
+              ),
+            ),
+          )
+        : null,
     ]),
+    evaluation.questionResolution?.entries?.some((entry) => entry.arm)
+      ? element('section', {}, [
+          sectionHeading('Resolved inputs', 'Target-arm question history'),
+          element('div', { className: 'question-list' },
+            evaluation.questionResolution.entries
+              .filter((entry) => entry.arm)
+              .map((entry) => element('article', { className: 'question-entry' }, [
+                element('p', { className: 'overline', text: `${entry.arm} · ${entry.resolution}` }),
+                element('h3', { text: entry.question }),
+                element('p', { text: entry.answer }),
+              ])),
+          ),
+        ])
+      : null,
     element('section', {}, [
       sectionHeading('Target-blind review', 'Separate evaluation truth', 'These suggestions never enter normal or holdout scoring.'),
       element('p', { text: evaluation.judgment?.summary ?? 'The target-blind judge has not completed.' }),

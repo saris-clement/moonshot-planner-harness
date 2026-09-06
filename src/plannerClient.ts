@@ -151,6 +151,51 @@ export class PlannerClient {
     return value;
   }
 
+  async collectCompletedPhase2(caseId: string, runId: string): Promise<Phase2Result> {
+    const run = await this.request(
+      'analysis-run-latest',
+      `/api/planning-cases/${caseId}/runs/${runId}`,
+    );
+    const status = runStatus(run);
+    if (status !== 'completed') {
+      throw new Error(`Phase 2 run is not complete: ${caseId}/${runId} status=${status}`);
+    }
+    const finalResponses = await Promise.all([
+      this.request('case-final', `/api/planning-cases/${caseId}`),
+      this.request('events', `/api/planning-cases/${caseId}/events`),
+      this.request('analysis-runs', `/api/planning-cases/${caseId}/runs`),
+      this.request('analyses', `/api/planning-cases/${caseId}/analyses`),
+      this.request('planner-questions-final', `/api/planning-cases/${caseId}/planner-questions`),
+      this.request(
+        'requirements-consultations-final',
+        `/api/planning-cases/${caseId}/requirements-consultations`,
+      ),
+    ]);
+    const questions = plannerQuestionsFromResponse(finalResponses[4])
+      .filter((question) => question.status === 'answered' && question.answer)
+      .map((question): Phase2QuestionAudit => ({
+        questionId: question.id,
+        prompt: question.prompt,
+        answer: question.answer!,
+        resolution: question.resolution ?? 'human_answer',
+        evidence: question.evidence,
+        requirementsAgentRequests: 0,
+      }));
+    const analysis = await this.request('analysis', `/api/planning-cases/${caseId}/analysis`);
+    const facts = extractRunFacts(analysis, run);
+    await Promise.all([
+      writeFile(
+        path.join(this.artifactDirectory, 'question-audit.json'),
+        `${JSON.stringify(questions, null, 2)}\n`,
+      ),
+      writeFile(
+        path.join(this.artifactDirectory, 'facts.json'),
+        `${JSON.stringify(facts, null, 2)}\n`,
+      ),
+    ]);
+    return { caseId, runId, status, facts, questions };
+  }
+
   async runPhase2(
     zipPath: string,
     idempotencyPrefix: string,

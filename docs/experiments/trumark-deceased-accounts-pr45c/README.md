@@ -19,7 +19,7 @@ Improve generic Phase 2 source-backed adjudication accuracy using PR 45 durable 
 
 ## Target-Excluded Evaluations
 
-- trumark-deceased-accounts-pr45c-v000: failed; gate=pending; build drop=unscored
+- trumark-deceased-accounts-pr45c-v000: completed; gate=passed; build drop=0.0%
 
 ## Experiments
 

@@ -9,12 +9,13 @@ import {
   runTargetExcludedComparison,
   summarizeTargetExcludedComparisonReport,
 } from '../src/targetExcludedComparison.js';
+import { canonicalHash } from '../src/metrics.js';
 
 const digest = `planner-eval@sha256:${'a'.repeat(64)}`;
 const generatedAt = '2026-09-06T12:00:00.000Z';
 
 function report(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
+  const value = {
     kind: 'ainative-planner/evidence-visibility-comparison',
     schemaVersion: 1,
     validity: {
@@ -26,9 +27,9 @@ function report(overrides: Record<string, unknown> = {}): Record<string, unknown
       pair: { valid: true, mismatches: [] },
     },
     leakage: { detected: false, count: 0, paths: [] },
-    hash: `sha256:${'b'.repeat(64)}`,
     ...overrides,
   };
+  return { ...value, hash: canonicalHash(value) };
 }
 
 test('buildTargetExcludedComparisonDockerCommand isolates inputs and preserves arguments', () => {
@@ -136,34 +137,35 @@ test('generated script calls the planner authority with runs and no Phase 3 reso
 });
 
 test('summarizeTargetExcludedComparisonReport describes arm and pair mismatches', () => {
+  const value = report({
+    validity: {
+      valid: false,
+      arms: {
+        normal: {
+          valid: false,
+          errors: [{ code: 'CURRENT_ANALYSIS_INCOMPLETE', path: '$.analysis' }],
+        },
+        excluded: {
+          valid: false,
+          errors: [{ code: 'CASE_ID_MISMATCH', path: '$.case.id' }],
+        },
+      },
+      pair: {
+        valid: false,
+        mismatches: [
+          { category: 'renderer', path: '$.rendererVersion', normal: 'v1', excluded: 'v2' },
+        ],
+      },
+    },
+    leakage: {
+      detected: true,
+      count: 1,
+      paths: ['$.analysis.analysis.adjudications[0].sourceRefs[0].path'],
+    },
+  });
   const summary = summarizeTargetExcludedComparisonReport(
     2,
-    report({
-      validity: {
-        valid: false,
-        arms: {
-          normal: {
-            valid: false,
-            errors: [{ code: 'CURRENT_ANALYSIS_INCOMPLETE', path: '$.analysis' }],
-          },
-          excluded: {
-            valid: false,
-            errors: [{ code: 'CASE_ID_MISMATCH', path: '$.case.id' }],
-          },
-        },
-        pair: {
-          valid: false,
-          mismatches: [
-            { category: 'renderer', path: '$.rendererVersion', normal: 'v1', excluded: 'v2' },
-          ],
-        },
-      },
-      leakage: {
-        detected: true,
-        count: 1,
-        paths: ['$.analysis.analysis.adjudications[0].sourceRefs[0].path'],
-      },
-    }),
+    value,
   );
 
   assert.deepEqual(summary, {
@@ -175,7 +177,7 @@ test('summarizeTargetExcludedComparisonReport describes arm and pair mismatches'
       'renderer mismatch at $.rendererVersion',
     ],
     leakagePaths: ['$.analysis.analysis.adjudications[0].sourceRefs[0].path'],
-    reportHash: `sha256:${'b'.repeat(64)}`,
+    reportHash: value.hash,
   });
 });
 
@@ -198,6 +200,7 @@ test('runTargetExcludedComparison mounts a generated read-only script and return
   }
 
   let generatedScriptPath = '';
+  const reportValue = report();
   try {
     const summary = await runTargetExcludedComparison(
       {
@@ -216,7 +219,7 @@ test('runTargetExcludedComparison mounts a generated read-only script and return
           generatedScriptPath = scriptMount.slice(0, -':/eval/run.mts:ro'.length);
           assert.equal((await stat(generatedScriptPath)).mode & 0o777, 0o444);
           assert.equal(await readFile(generatedScriptPath, 'utf8'), TARGET_EXCLUDED_COMPARISON_SCRIPT);
-          await writeFile(outputPath, `${JSON.stringify(report())}\n`);
+          await writeFile(outputPath, `${JSON.stringify(reportValue)}\n`);
           return {
             command,
             args: [...args],
@@ -234,7 +237,7 @@ test('runTargetExcludedComparison mounts a generated read-only script and return
       valid: true,
       mismatches: [],
       leakagePaths: [],
-      reportHash: `sha256:${'b'.repeat(64)}`,
+      reportHash: reportValue.hash,
     });
     await assert.rejects(stat(generatedScriptPath), /ENOENT/);
   } finally {

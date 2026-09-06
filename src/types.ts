@@ -570,6 +570,7 @@ export interface QuestionResolutionEntry {
   resolution: 'requirements_agent' | 'source_fallback' | 'reused_source_answer' | 'human_answer';
   answer: string;
   evidence: string[];
+  arm?: 'control' | 'excluded';
 }
 
 export interface BenchmarkQuestionResolution {

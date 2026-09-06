@@ -448,6 +448,55 @@ export async function startVariantStack(
   return handle;
 }
 
+export async function reattachVariantStack(
+  campaign: CampaignRecord,
+  variant: VariantRecord,
+  artifactDirectory: string,
+  trustedPlannerPath: string,
+): Promise<StackHandle> {
+  if (!variant.worktreePath || !variant.imageTag) {
+    throw new Error('variant worktree and image are required to reattach a stack');
+  }
+  const generatedEnvironmentFile = path.join(artifactDirectory, 'stack.env');
+  const generatedEnvironment = await readEnvironmentFile(generatedEnvironmentFile);
+  const environment = {
+    ...(await loadCampaignEnvironment(campaign)),
+    ...generatedEnvironment,
+  };
+  const composeProject = generatedEnvironment.PLANNER_DDB_TABLE;
+  const plannerPort = generatedEnvironment.PLANNER_HOST_PORT;
+  const s3Port = generatedEnvironment.PLANNER_S3_HOST_PORT;
+  if (!composeProject || !plannerPort || !s3Port) {
+    throw new Error('persisted stack environment is incomplete');
+  }
+  const composeArgs = [
+    'compose',
+    '--env-file',
+    campaign.config.environmentFile,
+    '--env-file',
+    generatedEnvironmentFile,
+    '--project-name',
+    composeProject,
+    '--project-directory',
+    variant.worktreePath,
+    '--file',
+    path.join(trustedPlannerPath, 'docker-compose.yml'),
+  ];
+  return {
+    campaignId: campaign.id,
+    variantId: variant.id,
+    worktreePath: variant.worktreePath,
+    artifactDirectory,
+    imageTag: variant.imageTag,
+    composeProject,
+    generatedEnvironmentFile,
+    baseUrl: `http://127.0.0.1:${plannerPort}${environment.PLANNER_PUBLIC_BASE ?? ''}`,
+    s3Endpoint: `http://127.0.0.1:${s3Port}`,
+    environment,
+    composeArgs,
+  };
+}
+
 async function seedKbVolume(handle: StackHandle): Promise<void> {
   if (handle.environment.PLANNER_KB_MODE === 'disabled') return;
   const sourceVolume = handle.environment.PLANNER_EVAL_KB_SEED_VOLUME ?? 'ainative-planner-kb';

@@ -32,7 +32,7 @@ const MAX_SOURCE_REFS = 100;
 const MAX_SOURCE_BYTES = 512 * 1_024;
 const MAX_SOURCE_EXCERPT_BYTES = 4_000;
 const MAX_FOCUS_UNITS = 30;
-const MAX_DIAGNOSIS_INPUT_BYTES = 4 * 1_024 * 1_024;
+const MAX_DIAGNOSIS_INPUT_BYTES = 8 * 1_024 * 1_024;
 
 interface ArtifactInventoryItem {
   path: string;
@@ -1523,7 +1523,14 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
       const report = await readJsonArtifact(filePath);
       if (!report) continue;
       const embeddedHash = stringField(report.value, 'hash');
-      if (comparison.reportHash && embeddedHash !== comparison.reportHash) continue;
+      const reportRecord = isRecord(report.value) ? { ...report.value } : null;
+      if (!reportRecord) continue;
+      delete reportRecord.hash;
+      if (
+        !embeddedHash ||
+        sha256Bytes(stableJson(reportRecord)) !== embeddedHash ||
+        (comparison.reportHash && embeddedHash !== comparison.reportHash)
+      ) continue;
       addEvidence(`target-excluded-comparison|${replicate}|${report.sha256}`, {
         kind: 'target_excluded_comparison',
         summary: `Target comparison replicate ${replicate} was read from the archived JSON report and verified by content hash.`,

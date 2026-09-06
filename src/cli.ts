@@ -20,6 +20,7 @@ function usage(): never {
   npm run cli -- promote <campaign-id> <variant-id>
   npm run cli -- target-config <campaign-id> <baseline-variant-id> <client/workflow>
   npm run cli -- target-run <campaign-id> <variant-id>
+  npm run cli -- target-finalize <campaign-id> <variant-id>
   npm run cli -- serve [--port 4173]
 `);
   process.exit(2);
@@ -102,6 +103,16 @@ async function main(): Promise<void> {
     const variantId = arguments_[2];
     if (!campaignId || !variantId) usage();
     const evaluation = await orchestrator.runTargetExcluded(campaignId, variantId);
+    process.stdout.write(`${JSON.stringify(evaluation, null, 2)}\n`);
+    database.close();
+    return;
+  }
+
+  if (command === 'target-finalize') {
+    const campaignId = arguments_[1];
+    const variantId = arguments_[2];
+    if (!campaignId || !variantId) usage();
+    const evaluation = await orchestrator.finalizeLiveTargetExcluded(campaignId, variantId);
     process.stdout.write(`${JSON.stringify(evaluation, null, 2)}\n`);
     database.close();
     return;

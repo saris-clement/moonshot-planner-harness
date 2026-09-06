@@ -86,45 +86,71 @@ This diagnosis is unverified model interpretation. It is shown separately from m
 
 Status: `completed`
 
-Input hash: `sha256:4ad12a52336976263fd12f6ba6f4e84547f8a36b15c561aa95d9faf1fd827fba`
+Input hash: `sha256:f816e465cb8f6a52175426bf9757ecb64512ec3cd69a2bc7469b393faac7b3a1`
 
-> The bounded evidence suggests that deterministic shortlist recall and bounded evidence retention, rather than tool unavailability, made some decisions depend heavily on which committed declarations advisory discovery surfaced. This produced material replicate instability and confidence changes under otherwise pinned inputs. These conclusions are unverified model interpretations.
+Result hash: `sha256:a250716100f2e5447011c03d609c22bdde0e3de34d20d80431c463ed57c8f60c`
 
-### finding-structured-shortlist-recall-gap: candidate_ranking
+> The measured artifacts suggest that most false build or extend decisions arose after functioning search and source-read operations: relevant implementations were inconsistently retrieved, fragmented across declaration-level evidence, or interpreted too narrowly. A deliberate private-declaration rule also converted behaviorally complete discoveries into extend decisions. High confidence frequently survived weak or unstable evidence. No broad tool or source infrastructure outage is established.
 
-Confidence: `high`
-
-> The deterministic ranker produced an empty shortlist for a broad workflow-level behavior because its kind and normalized-term overlap rules did not admit lower-level implementation evidence. Advisory discovery subsequently hydrated committed production declarations, showing that an empty shortlist did not establish absence of an implementation foundation.
-
-Supporting evidence: `evidence-470bf9e1be24f22f`, `evidence-e230bf6ec481d8c1`, `evidence-00dde19a88da6b03`
-
-Counterevidence: `evidence-018f33cfc1aab49b`
-
-Falsification: Construct generic cases where a frozen repository contains a complete implementation represented by several lower-level declarations but no exact prose match. Compare deterministic shortlist recall before and after the change while holding requirements, source, model, prompt, and budget pins fixed. Reject this finding if the existing ranker consistently admits the implementation evidence.
-
-### finding-bounded-fragment-retention-sensitivity: evidence_retention
-
-Confidence: `medium`
-
-> Successful searches produced many qualified pointers and committed-source reads, but projection quotas rejected numerous candidates after evidence slots were exhausted. One replicate retained calculation-oriented fragments and selected two of them, while another retained a result-oriented fragment and selected one. Because the model adjudicates only the retained projection, different admitted fragments can change whether end-to-end coverage appears proven.
-
-Supporting evidence: `evidence-470bf9e1be24f22f`, `evidence-e230bf6ec481d8c1`
-
-Counterevidence: `evidence-024190cc32639718`, `evidence-006740da806a7c7b`
-
-Falsification: Replay fixed generic cases with identical search results while permuting hit order. Reject this finding if admitted semantic-role coverage and final decisions remain invariant, or if increasing role-balanced retention does not reduce decision variance.
-
-### finding-material-replicate-instability: replicate_instability
+### finding-retrieval-recall-under-semantic-drift: source_discovery
 
 Confidence: `high`
 
-> Persisted replicate facts report decision changes across multiple units. For the inspected unit, one durable replicate returned medium-confidence extension and another returned high-confidence reuse after selecting different discovered evidence. Confidence therefore tracked the model's sampled evidence interpretation rather than a replicate-stable measure of evidence completeness.
+> Compound queries combining requirement identifiers, output-field terminology, and behavioral prose often ranked unrelated declarations or returned no exact lexical hits. Hydration and committed-source reads succeeded, but relevant implementation declarations were consequently absent from the selectable evidence set, leading the planner to infer that new implementation was required.
 
-Supporting evidence: `evidence-9a7f4b8fd7484391`, `evidence-470bf9e1be24f22f`, `evidence-e230bf6ec481d8c1`
+Supporting evidence: `evidence-5bece13361db7ebe`, `evidence-00758e54293bc6e0`, `evidence-2186475755a7f2d2`, `evidence-3cef64a325603d46`
 
-Counterevidence: `evidence-930748412667f4bb`, `evidence-7925d20bf8b5393c`, `evidence-bf7ffef3288f873e`
+Counterevidence: `evidence-6e9d562312e9b250`, `evidence-e230bf6ec481d8c1`, `evidence-dc0590541284f88f`
 
-Falsification: Run repeated adjudications with identical immutable pins and quantify per-unit decision and confidence agreement. Reject this finding if the observed disagreement falls within a predefined reliability bound and confidence consistently predicts agreement or verified correctness.
+Falsification: Replay the affected units with identical pins, model, prompt, and budget while changing only retrieval to staged query expansion plus enclosing-module fallback. Reject this finding if relevant committed declarations are not retrieved more often or if build decisions do not decrease.
+
+### finding-fragmented-evidence-underproves-workflow: planner_interpretation
+
+Confidence: `high`
+
+> Broad workflow outcomes span orchestration, calculations, and result assembly, while selectable evidence is declaration-oriented and bounded. The adjudicator sometimes treated each fragment as proving only a partial foundation instead of composing mutually consistent source snippets into evidence for the existing end-to-end behavior.
+
+Supporting evidence: `evidence-470bf9e1be24f22f`, `evidence-14c61ec8606b9e6b`, `evidence-2aa57990acc5995d`, `evidence-aaf7f14834115fb9`
+
+Counterevidence: `evidence-e230bf6ec481d8c1`, `evidence-08484a666567b490`, `evidence-d0f5a50b49a6a69c`
+
+Falsification: Present the same committed snippets in two forms, independently and as a verified call-chain coverage matrix. Reject this finding if disposition accuracy and stability do not improve with the composed representation.
+
+### finding-visibility-policy-overconstrains-reuse: evidence_retention
+
+Confidence: `high`
+
+> The planner discovered behavior matching the requested entrypoint but classified its selected declaration as private top-level evidence. The frozen policy permits such evidence only for extension, so declaration visibility overrode behavioral completeness and repeatedly prevented reuse.
+
+Supporting evidence: `evidence-614ff5e3a1221048`, `evidence-024190cc32639718`, `evidence-006740da806a7c7b`
+
+Counterevidence: `evidence-4e4ce889ce85d8ef`, `evidence-08484a666567b490`
+
+Falsification: Add a boundary-verification signal without changing source visibility, then replay the unit. Reject this finding if the decision remains extend despite verified callable-boundary evidence, or if allowing such evidence creates false reuse decisions on controls.
+
+### finding-confidence-not-conditioned-on-evidence-strength: confidence_calibration
+
+Confidence: `high`
+
+> High-confidence build decisions were emitted even when no discovered candidate was selected, many search hits were malformed or displaced by evidence limits, and alternate replicates or the blind judge identified existing behavior. Confidence therefore tracked requirement clarity more strongly than certainty about implementation absence.
+
+Supporting evidence: `evidence-5bece13361db7ebe`, `evidence-bfcc99560bc8d004`, `evidence-5a02c907fd40ff06`, `evidence-463b8aea8bd823e1`, `evidence-259143ca04a111f1`
+
+Counterevidence: `evidence-e230bf6ec481d8c1`, `evidence-d0f5a50b49a6a69c`
+
+Falsification: Evaluate calibration on human-labeled units, comparing current confidence with evidence-conditioned confidence using reliability curves and high-confidence error rate. Reject this finding if conditioning does not improve calibration out of sample.
+
+### finding-primary-replicate-disposition-instability: replicate_instability
+
+Confidence: `high`
+
+> With immutable inputs and pins, primary replicates changed dispositions for numerous units, principally between build and extend or reuse. Unit-level evidence shows that different runs retrieved or selected different fragments of the same implementation, allowing downstream interpretation to cross disposition boundaries.
+
+Supporting evidence: `evidence-9a7f4b8fd7484391`, `evidence-924179f306953eec`, `evidence-470bf9e1be24f22f`, `evidence-e230bf6ec481d8c1`, `evidence-2aa57990acc5995d`, `evidence-08484a666567b490`
+
+Counterevidence: `evidence-930748412667f4bb`, `evidence-c10227ba197ee96c`
+
+Falsification: Run at least ten identical replicates before and after deterministic evidence ordering. Reject this finding if unit-level disposition disagreement does not decline without degrading independently reviewed accuracy.
 
 ## Requirements Questions
 
@@ -142,6 +168,7 @@ Falsification: Run repeated adjudications with identical immutable pins and quan
 | Planner requirements-agent answers | 0 |
 | Planner source fallback answers | 4 |
 | Planner reused answers | 0 |
+| Planner human answers | 0 |
 
 #### 01M1Q2R1VHAKDZHSQ7TQDBA8B2
 
@@ -235,6 +262,7 @@ Evidence:
 | Planner requirements-agent answers | 0 |
 | Planner source fallback answers | 1 |
 | Planner reused answers | 0 |
+| Planner human answers | 0 |
 
 #### question.37d4b726fe4cc16ac3288bd8
 
@@ -260,19 +288,41 @@ Evidence:
 
 ## Target-Excluded Guard
 
-Status: `failed`
+Status: `completed`
 
-Gate: `pending`
+Gate: `passed`
 
-Baseline mean build rate: unscored
+Baseline mean build rate: 78.8%
 
-Candidate mean build rate: unscored
+Candidate mean build rate: 78.8%
 
-Build-rate drop: unscored
+Build-rate drop: 0.0%
 
-Pair validity: invalid or pending
+Pair validity: valid
 
 Leakage paths: 0
+
+Control decisions: build=82, reuse=2, extend=25, defer=16, question=0
+
+Excluded decisions: build=102, reuse=0, extend=7, defer=16, question=0
+
+Comparison mismatches: none
+
+Recorded error: none
+
+Target-arm questions: 11
+
+- control: What exact Key into Symitar row format should be used for a consumer loan whose Symitar description identifies it as a HELOC? -> Use `HELOC L<loan-number>$`, removing leading zeros. Example: loan ID `0001` uses key `HELOC L1$`. (source_fallback)
+- control: What approved Symitar connection and read-only permission scopes will be available for member, death, deposit, consumer-loan, Visa, and tracking data? -> Use the TruMark live backend's Saris API Symitar/SymXchange proxy with read access to member/account and name fields; Tracking 50-53, including death name/date; deposit shares and share transactions; consumer loans and loan transactions/tracking/names/transfers; and Visa external-loan current balance/close-date and tracking data. Visa history is unavailable, so backdated card balances are out of scope. The workflow is recommend-only and never writes to Symitar; its only write is a separate records-api case-summary upsert. The exact SymXchange endpoint and credentials/secrets are deployment-provided. (source_fallback)
+- control: What exact keyable-value format should be used for home-equity lines of credit, including the `HELOC ` prefix and the value that follows it? -> Use `HELOC L<loan-number>$ <amount>`, for example `HELOC L1$ 49529.28`. The loan number is unpadded; the amount is plain dollars with exactly two decimals, no leading `$` and no thousands separators. (source_fallback)
+- control: What exact text format should the Key into Symitar summary use for a home-equity line of credit row? -> Use `HELOC L{loan-number}$ {amount}`, with the zero-padded loan ID rendered as a number and the amount as plain dollars with exactly two decimals, no currency symbol or thousands separators. Example: `HELOC L1$ 49529.28`. If the amount cannot be determined, use `HELOC L1$ needs review`. (source_fallback)
+- control: What is the approved Symitar connection for production, and which read-only permission scopes or service account should it use for member, death, deposit, consumer-loan, Visa, and tracking data? -> Production is the `trumark-live` backend deployment. It accesses Symitar through the Saris API proxy at `/api/lo_systems/symitar/accounts/with-children-select-fields`; the underlying SymXchange URL and credentials are deployment-provided. Use a read-only deployment service account permitted to read member/account and name data, account Tracking 50-53, deposits/shares and transactions, consumer loans and related transactions/tracking/name/transfer/application data, and external loans (PSCU/Visa) with tracking. No Symitar write permission is required. The source does not specify a named service account or named permission scopes, so those exact values remain deployment-provided. (source_fallback)
+- control: What exact keyable-value format should be used for home-equity lines of credit, including the `HELOC ` prefix and the value that follows it? -> Use `HELOC L<loan-number>$ <amount>`, for example `HELOC L1$ 49529.28`. The loan number is unpadded; the amount is plain dollars with exactly two decimals, no leading `$` and no thousands separators. (reused_source_answer)
+- excluded: For a consumer loan whose Symitar description identifies it as a HELOC, what exact text format should appear in the Key into Symitar summary? -> Use `HELOC L{loan number}$ {amount}`. Remove leading zeros from the loan number and render the amount with exactly two decimals and no thousands separator; for example, `HELOC L41$ 8120.55`. (human_answer)
+- excluded: What exact keyable format should be used for a HELOC principal, including placement of the `HELOC ` prefix relative to the amount? -> Use `HELOC L{loan number}$ {principal amount}`. Place `HELOC ` before the normalized loan label, remove leading zeros from the loan number, and place the principal amount after `$ ` with exactly two decimals and no thousands separator; for example, `HELOC L41$ 8120.55`. (human_answer)
+- excluded: What exact text format should the Key into Symitar summary use for a consumer loan whose Symitar description identifies it as a HELOC? -> Use `HELOC L{loan number}$ {amount}`. Remove leading zeros from the loan number and render the amount with exactly two decimals and no thousands separator; for example, `HELOC L41$ 8120.55`. (human_answer)
+- excluded: What approved Symitar connection should this workflow use, and which read-only permission scopes are available for member, death, deposit, consumer-loan, Visa, and tracking data? -> Use the `trumark-live` deployment with the deployment-provided SymXchange endpoint and secret. Provision read-only access for member/name/death data, deposits and shares, consumer loans, Visa or external loans, and Tracking 50/51/52/53, with no Symitar write permission. (human_answer)
+- excluded: What exact keyable format should be used for HELOC principal values, including the required prefix and spacing? -> Use `HELOC L{loan number}$ {principal amount}` with one space after `HELOC` and one space after `$`. Remove leading zeros from the loan number and render the principal with exactly two decimals and no thousands separator; for example, `HELOC L41$ 8120.55`. (human_answer)
 
 This arm is a promotion guard, not a fitness reward. Target-blind labels and suggestions remain separate from normal evaluation truth.
 

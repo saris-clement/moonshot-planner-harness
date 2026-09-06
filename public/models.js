@@ -233,15 +233,38 @@ export function isPromotionEligible(campaign, variants, variant) {
     !variant.artifactCollectionComplete ||
     !variant.facts ||
     !variant.score ||
+    variant.diagnosisStatus !== 'completed' ||
+    !variant.diagnosisInputHash ||
+    !variant.diagnosisResultHash ||
     variant.score.cohortMismatches.includes('requirement units')
   ) return false;
   if (campaign.targetExcludedConfig) {
+    const targetConfig = campaign.targetExcludedConfig;
     const targetEvaluation = (campaign.targetExcludedEvaluations ?? []).find(
       (candidate) => candidate.variantId === variant.id,
     );
+    const comparisonOrdinals = targetEvaluation?.comparisons
+      ?.map((comparison) => comparison.replicate)
+      .sort((left, right) => left - right);
+    const holdoutsComplete = campaign.config.benchmarks
+      .filter((benchmark) => benchmark.role === 'holdout')
+      .every((benchmark) =>
+        targetEvaluation?.holdoutReplicateFacts?.[benchmark.name]?.length === targetConfig.replicates
+      );
     if (
       targetEvaluation?.status !== 'completed' ||
       !targetEvaluation.artifactCollectionComplete ||
+      targetEvaluation.controlReplicateFacts?.length !== targetConfig.replicates ||
+      targetEvaluation.excludedReplicateFacts?.length !== targetConfig.replicates ||
+      !holdoutsComplete ||
+      !targetEvaluation.judgment ||
+      !targetEvaluation.score ||
+      !targetEvaluation.questionResolution ||
+      targetEvaluation.comparisons?.length !== targetConfig.replicates ||
+      JSON.stringify(comparisonOrdinals) !== JSON.stringify([1, 2]) ||
+      targetEvaluation.comparisons.some((comparison) =>
+        !comparison.valid || comparison.leakagePaths.length > 0
+      ) ||
       !['passed', 'warning'].includes(targetEvaluation.gate?.status)
     ) return false;
   }
