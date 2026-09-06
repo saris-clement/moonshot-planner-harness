@@ -1,0 +1,121 @@
+{
+  "kind": "ainative-planner/phase2-baseline",
+  "schemaVersion": 1,
+  "capturedAt": "2026-09-05T23:47:44Z",
+  "evaluationFixture": true,
+  "productionWorkflowLogic": false,
+  "purpose": "Compact frozen V13b observation for the V13c fallback-capacity experiment. This file is evaluation evidence only and is not production workflow logic.",
+  "case": {
+    "id": "3W93A4Y6WVAZJRCWN76BR25G2M",
+    "runId": "run.7d4766256078a5d88a89f50d",
+    "analysisId": "analysis.effe6095224e80dedbaecdc7",
+    "langfuseTraceId": "6ade5b116b203ebb2e3d6125bba79664"
+  },
+  "requirements": {
+    "workflow": "trumark/deceased-account",
+    "revision": 51,
+    "exportHash": "38b74ad46bf3"
+  },
+  "resolvedInputs": {
+    "sourceCommit": "140ec306bff8c20aa9eccde3cc2f4647ce790655",
+    "sourceTree": "443509a2c4fa4ffa0d56a4df57c615e44c8ef530",
+    "knowledgeGeneration": 1863,
+    "knowledgeSnapshotHash": "sha256:7646fe1380ebd2a53b9f309619bd3911549a82398cc7622ae8ac8e3054f804c3",
+    "adjudicatorPrompt": {
+      "version": "adjudicator-v13b",
+      "hash": "sha256:11fe9071f1ffe1f9b5e098f64c31305bdf859f1152c7ca8e14f05b2e77de881a"
+    },
+    "adjudicatorModel": {
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "configurationHash": "sha256:498d65ef93401dd27056168fc8b6ef7254a5b1941ccf08a15670e698f47c4a91"
+    },
+    "algorithms": {
+      "evidenceProjection": "evidence-projection-v2-large",
+      "kbSearchHydration": "qualified-search-hydration-v2",
+      "explicitBindingExclusion": "explicit-binding-exclusion-v1"
+    }
+  },
+  "analysis": {
+    "requirementUnits": 109,
+    "manifestCapabilities": 9,
+    "unitCapabilityPairs": 981,
+    "kindExclusions": 358,
+    "termOrIoExclusions": 559,
+    "matchedCandidateOccurrences": 64,
+    "unitsWithEmptyShortlist": 60,
+    "unitsWithNonemptyShortlist": 49,
+    "decisions": {
+      "build": 74,
+      "reuse": 2,
+      "extend": 21,
+      "defer": 12,
+      "question": 0
+    },
+    "usage": {
+      "calls": 289,
+      "inputTokens": 5683761,
+      "outputTokens": 71969,
+      "totalTokens": 5755730,
+      "durationMs": 1493680,
+      "costUsd": 17.668266
+    },
+    "toolOperations": {
+      "transcriptEntries": 189,
+      "knowledgeOperations": 188,
+      "requirements_question": 1,
+      "kb_search": 177,
+      "hybridCodeSearch": 100,
+      "lexicalFuzzySearch": 77,
+      "failedEntries": 0
+    },
+    "grounding": {
+      "receiptCount": 109,
+      "searchCalls": 177,
+      "searchHitCount": 2251,
+      "qualifiedPointerCount": 1431,
+      "hydrationAttemptCount": 442,
+      "sourceReadCount": 415,
+      "admittedSourceCount": 257,
+      "admittedTestCount": 59,
+      "projectedSourceBytes": 5787911,
+      "projectedTestBytes": 1382491,
+      "selectedDiscoveredCount": 20,
+      "rejectionCounts": [
+        { "reason": "evidence_slots_exhausted", "count": 797 },
+        { "reason": "malformed_hit", "count": 780 },
+        { "reason": "non_executable_declaration", "count": 96 },
+        { "reason": "unsupported_path", "count": 30 }
+      ]
+    }
+  },
+  "targetSourceFunnel": {
+    "hitUnits": 42,
+    "admittedUnits": 40,
+    "productionAdmittedUnits": 37,
+    "selectedUnits": 14
+  },
+  "buildCohorts": {
+    "targetHitBuilds": 24,
+    "targetProductionAdmittedBuilds": 22,
+    "noTargetHitBuilds": 50,
+    "targetHitOccurrences": 162,
+    "uniqueTargetTitles": 37
+  },
+  "evidenceExhaustion": {
+    "searchOnly": {
+      "allOccurrences": 796,
+      "targetPathOccurrences": 150,
+      "targetHitBuildOccurrences": 79
+    },
+    "persistedIncludingKbGet": {
+      "allOccurrences": 797,
+      "targetPathOccurrences": 151,
+      "targetHitBuildOccurrences": 80
+    }
+  },
+  "focusedCohorts": {
+    "originalTopTenScore": "3/10",
+    "v13ExtendToV13bBuildRegressions": 6
+  }
+}

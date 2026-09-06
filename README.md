@@ -15,7 +15,8 @@ It is deliberately a one-machine tool: one coordinator process, SQLite state, di
 - Resolves imported blocking questions through requirements-agent first, then a concise source-grounded fallback, and records every answer.
 - Persists human-reviewed labels independently from model suggestions.
 - Reconstructs bounded, cited post-run diagnoses from durable planner/S3 artifacts, optional Langfuse observations, frozen source references, judge evidence, labels, and replicate facts before proposing a planner mutation.
-- Generates one Markdown record per experiment under `docs/experiments/<campaign>/`.
+- Generates one Markdown research record per experiment before execution and refreshes it with measured facts, evidence, and a conservative conclusion afterward.
+- Preserves optional human-authored context in a separate `docs/experiments/<campaign>/human/<variant>.md` sidecar that report refreshes never overwrite.
 - Runs two primary and two holdout repetitions in parallel for every variant, then scores their unit-level consensus.
 
 ## Prerequisites
@@ -43,7 +44,7 @@ The console uses real History API routes and can be refreshed at any valid deep 
 
 - `/` and `/campaigns/new`
 - `/campaigns/<id>/overview`, `/campaigns/<id>/experiments`, and `/campaigns/<id>/lineage`
-- `/campaigns/<id>/experiments/<variant>?tab=summary|runs|questions|artifacts`
+- `/campaigns/<id>/experiments/<variant>?tab=summary|markdown|runs|questions|target-excluded|artifacts`
 - `/campaigns/<id>/review/<variant>?benchmark=<name>&unit=<key>&filter=<filter>`
 
 The server serves `index.html` only for these GET/HEAD UI paths. API paths and extension-bearing paths never receive the UI fallback.
@@ -52,7 +53,7 @@ Initialization copies the environment file and both ZIPs into the ignored campai
 
 Optional diagnosis-time Langfuse reads use `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, and `LANGFUSE_SECRET_KEY` from that frozen campaign environment. Reads are case/run filtered and capped; credentials and authorization headers are never persisted. Missing or failed Langfuse telemetry is recorded as incomplete optional evidence and does not invalidate durable run facts.
 
-All campaign operations after the server starts are available in the UI: create, baseline, retry failed baseline, run a supervised or automatic round, stop, resume, review labels, inspect planner questions and their answers, inspect artifacts, open Langfuse traces, open Markdown, and promote a candidate.
+All campaign operations after the server starts are available in the UI: create, baseline, retry failed baseline, run a supervised or automatic round, stop, resume, review labels, inspect planner questions and their answers, inspect artifacts, open Langfuse traces, read safely rendered experiment Markdown with a heading-derived section navigator, and promote a candidate.
 
 The overview separates live execution from durable experiment results. Each active experiment matrix synthesizes every configured benchmark and replicate slot, then joins persisted execution state and final replicate facts. Completed, current, and pending rows remain visible together; pending measurements use dashes rather than zero. Live decisions are the latest accepted checkpoint and can change after a planner question or successor run.
 
@@ -112,9 +113,11 @@ Blocking requirements questions are resolved once per campaign before evaluation
   artifacts/<id>/<variant>/      raw output, patches, logs, S3 objects
     diagnosis/                   immutable bounded inputs, manifests, optional telemetry, prompts, logs, and results
 docs/experiments/<id>/           trackable Markdown facts and conclusions
+  human/<variant>.md             optional human context, never generator-owned
+docs/experiments/history/        hash-pinned historical research materials
 ```
 
-Raw packs, source excerpts, model events, and logs stay in ignored `.data/`. Experiment Markdown contains hashes, aggregates, interpretation provenance, and artifact references without copying raw source text.
+Raw packs, source excerpts, model events, and logs stay in ignored `.data/`. Experiment Markdown contains preregistered assumptions and instructions, hashes, parent metrics, measured aggregates, interpretation provenance, a three-arm summary when configured, a conservative conclusion, and artifact references without copying raw source text. Historical strategist context is enumerated by `docs/experiments/history/manifest.json`; each imported file is verified by SHA-256 before use.
 
 ## Verification
 

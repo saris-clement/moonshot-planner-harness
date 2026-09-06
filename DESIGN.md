@@ -47,7 +47,9 @@ Patch crossover is intentionally excluded: combining independent source-policy c
 | Candidate implementation | Frozen seed SHA plus archived binary patch |
 | Expected unit disposition | Human-verified campaign label |
 | Unreviewed expected disposition | Persisted blind-judge suggestion |
-| Experiment narrative | Generated Markdown with provenance sections |
+| Experiment narrative | Generated Markdown with preregistered assumptions, measured evidence, and a conservative conclusion |
+| Human narrative context | Separate tracked sidecar; never scoring truth unless saved as a verified label |
+| Historical research | Explicit manifest entries verified against pinned file hashes |
 | Runtime recovery state | SQLite WAL database |
 | Live adjudication progress | Latest accepted planner run checkpoint, projected into SQLite |
 
@@ -65,7 +67,7 @@ The harness archives stack logs and S3 objects before invoking graceful planner 
 
 ## Agent Separation
 
-- The strategist receives the campaign goal, prior hypotheses, measured summaries, labels, and failures.
+- The strategist receives the campaign goal, hash-verified historical research, prior hypotheses, measured summaries, labels, and failures. It records the assumptions behind each proposed intervention.
 - A mutator receives one hypothesis and the genericity constraints. It edits only its disposable planner worktree.
 - The blind judge receives requirement-level run facts and read-only access to the frozen workflows source. It does not see the mutation or experiment score.
 - After judging and stack teardown, a read-only diagnostician receives a bounded immutable reconstruction with explicit durable, Langfuse, deterministic, model-inference, and not-captured provenance. Its findings remain unverified and cannot affect scoring.
@@ -114,7 +116,9 @@ There is no archive hydration path. Campaign APIs expose the execution projectio
 
 The frontend is native ES modules under `public/`, with no framework or runtime dependency. A small History API router owns the explicit campaign routes. The HTTP server falls back to `index.html` only for valid GET/HEAD UI routes; `/api` and extension-bearing requests retain normal 404 behavior.
 
-The shell uses a compact collapsible desktop sidebar and an accessible mobile drawer. Overview owns campaign operations and active replicate matrices. Experiments owns the filterable ledger. Lineage renders round columns with dependency connectors and an equivalent list. Experiment detail owns summary, run, question, and artifact tabs. Human review is a separate route with one central dirty-draft model; navigation, campaign changes, filters, units, and operations all pass through the same guard. SSE refreshes update persisted facts without replacing the draft.
+The shell uses a compact collapsible desktop sidebar and an accessible mobile drawer. Overview owns campaign operations and active replicate matrices. Experiments owns the filterable ledger. Lineage renders round columns with dependency connectors and an equivalent list. Experiment detail keeps Summary as its default and adds a Markdown tab beside run, question, target-excluded, and artifact views. The server renders GitHub-style Markdown through an allowlisted sanitizer, shifts report headings below the page title, and attaches stable anchors to original Markdown H1-H3 headings. The browser builds a dynamic "On this page" rail from those anchors; deeper headings do not enter the rail. Raw Markdown remains available separately. Human review is a separate route with one central dirty-draft model; navigation, campaign changes, filters, units, and operations all pass through the same guard. SSE refreshes update persisted facts without replacing the draft.
+
+Variant creation writes the initial report before mutation or evaluation starts. The immutable hypothesis record supplies assumptions, selected parent diagnosis findings, instructions, expected impact, and risk. Later refreshes add parent comparisons, standard/control/excluded measurements, human-label coverage, diagnosis status, and a deterministic conclusion. A lower build count or provisional score is never phrased as verified improvement. Optional human notes are read from a separate sidecar and embedded verbatim without becoming scoring truth.
 
 Replicate matrices are configured-slot projections, not lists of observed runs. For each benchmark and replicate number, the view left-joins execution state and final `replicateFacts`/`holdoutReplicateFacts`. Final facts take precedence for planner usage, live execution usage fills the current slot, and aggregate consensus usage is never added again. This keeps primary and holdout planner totals once-per-execution and excludes all harness-agent usage.
 
@@ -131,3 +135,7 @@ Added persisted per-replicate progress, partial decision telemetry, direct plann
 ### 2026-09-06 - Routed research workspace
 
 Replaced the single-page hash dashboard with explicit History API routes, configured replicate matrices, filterable experiment and lineage workspaces, isolated review navigation, once-per-replicate telemetry totals, and safe server-side deep-link fallback. Removed archive hydration from the serving contract.
+
+### 2026-09-06 - Data-backed experiment narratives
+
+Added preregistered assumptions and intervention instructions, parent and three-arm metric summaries, conservative evidence-backed conclusions, hash-verified historical V11-V13c research inputs, preserved human-note sidecars, and an in-page Markdown tab without replacing the existing experiment summary.

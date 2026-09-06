@@ -1,0 +1,223 @@
+{
+  "kind": "ainative-planner/phase2-baseline",
+  "schemaVersion": 1,
+  "capturedAt": "2026-09-05T21:03:24.261Z",
+  "evaluationFixture": true,
+  "productionWorkflowLogic": false,
+  "purpose": "Frozen V13 normal-run evaluation fixture for the narrow V13b retrieval and binding-exclusion experiment. This file is evidence only and is not production workflow logic.",
+  "case": {
+    "id": "5W8NBBN2Y8Z4CEWBEA61E4B910",
+    "runId": "run.9b1099e8438403fcaa6eabc3",
+    "analysisId": "analysis.c2e2ead475739f7418089bcd",
+    "mode": "greenfield"
+  },
+  "requirements": {
+    "workflow": "trumark/deceased-account",
+    "packVersion": 4,
+    "revision": 51,
+    "exportHash": "38b74ad46bf3",
+    "contractHash": "sha256:a3b1639eba15828bb2a9eef3b7b8945c8f715886f771ffc79ee8f88b50e2d133",
+    "normalizedArtifactSha256": "sha256:f9bcc974e7c93254e374eaecc5194671914213ef9a028c9ce09e8ead453b5ac8",
+    "originalArtifactSha256": "sha256:be6a0f1958a169dc5f3411a6da724a56453ba41f615cfe1d721d3cacc32d540a"
+  },
+  "resolvedInputs": {
+    "inputSetHash": "sha256:266c867e9b68dc20de54e15d5b65bc5d9a6260357e9f56d2b042ea90ef8de4e4",
+    "decisionSetVersion": 0,
+    "decisionSetHash": "sha256:32c0222d5ce22efd629133244c7b290faeca88592165b74fbf11aa4a71f8c90d",
+    "sourceCommit": "140ec306bff8c20aa9eccde3cc2f4647ce790655",
+    "sourceTree": "443509a2c4fa4ffa0d56a4df57c615e44c8ef530",
+    "sourceObservationHash": "sha256:6f4ef8af38ceb62c79e6e40cb6eca2f957d780b6c037b3955501f477e74b803b",
+    "capabilityManifestHash": "sha256:3f3cbd64bb2414d737832b6e7ddfdb32a269f053a27d74b37a8f5d75ca12a24e",
+    "availabilityHash": "sha256:4377f62fc2c8e69c88ec10f7d5a71f155fede35184a473a3d81c959451a61158",
+    "knowledgeSnapshotHash": "sha256:7646fe1380ebd2a53b9f309619bd3911549a82398cc7622ae8ac8e3054f804c3",
+    "knowledgeGeneration": 1863,
+    "adjudicatorPrompt": {
+      "version": "adjudicator-v13",
+      "hash": "sha256:6fb541e8f1dd7a101cb5d854dad910da54f97df6c8740b98d78b656be8d92ec9"
+    },
+    "adjudicatorModel": {
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "configurationHash": "sha256:2426dd91e307039b077eb53b45d419326b5dfc177c58905234592bd01cb66df9"
+    },
+    "algorithms": {
+      "decomposition": "decomposition-v3",
+      "candidateRanking": "candidate-ranking-v2",
+      "requirementBehaviorContext": "requirement-behavior-context-v1",
+      "evidenceProjection": "evidence-projection-v2-large",
+      "kbSearchHydration": "qualified-search-hydration-v2"
+    }
+  },
+  "analysis": {
+    "requirementUnits": 109,
+    "unitsWithEmptyShortlist": 60,
+    "unitsWithNonemptyShortlist": 49,
+    "matchedCandidateOccurrences": 64,
+    "decisions": {
+      "build": 81,
+      "reuse": 0,
+      "extend": 16,
+      "defer": 12,
+      "question": 0
+    },
+    "usage": {
+      "calls": 288,
+      "inputTokens": 2938029,
+      "outputTokens": 60463,
+      "totalTokens": 2998492,
+      "durationMs": 1334838,
+      "costUsd": 9.73788
+    },
+    "groundingFunnel": {
+      "receipts": 109,
+      "searchCalls": 125,
+      "searchHitCount": 1013,
+      "qualifiedPointerCount": 382,
+      "outsideAuthorityOrMalformedHits": 630,
+      "hydrationAttemptCount": 156,
+      "sourceReadCount": 148,
+      "admittedSourceCount": 105,
+      "admittedTestCount": 20,
+      "projectedSourceBytes": 2257435,
+      "projectedTestBytes": 465255,
+      "selectedDiscoveredCount": 12,
+      "unitsWithZeroQualifiedPointers": 62,
+      "buildsWithZeroQualifiedPointers": 50
+    },
+    "grounding": {
+      "receiptCount": 109,
+      "searchCalls": 125,
+      "searchHitCount": 1013,
+      "qualifiedPointerCount": 382,
+      "hydrationAttemptCount": 156,
+      "sourceReadCount": 148,
+      "admittedSourceCount": 105,
+      "admittedTestCount": 20,
+      "projectedSourceBytes": 2257435,
+      "projectedTestBytes": 465255,
+      "selectedDiscoveredCount": 12,
+      "rejectionCounts": [
+        { "reason": "duplicate_candidate", "count": 10 },
+        { "reason": "evidence_slots_exhausted", "count": 208 },
+        { "reason": "malformed_hit", "count": 630 },
+        { "reason": "non_executable_declaration", "count": 24 },
+        { "reason": "sensitive_source", "count": 7 },
+        { "reason": "unsupported_path", "count": 5 }
+      ]
+    },
+    "toolOperations": {
+      "kb_search": 125,
+      "kb_code_map": 50,
+      "requirements_question": 4
+    },
+    "rejections": {
+      "duplicate_candidate": 10,
+      "evidence_slots_exhausted": 208,
+      "malformed_hit": 630,
+      "non_executable_declaration": 24,
+      "sensitive_source": 7,
+      "unsupported_path": 5
+    },
+    "toolFailures": [
+      {
+        "ordinal": 54,
+        "attempt": 32,
+        "operation": "kb_search",
+        "requestHash": "sha256:e70baf00752f4a55abcde7ae7962dfe8903c290275a05bdd506bf3d48dbc24cd",
+        "reason": "engine_error"
+      }
+    ]
+  },
+  "transitionChurnFromDirectV12": {
+    "build->build": 78,
+    "build->extend": 7,
+    "build->defer": 1,
+    "extend->build": 3,
+    "extend->extend": 8,
+    "defer->defer": 11,
+    "defer->extend": 1
+  },
+  "targetHitMissCohort": {
+    "corrected": 5,
+    "remaining": 5,
+    "examples": [
+      {
+        "ordinal": 7,
+        "unitId": "unit.14645a34560e738743aea7d0",
+        "requirement": "fields/prorated_dividend",
+        "result": "extend",
+        "outcome": "corrected_selected_target"
+      },
+      {
+        "ordinal": 10,
+        "unitId": "unit.21b2b0b3052c9aeca420d2fc",
+        "requirement": "test-data/37251b62df600e7650b50575d78c7a5109ecd8798221573311a2bf29986f8e92",
+        "result": "build",
+        "outcome": "remaining_kb_missed_target"
+      },
+      {
+        "ordinal": 28,
+        "unitId": "unit.45b9a9089389568aa4711525",
+        "requirement": "fields/tracking_entry_status",
+        "result": "build",
+        "outcome": "remaining_kb_missed_target"
+      },
+      {
+        "ordinal": 29,
+        "unitId": "unit.47571bd0e5c7ae07ecca03d9",
+        "requirement": "fields/recorded_figure_attribution_outcome",
+        "result": "extend",
+        "outcome": "corrected_selected_target"
+      },
+      {
+        "ordinal": 33,
+        "unitId": "unit.4a59ae59752041505112b40c",
+        "requirement": "fields/dividend_as_of_date",
+        "result": "build",
+        "outcome": "remaining_query_mutation_missed_target",
+        "observation": "The exact identifier ranked the target first; the mutated prose query returned unrelated results against the same KB."
+      },
+      {
+        "ordinal": 54,
+        "unitId": "unit.8a4b6e7c04e91f4ca21d933f",
+        "requirement": "test-data/8732989513057e240d8a6ac6af4be4169636254b4e45fffe4db95e843601480e",
+        "result": "extend",
+        "outcome": "corrected_selected_target"
+      },
+      {
+        "ordinal": 61,
+        "unitId": "unit.94eaa2963f6ea24dee047a3b",
+        "requirement": "fields/undetermined_figure_review_count",
+        "result": "extend",
+        "outcome": "corrected_selected_target"
+      },
+      {
+        "ordinal": 82,
+        "unitId": "unit.b9688475a4661b7dc8aa9045",
+        "requirement": "fields/recorded_figure_disagreement_count",
+        "result": "extend",
+        "outcome": "corrected_selected_target"
+      },
+      {
+        "ordinal": 92,
+        "unitId": "unit.cfd8e7828a922465cefa6327",
+        "requirement": "steps/accept-account-number",
+        "result": "build",
+        "outcome": "remaining_kb_missed_target"
+      },
+      {
+        "ordinal": 106,
+        "unitId": "unit.f76960716aa6bc668c301d62",
+        "requirement": "fields/recorded_figure_comparison_outcome",
+        "result": "build",
+        "outcome": "remaining_admitted_test_not_production",
+        "observation": "A search requested limit 8 and omitted the relevant production results at ranks 9 and 10."
+      }
+    ]
+  },
+  "experimentNotes": [
+    "Compare V13b against this fixture without mutating it.",
+    "The one defer->extend transition was an explicit binding exclusion regression and motivates the structural V13b fast path.",
+    "The four unresolved KB-miss cases received no relevant production result; the fifth remaining case admitted supporting test evidence only."
+  ]
+}

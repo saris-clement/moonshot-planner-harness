@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "sourceRepository": "Saris-AI/moonshot-planner-poc",
+  "sourceRevision": "7ca5cadcc64a0b3951ebb24d481343ec8d23f5a1",
+  "materials": [
+    {
+      "name": "Deceased-account Phase 2 baseline observation",
+      "path": "history/planner-7ca5cad/deceased-account-phase2-baseline.json",
+      "sha256": "sha256:9726247d152180d4f903e449586881e5dee74a5ddb8ff5aef05747c6e4a00cee",
+      "kind": "historical_observation",
+      "comparability": "historical_context_only"
+    },
+    {
+      "name": "Deceased-account Phase 2 retrieval study",
+      "path": "history/planner-7ca5cad/deceased-account-phase2-retrieval-study.md",
+      "sha256": "sha256:98066e99fd498d125d46361f1ff46834f1cb27a50fe37a9d67a550c988b144c5",
+      "kind": "mixed_research_record",
+      "comparability": "historical_context_only"
+    },
+    {
+      "name": "Deceased-account Phase 2 V12 observation",
+      "path": "history/planner-7ca5cad/deceased-account-phase2-v12-observation.json",
+      "sha256": "sha256:009b6c4c5781fec27952b841aebad55366cda583e332337c8c45a668efe95c01",
+      "kind": "historical_observation",
+      "comparability": "historical_context_only"
+    },
+    {
+      "name": "Deceased-account Phase 2 V13 observation",
+      "path": "history/planner-7ca5cad/deceased-account-phase2-v13-observation.json",
+      "sha256": "sha256:3f21d9ed35e8edafb7983f0b8024449aaf6af18d6a78623c8e3ce280fc6d6375",
+      "kind": "historical_observation",
+      "comparability": "historical_context_only"
+    },
+    {
+      "name": "Deceased-account Phase 2 V13b observation",
+      "path": "history/planner-7ca5cad/deceased-account-phase2-v13b-observation.json",
+      "sha256": "sha256:4db3a375c1b53280460a599263d82bde35f2debaf547236aa3a4a99d72ba5b62",
+      "kind": "historical_observation",
+      "comparability": "historical_context_only"
+    },
+    {
+      "name": "Phase 2 experiment introduction",
+      "path": "history/planner-7ca5cad/introduction.md",
+      "sha256": "sha256:2dcdc9f26aadf2c0d1d69e78b05189ba613693de0240aa94e19d989e29de45d1",
+      "kind": "mixed_research_record",
+      "comparability": "historical_context_only"
+    },
+    {
+      "name": "Phase 2 V13c experiment axes",
+      "path": "history/planner-7ca5cad/phase2-v13c-experiment-axes.md",
+      "sha256": "sha256:8400be18c6d265446ea563124d83e2cbe390a99f5ae36b04ab345b620ed8a6e7",
+      "kind": "experiment_plan",
+      "comparability": "historical_context_only"
+    }
+  ]
+}

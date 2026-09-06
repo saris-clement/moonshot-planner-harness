@@ -76,6 +76,7 @@ async function fixture(): Promise<{
       expectedImpact: 'A generic improvement.',
       risk: 'Fixture only.',
       findingIds: [],
+      assumptions: [],
     },
     status: 'gating',
     worktreePath: directory,

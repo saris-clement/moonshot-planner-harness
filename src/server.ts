@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, readdir, rm, stat } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, realpath, rm, stat } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import path from 'node:path';
 import { Transform } from 'node:stream';
@@ -10,6 +10,7 @@ import type { HarnessDatabase } from './db.js';
 import type { CampaignOrchestrator } from './orchestrator.js';
 import { DecisionSchema } from './types.js';
 import { campaignReportDirectory, variantArtifactDirectory } from './paths.js';
+import { renderMarkdown } from './renderMarkdown.js';
 import { parseSourceLineRanges, readFrozenSourceFile, renderSourceViewer } from './sourceViewer.js';
 
 const LabelInputSchema = z.object({
@@ -197,20 +198,32 @@ async function streamLocalFile(
   root: string,
   relative: string,
   response: ServerResponse,
+  contentType?: string,
 ): Promise<void> {
   const filePath = path.resolve(root, relative);
   if (!filePath.startsWith(`${path.resolve(root)}${path.sep}`)) throw new Error('unsafe artifact path');
-  const details = await stat(filePath);
-  if (!details.isFile()) throw new Error('artifact is not a file');
+  const [rootPath, resolvedFile, details] = await Promise.all([
+    realpath(root),
+    realpath(filePath),
+    lstat(filePath),
+  ]);
+  if (
+    details.isSymbolicLink() ||
+    !details.isFile() ||
+    !resolvedFile.startsWith(`${rootPath}${path.sep}`)
+  ) {
+    throw new Error('artifact is not a contained regular file');
+  }
   const text = ['.json', '.jsonl', '.log', '.txt', '.md', '.patch', '.env'].includes(
-    path.extname(filePath),
+    path.extname(resolvedFile),
   );
   response.writeHead(200, {
-    'Content-Type': text ? 'text/plain; charset=utf-8' : 'application/octet-stream',
+    'Content-Type': contentType ?? (text ? 'text/plain; charset=utf-8' : 'application/octet-stream'),
+    'Cache-Control': 'no-store',
     'Content-Length': details.size,
-    'Content-Disposition': `${text ? 'inline' : 'attachment'}; filename="${path.basename(filePath).replaceAll('"', '')}"`,
+    'Content-Disposition': `${text ? 'inline' : 'attachment'}; filename="${path.basename(resolvedFile).replaceAll('"', '')}"`,
   });
-  createReadStream(filePath).pipe(response);
+  createReadStream(resolvedFile).pipe(response);
 }
 
 export function startDashboard(input: {
@@ -367,10 +380,32 @@ export function startDashboard(input: {
           }
           if (segments[5] === 'report') {
             const reportRoot = campaignReportDirectory(input.orchestrator.paths, campaignId);
+            const reportName = `${String(variant.ordinal).padStart(3, '0')}-${variant.id}.md`;
+            if (url.searchParams.get('format') === 'html') {
+              const reportPath = path.resolve(reportRoot, reportName);
+              if (!reportPath.startsWith(`${path.resolve(reportRoot)}${path.sep}`)) {
+                throw new Error('unsafe report path');
+              }
+              const [reportRootPath, resolvedReport, reportDetails] = await Promise.all([
+                realpath(reportRoot),
+                realpath(reportPath),
+                lstat(reportPath),
+              ]);
+              if (
+                reportDetails.isSymbolicLink() ||
+                !reportDetails.isFile() ||
+                !resolvedReport.startsWith(`${reportRootPath}${path.sep}`)
+              ) {
+                throw new Error('unsafe report file');
+              }
+              sendHtml(response, 200, renderMarkdown(await readFile(resolvedReport, 'utf8')));
+              return;
+            }
             await streamLocalFile(
               reportRoot,
-              `${String(variant.ordinal).padStart(3, '0')}-${variant.id}.md`,
+              reportName,
               response,
+              'text/markdown; charset=utf-8',
             );
             return;
           }

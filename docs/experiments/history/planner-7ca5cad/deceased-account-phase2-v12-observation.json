@@ -1,0 +1,119 @@
+{
+  "kind": "ainative-planner/phase2-baseline",
+  "schemaVersion": 1,
+  "capturedAt": "2026-09-05T15:26:24.497Z",
+  "purpose": "Direct V12 reference for measuring qualified search hydration and large evidence projection with the same deceased-account requirements and source pins.",
+  "case": {
+    "id": "3PTXXJDVQP1AQN6E3JMZEP4WKP",
+    "analysisId": "analysis.601f2e5ce8b681997ccb191e",
+    "analysisRunId": "run.0cda18a9a45430d9a7a463f6",
+    "mode": "greenfield"
+  },
+  "requirements": {
+    "workflow": "trumark/deceased-account",
+    "packVersion": 4,
+    "revision": 51,
+    "exportHash": "38b74ad46bf3",
+    "contractHash": "sha256:a3b1639eba15828bb2a9eef3b7b8945c8f715886f771ffc79ee8f88b50e2d133",
+    "originalArtifactSha256": "sha256:be6a0f1958a169dc5f3411a6da724a56453ba41f615cfe1d721d3cacc32d540a"
+  },
+  "resolvedInputs": {
+    "inputSetHash": "sha256:f2b0f00397a699c32edd5ddc83ede9245020c39b12d57422ca885f1b456bccc7",
+    "sourceCommit": "140ec306bff8c20aa9eccde3cc2f4647ce790655",
+    "sourceTree": "443509a2c4fa4ffa0d56a4df57c615e44c8ef530",
+    "sourceObservationHash": "sha256:6f4ef8af38ceb62c79e6e40cb6eca2f957d780b6c037b3955501f477e74b803b",
+    "capabilityManifestHash": "sha256:3f3cbd64bb2414d737832b6e7ddfdb32a269f053a27d74b37a8f5d75ca12a24e",
+    "availabilityHash": "sha256:4377f62fc2c8e69c88ec10f7d5a71f155fede35184a473a3d81c959451a61158",
+    "knowledgeSnapshotHash": "sha256:7646fe1380ebd2a53b9f309619bd3911549a82398cc7622ae8ac8e3054f804c3",
+    "knowledgeGeneration": 1863,
+    "adjudicatorPrompt": "adjudicator-v12",
+    "requirementContextAlgorithm": "requirement-behavior-context-v1"
+  },
+  "analysis": {
+    "requirementUnits": 109,
+    "manifestCapabilities": 9,
+    "unitCapabilityPairs": 981,
+    "kindExclusions": 358,
+    "termOrIoExclusions": 559,
+    "matchedCandidateOccurrences": 64,
+    "unitsWithEmptyShortlist": 60,
+    "unitsWithNonemptyShortlist": 49,
+    "unitsWithDiscoveryAttempted": 99,
+    "kbCalls": 180,
+    "kbCallsSucceeded": 180,
+    "kbCallsFailedOrRejected": 0,
+    "toolOperations": {
+      "kb_search": 95,
+      "kb_code_map": 68,
+      "kb_get": 15,
+      "kb_locate": 2,
+      "requirements_question": 2
+    },
+    "unitsWithHydratedCommittedEvidence": 11,
+    "unitsWithSelectedHydratedEvidence": 5,
+    "targetHitUnits": 11,
+    "targetHydratedUnits": 8,
+    "targetSelectedSourceRefs": 5,
+    "hydratedPrefixMisses": 4,
+    "decisions": {
+      "build": 86,
+      "reuse": 0,
+      "extend": 11,
+      "defer": 12,
+      "question": 0
+    },
+    "confidence": {
+      "buildHigh": 75,
+      "buildMedium": 11,
+      "extendHigh": 7,
+      "extendMedium": 4,
+      "deferHigh": 12
+    },
+    "evidence": {
+      "discoveredCount": 11,
+      "selectedSourceRefCount": 11,
+      "privateTopLevelDiscoveredCount": 8,
+      "privateTopLevelSelectedCount": 5,
+      "sourceRefsByScope": {
+        "target": 5,
+        "shared": 6,
+        "otherWorkflow": 0,
+        "unclassified": 0
+      }
+    },
+    "usage": {
+      "calls": 291,
+      "inputTokens": 1528857,
+      "outputTokens": 54463,
+      "totalTokens": 1583320,
+      "durationMs": 1161706,
+      "costUsd": 5.320731
+    }
+  },
+  "sentinels": [
+    {
+      "unitId": "unit.4a59ae59752041505112b40c",
+      "requirement": "dividend_as_of_date",
+      "observed": "build",
+      "expectedWithGroundedSource": "extend"
+    },
+    {
+      "unitId": "unit.8a4b6e7c04e91f4ca21d933f",
+      "requirement": "$2.00 / 20 * 21 dividend example",
+      "observed": "build",
+      "expectedWithGroundedSource": "extend"
+    },
+    {
+      "unitId": "unit.b9688475a4661b7dc8aa9045",
+      "requirement": "recorded_figure_disagreement_count",
+      "observed": "build",
+      "expectedWithGroundedSource": "extend"
+    }
+  ],
+  "comparisonNotes": [
+    "Use this observation as --baseline for the first V13 normal run.",
+    "V12 has no evidence-grounding receipts, so its grounding delta is unknown rather than zero.",
+    "The requirements workflow remains singular while the implementation is plural; workflow-level resolution therefore remains new.",
+    "The V13 experiment is successful only if evidence receipts prove automatic frozen-source hydration and the decision changes are supported by exact source ranges."
+  ]
+}

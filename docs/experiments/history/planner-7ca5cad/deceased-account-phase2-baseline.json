@@ -1,0 +1,111 @@
+{
+  "kind": "ainative-planner/phase2-baseline",
+  "schemaVersion": 1,
+  "capturedAt": "2026-09-05T07:00:27.000Z",
+  "purpose": "Pre-change comparison baseline for Phase 2 retrieval and counterfactual target-implementation exclusion work.",
+  "case": {
+    "id": "7PQFRQT9H876E8M58K8T8Q5WYW",
+    "analysisId": "analysis.a8f4dae248c76bb983added2",
+    "analysisRunId": "run.a9ecb3f824f2c5698bdaab62",
+    "mode": "greenfield",
+    "statusAtCapture": "failed"
+  },
+  "requirements": {
+    "workflow": "trumark/deceased-account",
+    "packVersion": 4,
+    "revision": 51,
+    "exportHash": "38b74ad46bf3",
+    "readiness": "provisional",
+    "contractHash": "sha256:a3b1639eba15828bb2a9eef3b7b8945c8f715886f771ffc79ee8f88b50e2d133",
+    "normalizedArtifactSha256": "sha256:f9bcc974e7c93254e374eaecc5194671914213ef9a028c9ce09e8ead453b5ac8",
+    "originalArtifactSha256": "sha256:be6a0f1958a169dc5f3411a6da724a56453ba41f615cfe1d721d3cacc32d540a"
+  },
+  "resolvedInputs": {
+    "inputSetHash": "sha256:2d38aa14902f10902b145f5fe4e0cc7731ac021ab05c6c400c42a351042dbcf2",
+    "repository": "workflows",
+    "sourceCommit": "140ec306bff8c20aa9eccde3cc2f4647ce790655",
+    "sourceTree": "443509a2c4fa4ffa0d56a4df57c615e44c8ef530",
+    "sourceObservationHash": "sha256:6f4ef8af38ceb62c79e6e40cb6eca2f957d780b6c037b3955501f477e74b803b",
+    "capabilityManifestHash": "sha256:3f3cbd64bb2414d737832b6e7ddfdb32a269f053a27d74b37a8f5d75ca12a24e",
+    "harnessCatalogHash": "sha256:bb8999e4551de2f8a98d73959cc727ae6125a2d215862e86efc69396108fb9c7",
+    "knowledgeSnapshotHash": "sha256:7646fe1380ebd2a53b9f309619bd3911549a82398cc7622ae8ac8e3054f804c3",
+    "knowledgeGeneration": 1863
+  },
+  "workflowResolution": {
+    "workflow": "trumark/deceased-account",
+    "status": "new",
+    "implementationStatus": "absent",
+    "harnessStatus": "missing",
+    "exactCapabilityId": null,
+    "requiresWorkflowEstablishment": true,
+    "reasonCode": "no_exact_implementation_or_harness_registration",
+    "sourceEvidenceCount": 0
+  },
+  "analysis": {
+    "requirementUnits": 109,
+    "manifestCapabilities": 9,
+    "unitCapabilityPairs": 981,
+    "kindExclusions": 358,
+    "termOrIoExclusions": 559,
+    "matchedCandidateOccurrences": 64,
+    "unitsWithEmptyShortlist": 60,
+    "unitsWithNonemptyShortlist": 49,
+    "unitsWithDiscoveryAttempted": 100,
+    "kbCalls": 185,
+    "kbCallsSucceeded": 141,
+    "kbCallsFailedOrRejected": 44,
+    "unitsWithHydratedCommittedEvidence": 10,
+    "unitsWithSelectedHydratedEvidence": 4,
+    "decisions": {
+      "build": 89,
+      "reuse": 1,
+      "extend": 8,
+      "defer": 11,
+      "question": 0
+    },
+    "planDispositions": {
+      "create_new": 89,
+      "modify_existing": 8,
+      "reuse_and_wire": 1,
+      "blocked_unknown": 11
+    },
+    "buildDecisionConfidence": {
+      "high": 65,
+      "medium": 24
+    },
+    "buildUnitsWithFailedToolCall": 40,
+    "buildSearchesWithTargetSourceHit": 10,
+    "targetSourceHitsNotHydrated": 9,
+    "kbFailureBreakdown": {
+      "hybridGeneralOrTechnicalEngineError": 12,
+      "lexicalFacetInvalidRequest": 28,
+      "invalidLocateRequest": 2,
+      "codeMapBudgetExceeded": 1
+    },
+    "buildUnitsByKind": {
+      "field": 46,
+      "user_visible_behavior": 20,
+      "action": 10,
+      "check": 8,
+      "system": 2,
+      "cardinality": 1,
+      "document": 1,
+      "trigger": 1
+    },
+    "largestBehavior": {
+      "name": "Present the combined result",
+      "buildUnits": 62
+    }
+  },
+  "knownIdentityGap": {
+    "requirementsWorkflow": "trumark/deceased-account",
+    "implementedWorkflow": "trumark/deceased-accounts",
+    "implementedRoot": "src/customers/trumark/deceased-accounts/",
+    "note": "The baseline is retained as an observed failure case. A valid normal-versus-exclusion experiment must use an exact workflow identity that normal mode proves as existing."
+  },
+  "comparisonNotes": [
+    "The archived baseline is descriptive, not a causal control after prompt, tool, and source pins change.",
+    "Provider output is nondeterministic; use at least three valid paired normal/exclusion runs.",
+    "A pair is valid only when requirements, source, manifest, configuration, availability, knowledge, model, prompt, budget, renderer, and harness pins match after removing the policy-specific fields."
+  ]
+}

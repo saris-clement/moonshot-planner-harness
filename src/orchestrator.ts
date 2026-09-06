@@ -84,6 +84,10 @@ const baselineHypothesis: Hypothesis = {
   expectedImpact: 'Establish reproducible primary and holdout facts for this campaign.',
   risk: 'Provider nondeterminism means one screening run is descriptive rather than conclusive.',
   findingIds: [],
+  assumptions: [
+    'Repeated runs with frozen inputs provide a campaign-local behavioral baseline.',
+    'The unmodified seed is a reference observation, not evidence that its decisions are correct.',
+  ],
 };
 
 function errorMessage(error: unknown): string {
@@ -762,6 +766,16 @@ export class CampaignOrchestrator {
         ordinal,
         hypothesis: baselineHypothesis,
       });
+      try {
+        await this.refreshReports(campaignId);
+      } catch (error) {
+        this.database.updateVariant(variant.id, {
+          status: 'failed',
+          error: `pre-run report generation failed: ${errorMessage(error)}`.slice(0, 20_000),
+        });
+        this.database.updateCampaign(campaignId, { status: 'baseline_failed' });
+        throw error;
+      }
       const result = await this.runVariant(campaign, variant, false);
       return await this.finalizeBaseline(campaignId, result);
     });
@@ -954,13 +968,42 @@ export class CampaignOrchestrator {
       this.ensureFrozenWorkflowsSource(campaign),
     ]);
     const historyPath = await this.refreshAgentHistory(campaignId);
-    const hypotheses = await new AgentRunner(campaign).proposeHypotheses(
+    const proposedHypotheses = await new AgentRunner(campaign).proposeHypotheses(
       campaignDirectory(this.paths, campaignId),
       historyPath,
       count,
       diagnosisAvailable,
     );
     const parentDiagnosis = this.database.getVariant(campaign.currentParentVariantId).diagnosis;
+    const hypotheses = proposedHypotheses.map((hypothesis) => ({
+      ...hypothesis,
+      findingSnapshots:
+        parentDiagnosis?.findings
+          .filter(({ id }) => hypothesis.findingIds.includes(id))
+          .map(
+            ({
+              id,
+              category,
+              causalMechanism,
+              supportingEvidenceRefs,
+              counterEvidenceRefs,
+              confidence,
+              genericIntervention,
+              falsificationTest,
+              limitations,
+            }) => ({
+              id,
+              category,
+              causalMechanism,
+              supportingEvidenceRefs,
+              counterEvidenceRefs,
+              confidence,
+              genericIntervention,
+              falsificationTest,
+              limitations,
+            }),
+          ) ?? [],
+    }));
     const findingIds = new Set(parentDiagnosis?.findings.map((finding) => finding.id) ?? []);
     for (const hypothesis of hypotheses) {
       if (diagnosisAvailable && hypothesis.findingIds.length === 0) {
@@ -985,6 +1028,18 @@ export class CampaignOrchestrator {
         hypothesis,
       });
     });
+    try {
+      await this.refreshReports(campaignId);
+    } catch (error) {
+      for (const candidate of candidates) {
+        this.database.updateVariant(candidate.id, {
+          status: 'failed',
+          error: `pre-run report generation failed: ${errorMessage(error)}`.slice(0, 20_000),
+        });
+      }
+      this.database.updateCampaign(campaignId, { status: 'stopped_round_failed' });
+      throw error;
+    }
     const results = await Promise.all(
       candidates.map((candidate) => this.runVariant(campaign, candidate, true)),
     );
@@ -2750,6 +2805,7 @@ export class CampaignOrchestrator {
       const targetByVariant = new Map(
         targetEvaluations.map((evaluation) => [evaluation.variantId, evaluation]),
       );
+      const variantById = new Map(variants.map((variant) => [variant.id, variant]));
       await Promise.all([
         writeCampaignIndex(this.paths, campaign, variants, targetConfig, targetEvaluations),
         ...variants.map((variant) =>
@@ -2759,10 +2815,12 @@ export class CampaignOrchestrator {
             variant,
             labels,
             targetByVariant.get(variant.id),
+            variant.parentVariantId ? variantById.get(variant.parentVariantId) : null,
           ),
         ),
       ]);
       await this.refreshAgentHistory(campaignId);
+      this.database.addEvent(campaignId, null, 'reports.refreshed', {});
     });
     this.reportQueues.set(campaignId, current);
     try {

@@ -17,9 +17,21 @@ import { runCommand } from './process.js';
 import { sha256File } from './config.js';
 import { diagnosisResultPath, validateDiagnosisFindingReferences } from './diagnosis.js';
 
-const StrategyOutputSchema = z.object({
-  hypotheses: z.array(HypothesisSchema).min(1).max(3),
-});
+const StrategyOutputSchema = z
+  .object({
+    hypotheses: z.array(HypothesisSchema).min(1).max(3),
+  })
+  .superRefine((output, context) => {
+    for (const [index, hypothesis] of output.hypotheses.entries()) {
+      if (hypothesis.assumptions.length === 0) {
+        context.addIssue({
+          code: 'custom',
+          path: ['hypotheses', index, 'assumptions'],
+          message: 'strategist hypotheses must record at least one assumption',
+        });
+      }
+    }
+  });
 
 const SourceQuestionAnswerSchema = z.discriminatedUnion('resolution', [
   z.object({
@@ -128,10 +140,10 @@ export class AgentRunner {
   ): Promise<Hypothesis[]> {
     const prompt = `You are the strategist for a generic requirements-to-builder planner evaluation.
 
-Read the attached campaign history. Propose exactly ${count} independent, bounded hypotheses for the next round. Each hypothesis must address an observed, source-backed failure mechanism rather than optimize decision counts. ${requireFindingIds ? "Every hypothesis must cite one or more real finding IDs from the current parent variant's completed model-generated diagnosis in findingIds. Diagnosis is unverified interpretation: preserve supporting evidence, counterevidence, limitations, and falsification rather than treating it as truth. Do not invent IDs." : 'The campaign explicitly opted out of requiring a current-parent diagnosis. Return an empty findingIds array and rely only on the separately identified measured facts, labels, and limitations in history.'} Do not add customer names, workflow names, fixed source paths, capability IDs, aliases, or pack-specific rules to production code. Prefer one causal mechanism per hypothesis so the experiment remains attributable.
+Read the attached campaign history. Propose exactly ${count} independent, bounded hypotheses for the next round. Each hypothesis must address an observed, source-backed failure mechanism rather than optimize decision counts. ${requireFindingIds ? "Every hypothesis must cite one or more real finding IDs from the current parent variant's completed model-generated diagnosis in findingIds. Diagnosis is unverified interpretation: preserve supporting evidence, counterevidence, limitations, and falsification rather than treating it as truth. Do not invent IDs." : 'The campaign explicitly opted out of requiring a current-parent diagnosis. Return an empty findingIds array and rely only on the separately identified measured facts, labels, and limitations in history.'} Record the assumptions that must be true for the proposed intervention to work. Assumptions are model-generated and must remain visibly unverified. Do not add customer names, workflow names, fixed source paths, capability IDs, aliases, or pack-specific rules to production code. Prefer one causal mechanism per hypothesis so the experiment remains attributable.
 
 Return JSON only:
-{"hypotheses":[{"title":"...","rationale":"...","instructions":"...","expectedImpact":"...","risk":"...","findingIds":["finding-..."]}]}`;
+{"hypotheses":[{"title":"...","rationale":"...","instructions":"...","expectedImpact":"...","risk":"...","findingIds":["finding-..."],"assumptions":["..."]}]}`;
     const result = await this.commandRunner(
       this.campaign.config.agent.command,
       this.argumentsFor(prompt, `${this.campaign.id} strategist`, [historyPath], contextDirectory),

@@ -121,6 +121,9 @@ async function main(): Promise<void> {
   if (command === 'serve') {
     const port = Number.parseInt(option(arguments_, '--port') ?? '4173', 10);
     if (!Number.isInteger(port) || port < 1 || port > 65_535) usage();
+    await Promise.all(
+      database.listCampaigns().map((campaign) => orchestrator.refreshReports(campaign.id)),
+    );
     const server = startDashboard({
       port,
       publicDirectory: path.resolve(process.cwd(), 'public'),

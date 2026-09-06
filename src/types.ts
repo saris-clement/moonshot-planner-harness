@@ -173,8 +173,28 @@ export const HypothesisSchema = z
       .array(z.string().regex(/^finding-[a-z0-9][a-z0-9._-]{0,79}$/))
       .max(20)
       .default([]),
+    assumptions: z.array(z.string().trim().min(1).max(2_000)).max(20).default([]),
+    findingSnapshots: z
+      .array(
+        z
+          .object({
+            id: z.string().regex(/^finding-[a-z0-9][a-z0-9._-]{0,79}$/),
+            category: z.string().min(1).max(128),
+            causalMechanism: z.string().min(1).max(4_000),
+            supportingEvidenceRefs: z.array(z.string().regex(/^evidence-[a-f0-9]{16}$/)).min(1).max(100),
+            counterEvidenceRefs: z.array(z.string().regex(/^evidence-[a-f0-9]{16}$/)).min(1).max(100),
+            confidence: z.enum(['low', 'medium', 'high']),
+            genericIntervention: z.string().min(1).max(4_000),
+            falsificationTest: z.string().min(1).max(4_000),
+            limitations: z.array(z.string().min(1).max(2_000)).min(1).max(50),
+          })
+          .strict(),
+      )
+      .max(20)
+      .optional(),
   })
   .strict();
+export type HypothesisInput = z.input<typeof HypothesisSchema>;
 export type Hypothesis = z.infer<typeof HypothesisSchema>;
 
 const Sha256Schema = z.string().regex(/^sha256:[a-f0-9]{64}$/);

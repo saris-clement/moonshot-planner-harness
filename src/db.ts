@@ -6,6 +6,7 @@ import type {
   DiagnosisOutput,
   DiagnosisStatus,
   Hypothesis,
+  HypothesisInput,
   JudgeOutput,
   LabelRecord,
   RunFacts,
@@ -468,9 +469,10 @@ export class HarnessDatabase {
     parentVariantId: string | null;
     round: number;
     ordinal: number;
-    hypothesis: Hypothesis;
+    hypothesis: HypothesisInput;
   }): VariantRecord {
     const timestamp = now();
+    const hypothesis = HypothesisSchema.parse(input.hypothesis);
     this.database
       .prepare(
         `INSERT INTO variants
@@ -483,11 +485,11 @@ export class HarnessDatabase {
         input.parentVariantId,
         input.round,
         input.ordinal,
-        JSON.stringify(input.hypothesis),
+        JSON.stringify(hypothesis),
         timestamp,
         timestamp,
       );
-    this.addEvent(input.campaignId, input.id, 'variant.created', { hypothesis: input.hypothesis });
+    this.addEvent(input.campaignId, input.id, 'variant.created', { hypothesis });
     return this.getVariant(input.id);
   }
 

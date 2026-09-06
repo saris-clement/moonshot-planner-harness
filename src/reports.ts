@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { lstat, mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type {
   CampaignRecord,
@@ -10,6 +10,7 @@ import type {
 } from './types.js';
 import type { HarnessPaths } from './paths.js';
 import { campaignReportDirectory } from './paths.js';
+import { compareCohort } from './metrics.js';
 
 function markdown(value: string): string {
   return value.replaceAll('|', '\\|').replace(/[\r\n]+/g, ' ').trim();
@@ -27,6 +28,334 @@ function percentage(value: number | null): string {
   return value === null ? 'unscored' : `${(value * 100).toFixed(1)}%`;
 }
 
+function signedDelta(value: number | null, baseline: number | null, percent = false): string {
+  if (value === null || baseline === null) return 'unavailable';
+  const delta = value - baseline;
+  const rendered = percent ? `${(delta * 100).toFixed(1)} pp` : String(delta);
+  return delta > 0 ? `+${rendered}` : rendered;
+}
+
+function renderAssumptions(variant: VariantRecord, parent?: VariantRecord | null): string {
+  if (variant.hypothesis.assumptions.length === 0) {
+    return 'No explicit assumptions were captured for this legacy hypothesis.';
+  }
+  const authority = parent
+    ? 'They are model-generated and unverified.'
+    : 'They are harness-authored baseline assumptions, not measured facts.';
+  return `These assumptions were recorded before execution. ${authority}\n\n${variant.hypothesis.assumptions
+    .map((assumption) => `- ${markdown(assumption)}`)
+    .join('\n')}`;
+}
+
+function renderObservedIssues(variant: VariantRecord, parent?: VariantRecord | null): string {
+  if (!parent) {
+    return 'This is a baseline observation with no parent diagnosis. No causal issue is asserted.';
+  }
+  const snapshottedFindings = variant.hypothesis.findingSnapshots ?? [];
+  const legacyFallback = snapshottedFindings.length === 0 && variant.hypothesis.findingIds.length > 0;
+  const findings = legacyFallback
+    ? parent.diagnosis?.findings.filter(({ id }) => variant.hypothesis.findingIds.includes(id)) ?? []
+    : snapshottedFindings;
+  if (findings.length === 0) {
+    return variant.hypothesis.findingIds.length === 0
+      ? 'No parent diagnosis finding was selected for this experiment.'
+      : `The selected finding IDs were not available in the parent diagnosis: ${variant.hypothesis.findingIds.map((id) => `\`${id}\``).join(', ')}.`;
+  }
+  return findings
+    .map(
+      (finding) => `### ${markdown(finding.id)}: ${markdown(finding.category)}
+
+Authority: \`${legacyFallback ? 'legacy_current_parent_diagnosis' : 'unverified_model_judgment'}\`
+
+${legacyFallback ? 'This legacy experiment predates finding snapshots. The displayed parent finding was not preregistered and may change after re-diagnosis.\n\n' : ''}${quote(finding.causalMechanism)}
+
+Proposed generic intervention: ${markdown(finding.genericIntervention)}
+
+Supporting evidence: ${finding.supportingEvidenceRefs.map((id) => `\`${id}\``).join(', ')}
+
+Counterevidence: ${finding.counterEvidenceRefs.map((id) => `\`${id}\``).join(', ')}
+
+Falsification: ${markdown(finding.falsificationTest)}
+
+Limitations: ${finding.limitations.map((limitation) => markdown(limitation)).join('; ')}`,
+    )
+    .join('\n\n');
+}
+
+function renderBaselineMetrics(variant: VariantRecord, parent?: VariantRecord | null): string {
+  if (!parent) {
+    return 'No parent metrics exist. This experiment establishes a campaign-local baseline.';
+  }
+  const metrics = [
+    ['Build units', parent.facts?.decisions.build ?? null, variant.facts?.decisions.build ?? null, false],
+    ['Reuse units', parent.facts?.decisions.reuse ?? null, variant.facts?.decisions.reuse ?? null, false],
+    ['Extend units', parent.facts?.decisions.extend ?? null, variant.facts?.decisions.extend ?? null, false],
+    ['Defer units', parent.facts?.decisions.defer ?? null, variant.facts?.decisions.defer ?? null, false],
+    ['Question units', parent.facts?.decisions.question ?? null, variant.facts?.decisions.question ?? null, false],
+    ['Decision agreement', parent.facts?.decisionAgreement ?? null, variant.facts?.decisionAgreement ?? null, true],
+    ['Selected source references', parent.facts?.evidence.selectedSourceRefs ?? null, variant.facts?.evidence.selectedSourceRefs ?? null, false],
+    ['Verified accuracy', parent.score?.verified.accuracy ?? null, variant.score?.verified.accuracy ?? null, true],
+    ['Provisional accuracy', parent.score?.provisional.accuracy ?? null, variant.score?.provisional.accuracy ?? null, true],
+  ] as const;
+  const value = (metric: number | null, percent: boolean): string =>
+    metric === null ? 'unavailable' : percent ? percentage(metric) : String(metric);
+  return `| Metric | Parent | Observed | Delta |
+| --- | ---: | ---: | ---: |
+${metrics
+    .map(
+      ([label, baseline, observed, percent]) =>
+        `| ${label} | ${value(baseline, percent)} | ${value(observed, percent)} | ${signedDelta(observed, baseline, percent)} |`,
+    )
+    .join('\n')}`;
+}
+
+function renderArms(variant: VariantRecord, targetExcluded?: TargetExcludedEvaluationRecord | null): string {
+  const rows: Array<[string, string, VariantRecord['facts']]> = [
+    ['Standard', variant.facts ? 'measured' : 'pending', variant.facts],
+  ];
+  if (targetExcluded) {
+    rows.push(
+      ['Target-safe control', targetExcluded.controlFacts ? 'measured' : targetExcluded.status, targetExcluded.controlFacts],
+      ['Target-excluded', targetExcluded.excludedFacts ? 'measured' : targetExcluded.status, targetExcluded.excludedFacts],
+    );
+  }
+  return `| Arm | Status | Units | Build | Reuse | Extend | Defer | Question | Agreement |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+${rows
+    .map(
+      ([arm, status, facts]) =>
+        `| ${arm} | ${status} | ${facts?.unitCount ?? 'unavailable'} | ${facts?.decisions.build ?? 'unavailable'} | ${facts?.decisions.reuse ?? 'unavailable'} | ${facts?.decisions.extend ?? 'unavailable'} | ${facts?.decisions.defer ?? 'unavailable'} | ${facts?.decisions.question ?? 'unavailable'} | ${facts ? percentage(facts.decisionAgreement) : 'unavailable'} |`,
+    )
+    .join('\n')}
+
+${targetExcluded ? 'The control and excluded arms use the same target-safe pack. The excluded arm is a promotion guard, not a fitness reward.' : 'No target-safe control or target-excluded result is available for this experiment.'}`;
+}
+
+function renderConclusion(
+  variant: VariantRecord,
+  parent?: VariantRecord | null,
+  targetExcluded?: TargetExcludedEvaluationRecord | null,
+  labels: readonly LabelRecord[] = [],
+): string {
+  if (!variant.facts) {
+    return `Status: \`pending\`\n\nNo measured conclusion is available while the experiment is ${variant.status}.`;
+  }
+  const statements = [
+    'This section is generated from persisted measurements. It does not treat model diagnosis or blind-judge suggestions as verified truth.',
+  ];
+  if (!parent) {
+    statements.push('This run establishes a baseline observation; it does not establish that the planner decisions are correct or that the planner improved.');
+  } else if (!parent.facts) {
+    statements.push('The result is inconclusive because the parent has no complete measured facts.');
+  } else {
+    const mismatches = compareCohort(parent.facts, variant.facts);
+    statements.push(
+      mismatches.length === 0
+        ? 'The parent and candidate requirement cohorts are comparable. The measured deltas above are descriptive until correctness is human-verified.'
+        : `The result is not causally comparable with its parent because of: ${mismatches.join(', ')}.`,
+    );
+  }
+  if (!variant.score) {
+    statements.push(`Correctness could not be scored because judging did not produce a score. The campaign currently has ${labels.filter(({ status }) => status === 'verified').length} verified labels.`);
+  } else if (variant.score.verified.labeled === 0) {
+    statements.push('Correctness remains unverified because no human-verified labels score this experiment. Provisional accuracy is an LLM suggestion only.');
+  } else {
+    statements.push(`Verified accuracy is ${percentage(variant.score.verified.accuracy)} across ${variant.score.verified.labeled} human-reviewed units.`);
+  }
+  if (variant.diagnosisStatus !== 'completed') {
+    statements.push(`Causal interpretation is not final because diagnosis status is ${variant.diagnosisStatus}.`);
+  }
+  if (targetExcluded) {
+    statements.push(
+      targetExcluded.status === 'completed'
+        ? `The target-excluded promotion guard is ${targetExcluded.gate?.status ?? 'pending'}.`
+        : `The target-safe control and target-excluded comparison is ${targetExcluded.status}; the conclusion is incomplete until it finishes.`,
+    );
+  }
+  return `Status: \`${variant.status === 'failed' ? 'failed' : 'measured'}\`\n\n${statements.join('\n\n')}`;
+}
+
+function renderEvidenceLedger(
+  paths: HarnessPaths,
+  campaign: CampaignRecord,
+  variant: VariantRecord,
+  labels: readonly LabelRecord[],
+  parent: VariantRecord | null | undefined,
+  targetExcluded: TargetExcludedEvaluationRecord | null | undefined,
+  humanNotesPresent: boolean,
+): string {
+  const primary = campaign.config.benchmarks.find(({ role }) => role === 'primary')?.name ?? 'primary';
+  const root = path.join(paths.artifacts, campaign.id, variant.id);
+  const rows = [
+    ['Frozen campaign inputs', 'observed_durable', path.join(paths.campaigns, campaign.id, 'campaign.json'), 'hash-pinned'],
+    ['Current measured facts', 'observed_durable', `${root}/${primary}/facts.json`, variant.facts ? (variant.artifactCollectionComplete ? 'archived' : 'pending archive') : 'unavailable'],
+  ];
+  if (parent) {
+    rows.push([
+      'Parent measured facts',
+      'observed_durable',
+      path.join(paths.artifacts, campaign.id, parent.id, primary, 'facts.json'),
+      parent.facts ? (parent.artifactCollectionComplete ? 'archived' : 'pending archive') : 'unavailable',
+    ]);
+  }
+  if (variant.diagnosisInputHash) {
+    rows.push([
+      'Diagnosis input',
+      'deterministic_reconstruction',
+      `${root}/diagnosis/diagnosis-input-${variant.diagnosisInputHash.slice(7)}.json`,
+      variant.diagnosisStatus,
+    ]);
+  }
+  if (variant.diagnosisInputHash && variant.diagnosisResultHash) {
+    rows.push([
+      'Model diagnosis',
+      'model_inference',
+      `${root}/diagnosis/diagnosis-result-${variant.diagnosisInputHash.slice(7)}.json`,
+      variant.diagnosisStatus,
+    ]);
+  }
+  if (targetExcluded) {
+    rows.push([
+      'Target-excluded comparisons',
+      'deterministic_reconstruction',
+      `${root}/target-excluded/comparisons/`,
+      targetExcluded.status,
+    ]);
+  }
+  rows.push([
+    'Human labels',
+    'human_verified',
+    paths.database,
+    `${labels.filter(({ status }) => status === 'verified').length} verified`,
+  ]);
+  if (humanNotesPresent) {
+    rows.push([
+      'Human notes',
+      'human_authored_context',
+      path.join(campaignReportDirectory(paths, campaign.id), 'human', `${variant.id}.md`),
+      'tracked sidecar',
+    ]);
+  }
+  return `| Evidence | Authority | Locator | Integrity/status |
+| --- | --- | --- | --- |
+${rows.map(([name, authority, locator, integrity]) => `| ${name} | \`${authority}\` | \`${locator}\` | ${integrity} |`).join('\n')}`;
+}
+
+async function readHumanNotes(filePath: string): Promise<string | null> {
+  try {
+    return await readFile(filePath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function readHistoricalExperiments(experimentsRoot: string): Promise<Array<Record<string, unknown>>> {
+  const historyPath = path.join(experimentsRoot, 'history');
+  let historyDetails;
+  try {
+    historyDetails = await lstat(historyPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  if (historyDetails.isSymbolicLink() || !historyDetails.isDirectory()) {
+    throw new Error('historical research root must be a real directory');
+  }
+  const [reportsRoot, historyRoot] = await Promise.all([
+    realpath(experimentsRoot),
+    realpath(historyPath),
+  ]);
+  if (!historyRoot.startsWith(`${reportsRoot}${path.sep}`)) {
+    throw new Error('historical research root escapes the reports directory');
+  }
+  const manifestPath = path.join(historyPath, 'manifest.json');
+  let manifestDetails;
+  try {
+    manifestDetails = await lstat(manifestPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  if (manifestDetails.isSymbolicLink() || !manifestDetails.isFile()) {
+    throw new Error('historical research manifest must be a contained regular file');
+  }
+  const resolvedManifest = await realpath(manifestPath);
+  if (!resolvedManifest.startsWith(`${historyRoot}${path.sep}`)) {
+    throw new Error('historical research manifest must be a contained regular file');
+  }
+  const manifest = JSON.parse(await readFile(resolvedManifest, 'utf8')) as unknown;
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    throw new Error('historical research manifest must be an object');
+  }
+  const manifestRecord = manifest as Record<string, unknown>;
+  if (manifestRecord.schemaVersion !== 1) {
+    throw new Error('unsupported historical research manifest version');
+  }
+  const sourceRepository = manifestRecord.sourceRepository;
+  const sourceRevision = manifestRecord.sourceRevision;
+  if (typeof sourceRepository !== 'string' || sourceRepository.length === 0) {
+    throw new Error('historical research manifest omitted sourceRepository');
+  }
+  if (typeof sourceRevision !== 'string' || !/^[a-f0-9]{40}$/.test(sourceRevision)) {
+    throw new Error('historical research manifest has an invalid sourceRevision');
+  }
+  const materials = manifestRecord.materials;
+  if (!Array.isArray(materials)) throw new Error('historical research manifest omitted materials');
+  const imported = await Promise.all(
+    materials.map(async (value, index) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error(`historical research material ${index} must be an object`);
+      }
+      const material = value as Record<string, unknown>;
+      const relative = material.path;
+      const expectedSha = material.sha256;
+      if (
+        typeof relative !== 'string' ||
+        path.isAbsolute(relative) ||
+        relative.includes('\\') ||
+        relative.split('/').some((segment) => segment === '..') ||
+        !relative.startsWith('history/')
+      ) {
+        throw new Error(`historical research material ${index} has an unsafe path`);
+      }
+      if (typeof expectedSha !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(expectedSha)) {
+        throw new Error(`historical research material ${index} has an invalid hash`);
+      }
+      if (typeof material.kind !== 'string' || material.comparability !== 'historical_context_only') {
+        throw new Error(`historical research material ${index} has invalid authority metadata`);
+      }
+      const filePath = path.join(experimentsRoot, relative);
+      const [resolvedFile, details] = await Promise.all([realpath(filePath), lstat(filePath)]);
+      if (
+        !resolvedFile.startsWith(`${historyRoot}${path.sep}`) ||
+        details.isSymbolicLink() ||
+        !details.isFile()
+      ) {
+        throw new Error(`historical research material escapes its manifest root: ${relative}`);
+      }
+      const content = await readFile(resolvedFile, 'utf8');
+      const actualSha = `sha256:${createHash('sha256').update(content).digest('hex')}`;
+      if (actualSha !== expectedSha) {
+        throw new Error(`historical research material hash mismatch: ${relative}`);
+      }
+      return {
+        name: typeof material.name === 'string' ? material.name : path.basename(relative),
+        path: relative,
+        sha256: expectedSha,
+        sourceRepository,
+        sourceRevision,
+        kind: material.kind,
+        comparability: material.comparability,
+        content: content.slice(0, 40_000),
+        contentBytes: Buffer.byteLength(content),
+        contentTruncated: content.length > 40_000,
+      };
+    }),
+  );
+  return imported;
+}
+
 async function atomicWrite(filePath: string, content: string): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true });
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
@@ -40,6 +369,7 @@ export async function writeVariantReport(
   variant: VariantRecord,
   labels: readonly LabelRecord[],
   targetExcluded?: TargetExcludedEvaluationRecord | null,
+  parent?: VariantRecord | null,
 ): Promise<string> {
   const facts = variant.facts;
   const score = variant.score;
@@ -58,21 +388,38 @@ export async function writeVariantReport(
     campaignReportDirectory(paths, campaign.id),
     `${String(variant.ordinal).padStart(3, '0')}-${variant.id}.md`,
   );
+  const humanNotesPath = path.join(
+    campaignReportDirectory(paths, campaign.id),
+    'human',
+    `${variant.id}.md`,
+  );
+  const humanNotes = await readHumanNotes(humanNotesPath);
   const output = `# ${markdown(variant.hypothesis.title)}
 
 ## Goal
 
 ${campaign.config.goal.trim()}
 
-## Hypothesis
+## Base Assumptions
 
-The hypothesis below is model-generated and remains unverified until the experiment completes.
+${renderAssumptions(variant, parent)}
+
+## Observed Issues
+
+${renderObservedIssues(variant, parent)}
+
+## Planned Change
+
+${parent ? 'The plan below is model-generated and remains unverified.' : 'The baseline plan below is harness-authored.'} It is recorded before execution so the result can be evaluated against the original intervention.
 
 ${quote(variant.hypothesis.rationale)}
 
-Expected impact: ${variant.hypothesis.expectedImpact}
+Implementation instructions:
+${quote(variant.hypothesis.instructions)}
 
-Risk: ${variant.hypothesis.risk}
+Expected impact: ${markdown(variant.hypothesis.expectedImpact)}
+
+Risk: ${markdown(variant.hypothesis.risk)}
 
 ## Provenance
 
@@ -90,6 +437,10 @@ Risk: ${variant.hypothesis.risk}
 | Patch | ${variant.patchPath ? `\`${variant.patchPath}\`` : 'none'} |
 | Image | ${variant.imageTag ? `\`${variant.imageTag}\`` : 'not built'} |
 | Artifact collection | ${variant.artifactCollectionComplete ? 'complete' : 'incomplete'} |
+
+## Baseline Metrics
+
+${renderBaselineMetrics(variant, parent)}
 
 ## Actual Facts
 
@@ -123,6 +474,14 @@ ${decisionRows}
 | Provisional accuracy | ${percentage(score?.provisional.accuracy ?? null)} |
 | Persisted labels | ${labels.length} |
 | Cohort pin mismatches | ${score?.cohortMismatches.join(', ') || 'none'} |
+
+## Experiment Arms
+
+${renderArms(variant, targetExcluded)}
+
+## Conclusion
+
+${renderConclusion(variant, parent, targetExcluded, labels)}
 
 ## LLM Suggestion
 
@@ -249,6 +608,16 @@ This arm is a promotion guard, not a fitness reward. Target-blind labels and sug
 
 ${variant.error ? `\`${markdown(variant.error)}\`` : 'None recorded.'}
 
+## Evidence Ledger
+
+${renderEvidenceLedger(paths, campaign, variant, labels, parent, targetExcluded, humanNotes !== null)}
+
+## Human Notes
+
+Human-authored notes are contextual and do not become verified scoring truth unless they are also saved as reviewed labels.
+
+${humanNotes ?? 'No human-authored notes have been added.'}
+
 ## Artifacts
 
 Raw artifacts, prompts, logs, source excerpts, and model events remain in the ignored local data directory for this variant.
@@ -322,14 +691,7 @@ export async function writeAgentHistory(
   labels: readonly LabelRecord[],
   targetEvaluations: readonly TargetExcludedEvaluationRecord[] = [],
 ): Promise<void> {
-  const historicalExperiments = await Promise.all(
-    (await readdir(experimentsRoot, { withFileTypes: true }).catch(() => []))
-      .filter((entry) => entry.isFile() && entry.name.endsWith('.md'))
-      .map(async (entry) => ({
-        name: entry.name,
-        content: (await readFile(path.join(experimentsRoot, entry.name), 'utf8')).slice(0, 40_000),
-      })),
-  );
+  const historicalExperiments = await readHistoricalExperiments(experimentsRoot);
   const history = {
     goal: campaign.config.goal,
     genericityConstraints: [
