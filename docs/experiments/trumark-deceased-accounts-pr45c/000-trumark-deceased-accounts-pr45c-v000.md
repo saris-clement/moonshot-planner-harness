@@ -4,11 +4,22 @@
 
 Improve generic Phase 2 source-backed adjudication accuracy using PR 45 durable diagnostic correlation. Preserve requirement, source, model, prompt, budget, and knowledge pins; distinguish measured facts, deterministic reconstruction, model diagnosis, and human truth. Reduce false build and false extend decisions without introducing false reuse or customer-specific production heuristics. Use the target-excluded arm only as a promotion guard against over-eager reuse and target leakage, never as a fitness reward.
 
-## Hypothesis
+## Base Assumptions
 
-The hypothesis below is model-generated and remains unverified until the experiment completes.
+No explicit assumptions were captured for this legacy hypothesis.
+
+## Observed Issues
+
+This is a baseline observation with no parent diagnosis. No causal issue is asserted.
+
+## Planned Change
+
+The baseline plan below is harness-authored. It is recorded before execution so the result can be evaluated against the original intervention.
 
 > Measure the selected seed revision before applying an experimental mutation.
+
+Implementation instructions:
+> Do not modify the planner.
 
 Expected impact: Establish reproducible primary and holdout facts for this campaign.
 
@@ -30,6 +41,10 @@ Risk: Provider nondeterminism means one screening run is descriptive rather than
 | Patch | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr45c/trumark-deceased-accounts-pr45c-v000/variant.patch` |
 | Image | `ainative-planner-eval:trumark-deceased-accounts-pr45c-bede783bef-0` |
 | Artifact collection | complete |
+
+## Baseline Metrics
+
+No parent metrics exist. This experiment establishes a campaign-local baseline.
 
 ## Actual Facts
 
@@ -67,6 +82,28 @@ Risk: Provider nondeterminism means one screening run is descriptive rather than
 | Provisional accuracy | 28.0% |
 | Persisted labels | 241 |
 | Cohort pin mismatches | none |
+
+## Experiment Arms
+
+| Arm | Status | Units | Build | Reuse | Extend | Defer | Question | Agreement |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Standard | measured | 125 | 82 | 4 | 23 | 16 | 0 | 81.6% |
+| Target-safe control | measured | 125 | 82 | 2 | 25 | 16 | 0 | 86.4% |
+| Target-excluded | measured | 125 | 102 | 0 | 7 | 16 | 0 | 94.4% |
+
+The control and excluded arms use the same target-safe pack. The excluded arm is a promotion guard, not a fitness reward.
+
+## Conclusion
+
+Status: `measured`
+
+This section is generated from persisted measurements. It does not treat model diagnosis or blind-judge suggestions as verified truth.
+
+This run establishes a baseline observation; it does not establish that the planner decisions are correct or that the planner improved.
+
+Correctness remains unverified because no human-verified labels score this experiment. Provisional accuracy is an LLM suggestion only.
+
+The target-excluded promotion guard is passed.
 
 ## LLM Suggestion
 
@@ -329,6 +366,23 @@ This arm is a promotion guard, not a fitness reward. Target-blind labels and sug
 ## Failure
 
 None recorded.
+
+## Evidence Ledger
+
+| Evidence | Authority | Locator | Integrity/status |
+| --- | --- | --- | --- |
+| Frozen campaign inputs | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/campaigns/trumark-deceased-accounts-pr45c/campaign.json` | hash-pinned |
+| Current measured facts | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr45c/trumark-deceased-accounts-pr45c-v000/deceased-account/facts.json` | archived |
+| Diagnosis input | `deterministic_reconstruction` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr45c/trumark-deceased-accounts-pr45c-v000/diagnosis/diagnosis-input-f816e465cb8f6a52175426bf9757ecb64512ec3cd69a2bc7469b393faac7b3a1.json` | completed |
+| Model diagnosis | `model_inference` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr45c/trumark-deceased-accounts-pr45c-v000/diagnosis/diagnosis-result-f816e465cb8f6a52175426bf9757ecb64512ec3cd69a2bc7469b393faac7b3a1.json` | completed |
+| Target-excluded comparisons | `deterministic_reconstruction` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr45c/trumark-deceased-accounts-pr45c-v000/target-excluded/comparisons/` | completed |
+| Human labels | `human_verified` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/harness.sqlite` | 0 verified |
+
+## Human Notes
+
+Human-authored notes are contextual and do not become verified scoring truth unless they are also saved as reviewed labels.
+
+No human-authored notes have been added.
 
 ## Artifacts
 

@@ -22,11 +22,22 @@ Never optimize specifically for TruMark, deceased accounts, singular/plural alia
 
 Accuracy, evidence quality, reproducibility, and genericity are the objectives. Time, token usage, monetary cost, and achieving a superficially attractive decision distribution are secondary.
 
-## Hypothesis
+## Base Assumptions
 
-The hypothesis below is model-generated and remains unverified until the experiment completes.
+No explicit assumptions were captured for this legacy hypothesis.
+
+## Observed Issues
+
+This is a baseline observation with no parent diagnosis. No causal issue is asserted.
+
+## Planned Change
+
+The baseline plan below is harness-authored. It is recorded before execution so the result can be evaluated against the original intervention.
 
 > Measure the selected seed revision before applying an experimental mutation.
+
+Implementation instructions:
+> Do not modify the planner.
 
 Expected impact: Establish reproducible primary and holdout facts for this campaign.
 
@@ -48,6 +59,10 @@ Risk: Provider nondeterminism means one screening run is descriptive rather than
 | Patch | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-v14-origin-main/trumark-deceased-accounts-v14-origin-main-v007/variant.patch` |
 | Image | `ainative-planner-eval:trumark-deceased-accounts-v14-origin-606b2e0431-7` |
 | Artifact collection | complete |
+
+## Baseline Metrics
+
+No parent metrics exist. This experiment establishes a campaign-local baseline.
 
 ## Actual Facts
 
@@ -86,6 +101,30 @@ Risk: Provider nondeterminism means one screening run is descriptive rather than
 | Persisted labels | 241 |
 | Cohort pin mismatches | none |
 
+## Experiment Arms
+
+| Arm | Status | Units | Build | Reuse | Extend | Defer | Question | Agreement |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Standard | measured | 125 | 105 | 0 | 6 | 14 | 0 | 89.6% |
+| Target-safe control | failed | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |
+| Target-excluded | failed | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |
+
+The control and excluded arms use the same target-safe pack. The excluded arm is a promotion guard, not a fitness reward.
+
+## Conclusion
+
+Status: `measured`
+
+This section is generated from persisted measurements. It does not treat model diagnosis or blind-judge suggestions as verified truth.
+
+This run establishes a baseline observation; it does not establish that the planner decisions are correct or that the planner improved.
+
+Correctness remains unverified because no human-verified labels score this experiment. Provisional accuracy is an LLM suggestion only.
+
+Causal interpretation is not final because diagnosis status is not_started.
+
+The target-safe control and target-excluded comparison is failed; the conclusion is incomplete until it finishes.
+
 ## LLM Suggestion
 
 This section is model-generated interpretation, not verified fact. Per-unit suggestions require human review in the dashboard.
@@ -97,6 +136,20 @@ This section is model-generated interpretation, not verified fact. Per-unit sugg
 > Chunk 5: 15 planner decisions missed substantial existing capability; 5 correctly identified intentionally absent or deferred work.
 > Chunk 6: The frozen checkout contains a substantial TruMark deceased-accounts implementation that the planner repeatedly missed. Most build decisions should have been reuse or extend; the two explicit scope exclusions are correctly deferred.
 > Chunk 7: One build decision overlooks a complete existing entrypoint, while three field builds overlook partial implementations that should be extended. The dividend-basis decision correctly identifies a genuine extension gap.
+
+## Model-Generated Diagnosis
+
+This diagnosis is unverified model interpretation. It is shown separately from measured output, blind-judge suggestions, and human labels, and it does not contribute to numeric scoring.
+
+Status: `not_started`
+
+Input hash: unavailable
+
+Result hash: unavailable
+
+> No model-generated diagnosis is available.
+
+No diagnosis findings are available.
 
 ## Requirements Questions
 
@@ -114,6 +167,7 @@ This section is model-generated interpretation, not verified fact. Per-unit sugg
 | Planner requirements-agent answers | 0 |
 | Planner source fallback answers | 8 |
 | Planner reused answers | 0 |
+| Planner human answers | 0 |
 
 #### 01M1Q2R1VHAKDZHSQ7TQDBA8B2
 
@@ -271,6 +325,7 @@ Evidence:
 | Planner requirements-agent answers | 0 |
 | Planner source fallback answers | 1 |
 | Planner reused answers | 0 |
+| Planner human answers | 0 |
 
 #### question.0357a9f60fe6c5a7f24539f5
 
@@ -307,11 +362,38 @@ Pair validity: invalid or pending
 
 Leakage paths: 0
 
+Control decisions: unavailable
+
+Excluded decisions: unavailable
+
+Comparison mismatches: none
+
+Recorded error: `Calibration attempt interrupted after a holdout model-budget failure; partial replicates are not reusable.`
+
+Target-arm questions: 0
+
+No target-arm runtime question was recorded.
+
 This arm is a promotion guard, not a fitness reward. Target-blind labels and suggestions remain separate from normal evaluation truth.
 
 ## Failure
 
 None recorded.
+
+## Evidence Ledger
+
+| Evidence | Authority | Locator | Integrity/status |
+| --- | --- | --- | --- |
+| Frozen campaign inputs | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/campaigns/trumark-deceased-accounts-v14-origin-main/campaign.json` | hash-pinned |
+| Current measured facts | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-v14-origin-main/trumark-deceased-accounts-v14-origin-main-v007/deceased-account/facts.json` | archived |
+| Target-excluded comparisons | `deterministic_reconstruction` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-v14-origin-main/trumark-deceased-accounts-v14-origin-main-v007/target-excluded/comparisons/` | failed |
+| Human labels | `human_verified` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/harness.sqlite` | 0 verified |
+
+## Human Notes
+
+Human-authored notes are contextual and do not become verified scoring truth unless they are also saved as reviewed labels.
+
+No human-authored notes have been added.
 
 ## Artifacts
 

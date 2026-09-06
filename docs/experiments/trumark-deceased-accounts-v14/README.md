@@ -29,7 +29,15 @@ Accuracy, evidence quality, reproducibility, and genericity are the objectives. 
 - Environment profile: `sha256:c74a27a40f2243e5a4f5cdc6272084a122e52c7c919aa9a743ff6a1aa879f799`
 - Mode: `supervised`
 - Concurrency: 3
+- Replicate concurrency: 2
 - Maximum generated variants: 9
+- Effective replicate protocol: 3 runs
+- Target-excluded workflow: not configured
+- Target-excluded baseline: not configured
+
+## Target-Excluded Evaluations
+
+No target-excluded evaluation has run.
 
 ## Experiments
 

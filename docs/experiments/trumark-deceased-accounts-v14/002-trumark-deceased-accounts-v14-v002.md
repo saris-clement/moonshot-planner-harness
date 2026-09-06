@@ -22,11 +22,22 @@ Never optimize specifically for TruMark, deceased accounts, singular/plural alia
 
 Accuracy, evidence quality, reproducibility, and genericity are the objectives. Time, token usage, monetary cost, and achieving a superficially attractive decision distribution are secondary.
 
-## Hypothesis
+## Base Assumptions
 
-The hypothesis below is model-generated and remains unverified until the experiment completes.
+No explicit assumptions were captured for this legacy hypothesis.
+
+## Observed Issues
+
+This is a baseline observation with no parent diagnosis. No causal issue is asserted.
+
+## Planned Change
+
+The baseline plan below is harness-authored. It is recorded before execution so the result can be evaluated against the original intervention.
 
 > Measure the selected seed revision before applying an experimental mutation.
+
+Implementation instructions:
+> Do not modify the planner.
 
 Expected impact: Establish reproducible primary and holdout facts for this campaign.
 
@@ -48,6 +59,10 @@ Risk: Provider nondeterminism means one screening run is descriptive rather than
 | Patch | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-v14/trumark-deceased-accounts-v14-v002/variant.patch` |
 | Image | `ainative-planner-eval:trumark-deceased-accounts-v14-7c3dced3ac-2` |
 | Artifact collection | incomplete |
+
+## Baseline Metrics
+
+No parent metrics exist. This experiment establishes a campaign-local baseline.
 
 ## Actual Facts
 
@@ -82,19 +97,69 @@ Risk: Provider nondeterminism means one screening run is descriptive rather than
 | Persisted labels | 0 |
 | Cohort pin mismatches | none |
 
+## Experiment Arms
+
+| Arm | Status | Units | Build | Reuse | Extend | Defer | Question | Agreement |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Standard | pending | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |
+
+No target-safe control or target-excluded result is available for this experiment.
+
+## Conclusion
+
+Status: `pending`
+
+No measured conclusion is available while the experiment is failed.
+
 ## LLM Suggestion
 
 This section is model-generated interpretation, not verified fact. Per-unit suggestions require human review in the dashboard.
 
 > No blind-judge result is available.
 
+## Model-Generated Diagnosis
+
+This diagnosis is unverified model interpretation. It is shown separately from measured output, blind-judge suggestions, and human labels, and it does not contribute to numeric scoring.
+
+Status: `not_started`
+
+Input hash: unavailable
+
+Result hash: unavailable
+
+> No model-generated diagnosis is available.
+
+No diagnosis findings are available.
+
+## Requirements Questions
+
+Question resolution did not run.
+
 ## Holdout
 
 Not run for this variant.
 
+## Target-Excluded Guard
+
+Not configured or not run for this variant.
+
 ## Failure
 
 `command failed (1): docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 512 --memory 4g --cpus 4 --tmpfs "/tmp:rw,noexec,nosuid,size=1g" --tmpfs "/root/.npm:rw,noexec,nosuid,size=128m" --tmpfs "/app/.local:rw,noexec,nosuid,size=1g" --env CI=1 --entrypoint npm ainative-planner-eval:trumark-deceased-accounts-v14-7c3dced3ac-2-test run test --workspace @ainative-planner/server [31mfailed to load config from /app/server/vitest.config.ts[39m [31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Startup Error [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯⎯[39m Error: ENOENT: no such file or directory, mkdir '/app/server/node_modules/.vite-temp'     at async Object.mkdir (node:internal/fs/promises:856:10)     at async loadConfigFromBundledFile (file:///app/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:49572:9)     at async bundleAndLoadConfigFile (file:///app/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:49433:22)     at async loadConfigFromFile (file:///app/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:49396:44)     at async resolveConfig (file:///app/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:48891:24)     at async _createServer (file:///app/node_modules/vite/dist/node/chunks/dep-Dm0c1Wj2.js:38478:66)     at async createViteServer (file:///app/node_modules/vitest/dist/chunks/cli-api.DVe0nWUx.js:6921:17)     at async createVitest (file:///app/node_modules/vitest/dist/chunks/cli-api.DVe0nWUx.js:10212:17)     at async prepareVitest (file:///app/node_modules/vitest/dist/chunks/cli-api.DVe0nWUx.js:10551:14)     at async startVitest (file:///app/node_modules/vitest/dist/chunks/cli-api.DVe0nWUx.js:10498:14) {   errno: -2,   code: 'ENOENT',   syscall: 'mkdir',   path: '/app/server/node_modules/.vite-temp' } npm error Lifecycle script `test` failed with error: npm error code 1 npm error path /app/server npm error workspace @ainative-planner/server@0.1.0 npm error location /app/server npm error command failed npm error command sh -c vitest run`
+
+## Evidence Ledger
+
+| Evidence | Authority | Locator | Integrity/status |
+| --- | --- | --- | --- |
+| Frozen campaign inputs | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/campaigns/trumark-deceased-accounts-v14/campaign.json` | hash-pinned |
+| Current measured facts | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-v14/trumark-deceased-accounts-v14-v002/deceased-account/facts.json` | unavailable |
+| Human labels | `human_verified` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/harness.sqlite` | 0 verified |
+
+## Human Notes
+
+Human-authored notes are contextual and do not become verified scoring truth unless they are also saved as reviewed labels.
+
+No human-authored notes have been added.
 
 ## Artifacts
 

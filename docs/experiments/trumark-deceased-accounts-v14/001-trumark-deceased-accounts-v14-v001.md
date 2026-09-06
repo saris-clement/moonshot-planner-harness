@@ -22,11 +22,22 @@ Never optimize specifically for TruMark, deceased accounts, singular/plural alia
 
 Accuracy, evidence quality, reproducibility, and genericity are the objectives. Time, token usage, monetary cost, and achieving a superficially attractive decision distribution are secondary.
 
-## Hypothesis
+## Base Assumptions
 
-The hypothesis below is model-generated and remains unverified until the experiment completes.
+No explicit assumptions were captured for this legacy hypothesis.
+
+## Observed Issues
+
+This is a baseline observation with no parent diagnosis. No causal issue is asserted.
+
+## Planned Change
+
+The baseline plan below is harness-authored. It is recorded before execution so the result can be evaluated against the original intervention.
 
 > Measure the selected seed revision before applying an experimental mutation.
+
+Implementation instructions:
+> Do not modify the planner.
 
 Expected impact: Establish reproducible primary and holdout facts for this campaign.
 
@@ -48,6 +59,10 @@ Risk: Provider nondeterminism means one screening run is descriptive rather than
 | Patch | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-v14/trumark-deceased-accounts-v14-v001/variant.patch` |
 | Image | not built |
 | Artifact collection | incomplete |
+
+## Baseline Metrics
+
+No parent metrics exist. This experiment establishes a campaign-local baseline.
 
 ## Actual Facts
 
@@ -82,19 +97,69 @@ Risk: Provider nondeterminism means one screening run is descriptive rather than
 | Persisted labels | 0 |
 | Cohort pin mismatches | none |
 
+## Experiment Arms
+
+| Arm | Status | Units | Build | Reuse | Extend | Defer | Question | Agreement |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Standard | pending | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |
+
+No target-safe control or target-excluded result is available for this experiment.
+
+## Conclusion
+
+Status: `pending`
+
+No measured conclusion is available while the experiment is failed.
+
 ## LLM Suggestion
 
 This section is model-generated interpretation, not verified fact. Per-unit suggestions require human review in the dashboard.
 
 > No blind-judge result is available.
 
+## Model-Generated Diagnosis
+
+This diagnosis is unverified model interpretation. It is shown separately from measured output, blind-judge suggestions, and human labels, and it does not contribute to numeric scoring.
+
+Status: `not_started`
+
+Input hash: unavailable
+
+Result hash: unavailable
+
+> No model-generated diagnosis is available.
+
+No diagnosis findings are available.
+
+## Requirements Questions
+
+Question resolution did not run.
+
 ## Holdout
 
 Not run for this variant.
 
+## Target-Excluded Guard
+
+Not configured or not run for this variant.
+
 ## Failure
 
 `command failed (1): docker buildx build --load --tag ainative-planner-eval:trumark-deceased-accounts-v14-7c3dced3ac-1 --file /Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/worktrees/trumark-deceased-accounts-v14/frozen-planner/Dockerfile --build-arg PLANNER_BUILD_REVISION=13bd342adbad89c1d4cd680e08d0327e54a53fe3 --build-arg PLANNER_BUILD_SOURCE=https://github.com/Saris-AI/moonshot-planner-poc --build-arg PLANNER_PUBLIC_BASE= /Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/worktrees/trumark-deceased-accounts-v14/trumark-deceased-accounts-v14-v001 tend: Readline #19 11.63 debconf: unable to initialize frontend: Readline #19 11.63 debconf: (This frontend requires a controlling tty.) #19 11.63 debconf: falling back to frontend: Teletype #19 11.63 debconf: unable to initialize frontend: Teletype #19 11.63 debconf: (This frontend requires a controlling tty.) #19 11.63 debconf: falling back to frontend: Noninteractive #19 11.78 Updating certificates in /etc/ssl/certs... #19 11.98 150 added, 0 removed; done. #19 11.99 Setting up perl (5.40.1-6) ... #19 11.99 Setting up libp11-kit0:arm64 (0.25.5-3) ... #19 12.00 Setting up libgssapi-krb5-2:arm64 (1.21.3-5+deb13u1) ... #19 12.00 Setting up libreadline8t64:arm64 (8.2-6) ... #19 12.01 Setting up libpython3.13-stdlib:arm64 (3.13.5-2+deb13u4) ... #19 12.01 Setting up libpython3-stdlib:arm64 (3.13.5-1) ... #19 12.01 Setting up libgnutls30t64:arm64 (3.8.9-3+deb13u4) ... #19 12.02 Setting up python3.13 (3.13.5-2+deb13u4) ... #19 12.34 Setting up libpsl5t64:arm64 (0.21.2-1.1+b1) ... #19 12.34 Setting up python3 (3.13.5-1) ... #19 12.35 running python rtupdate hooks for python3.13... #19 12.35 running python post-rtupdate hooks for python3.13... #19 12.38 Setting up liberror-perl (0.17030-1) ... #19 12.38 Setting up librtmp1:arm64 (2.4+20151223.gitfa8646d.1-2+b5) ... #19 12.38 Setting up libngtcp2-crypto-gnutls8:arm64 (1.11.0-1+deb13u1) ... #19 12.39 Setting up libcurl3t64-gnutls:arm64 (8.14.1-2+deb13u4) ... #19 12.39 Setting up git (1:2.47.3-0+deb13u1) ... #19 12.40 Processing triggers for libc-bin (2.41-12+deb13u1) ... #19 12.42 Processing triggers for ca-certificates (20250419) ... #19 12.42 Updating certificates in /etc/ssl/certs... #19 12.59 0 added, 0 removed; done. #19 12.59 Running hooks in /etc/ca-certificates/update.d... #19 12.59 done. #19 DONE 12.7s #27 [production  3/14] WORKDIR /app #27 DONE 0.0s #28 [production  4/14] COPY package.json package-lock.json .npmrc ./ #28 DONE 0.0s #29 [production  5/14] COPY server/package.json ./server/ #29 DONE 0.0s #30 [production  6/14] COPY web/package.json ./web/ #30 DONE 0.0s #31 [production  7/14] RUN --mount=type=secret,id=github_token     --mount=type=secret,id=packages_token,required=false     set -eu;     if [ -s /run/secrets/packages_token ]; then TOKEN="$(cat /run/secrets/packages_token)";     else TOKEN="$(cat /run/secrets/github_token)"; fi;     printf '//npm.pkg.github.com/:_authToken=%s\n' "$TOKEN" > /root/.npmrc     && npm ci --omit=dev --ignore-scripts     && npm cache clean --force     && rm -f /root/.npmrc #31 0.097 cat: /run/secrets/github_token: No such file or directory #31 ERROR: process "/bin/sh -c set -eu;     if [ -s /run/secrets/packages_token ]; then TOKEN=\"$(cat /run/secrets/packages_token)\";     else TOKEN=\"$(cat /run/secrets/github_token)\"; fi;     printf '//npm.pkg.github.com/:_authToken=%s\\n' \"$TOKEN\" > /root/.npmrc     && npm ci --omit=dev --ignore-scripts     && npm cache clean --force     && rm -f /root/.npmrc" did not complete successfully: exit code: 1 ------  > [production  7/14] RUN --mount=type=secret,id=github_token     --mount=type=secret,id=packages_token,required=false     set -eu;     if [ -s /run/secrets/packages_token ]; then TOKEN="$(cat /run/secrets/packages_token)";     else TOKEN="$(cat /run/secrets/github_token)"; fi;     printf '//npm.pkg.github.com/:_authToken=%s\n' "$TOKEN" > /root/.npmrc     && npm ci --omit=dev --ignore-scripts     && npm cache clean --force     && rm -f /root/.npmrc: 0.097 cat: /run/secrets/github_token: No such file or directory ------ ERROR: failed to build: failed to solve: process "/bin/sh -c set -eu;     if [ -s /run/secrets/packages_token ]; then TOKEN=\"$(cat /run/secrets/packages_token)\";     else TOKEN=\"$(cat /run/secrets/github_token)\"; fi;     printf '//npm.pkg.github.com/:_authToken=%s\\n' \"$TOKEN\" > /root/.npmrc     && npm ci --omit=dev --ignore-scripts     && npm cache clean --force     && rm -f /root/.npmrc" did not complete successfully: exit code: 1`
+
+## Evidence Ledger
+
+| Evidence | Authority | Locator | Integrity/status |
+| --- | --- | --- | --- |
+| Frozen campaign inputs | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/campaigns/trumark-deceased-accounts-v14/campaign.json` | hash-pinned |
+| Current measured facts | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-v14/trumark-deceased-accounts-v14-v001/deceased-account/facts.json` | unavailable |
+| Human labels | `human_verified` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/harness.sqlite` | 0 verified |
+
+## Human Notes
+
+Human-authored notes are contextual and do not become verified scoring truth unless they are also saved as reviewed labels.
+
+No human-authored notes have been added.
 
 ## Artifacts
 

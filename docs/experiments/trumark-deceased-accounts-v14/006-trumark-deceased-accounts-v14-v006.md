@@ -22,11 +22,22 @@ Never optimize specifically for TruMark, deceased accounts, singular/plural alia
 
 Accuracy, evidence quality, reproducibility, and genericity are the objectives. Time, token usage, monetary cost, and achieving a superficially attractive decision distribution are secondary.
 
-## Hypothesis
+## Base Assumptions
 
-The hypothesis below is model-generated and remains unverified until the experiment completes.
+No explicit assumptions were captured for this legacy hypothesis.
+
+## Observed Issues
+
+This is a baseline observation with no parent diagnosis. No causal issue is asserted.
+
+## Planned Change
+
+The baseline plan below is harness-authored. It is recorded before execution so the result can be evaluated against the original intervention.
 
 > Measure the selected seed revision before applying an experimental mutation.
+
+Implementation instructions:
+> Do not modify the planner.
 
 Expected impact: Establish reproducible primary and holdout facts for this campaign.
 
@@ -48,6 +59,10 @@ Risk: Provider nondeterminism means one screening run is descriptive rather than
 | Patch | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-v14/trumark-deceased-accounts-v14-v006/variant.patch` |
 | Image | `ainative-planner-eval:trumark-deceased-accounts-v14-7c3dced3ac-6` |
 | Artifact collection | incomplete |
+
+## Baseline Metrics
+
+No parent metrics exist. This experiment establishes a campaign-local baseline.
 
 ## Actual Facts
 
@@ -82,19 +97,69 @@ Risk: Provider nondeterminism means one screening run is descriptive rather than
 | Persisted labels | 0 |
 | Cohort pin mismatches | none |
 
+## Experiment Arms
+
+| Arm | Status | Units | Build | Reuse | Extend | Defer | Question | Agreement |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Standard | pending | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |
+
+No target-safe control or target-excluded result is available for this experiment.
+
+## Conclusion
+
+Status: `pending`
+
+No measured conclusion is available while the experiment is failed.
+
 ## LLM Suggestion
 
 This section is model-generated interpretation, not verified fact. Per-unit suggestions require human review in the dashboard.
 
 > No blind-judge result is available.
 
+## Model-Generated Diagnosis
+
+This diagnosis is unverified model interpretation. It is shown separately from measured output, blind-judge suggestions, and human labels, and it does not contribute to numeric scoring.
+
+Status: `not_started`
+
+Input hash: unavailable
+
+Result hash: unavailable
+
+> No model-generated diagnosis is available.
+
+No diagnosis findings are available.
+
+## Requirements Questions
+
+Question resolution did not run.
+
 ## Holdout
 
 Not run for this variant.
 
+## Target-Excluded Guard
+
+Not configured or not run for this variant.
+
 ## Failure
 
 `command failed (1): docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges:true --volume ainative-planner-kb:/source:ro --volume eval-trumark-deceased-accounts-v14-6-4c866f8f86-kb:/target busybox:1.37.0 sh -c "cp -a /source/. /target/ && chown -R 1001:1001 /target" n: /target/generations/generation-553/kb/history/segment.001861.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.001451.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000787.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000891.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000701.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.001768.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.001649.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.001081.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000225.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000984.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000904.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000856.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000788.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000712.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000118.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000873.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000189.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000319.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000902.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.001651.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.001227.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000338.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.001814.log: Operation not permitted chown: /target/generations/generation-553/kb/history/segment.000387.log: Operation not permitted chown: /target/generations/generation-553/kb/history: Operation not permitted chown: /target/generations/generation-553/kb/history: Operation not permitted chown: /target/generations/generation-553/kb/code.idx: Operation not permitted chown: /target/generations/generation-553/kb/embed.idx: Operation not permitted chown: /target/generations/generation-553/kb/wal.log: Operation not permitted chown: /target/generations/generation-553/kb/snapshot.001863.bin: Operation not permitted chown: /target/generations/generation-553/kb/git.idx: Operation not permitted chown: /target/generations/generation-553/kb/LOCK: Operation not permitted chown: /target/generations/generation-553/kb/snapshot.001862.bin: Operation not permitted chown: /target/generations/generation-553/kb: Operation not permitted chown: /target/generations/generation-553/kb: Operation not permitted chown: /target/generations/generation-553/engine-stats.json: Operation not permitted chown: /target/generations/generation-553/kb.old.20260827T020942_829000: Operation not permitted chown: /target/generations/generation-553/kb.old.20260827T020942_829000: Operation not permitted chown: /target/generations/generation-553/kb.lock: Operation not permitted chown: /target/generations/generation-553/snapshot-pin.json: Operation not permitted chown: /target/generations/generation-553: Operation not permitted chown: /target/generations/generation-553: Operation not permitted chown: /target/generations: Operation not permitted chown: /target/generations: Operation not permitted chown: /target/refresh.lock: Operation not permitted chown: /target: Operation not permitted chown: /target: Operation not permitted`
+
+## Evidence Ledger
+
+| Evidence | Authority | Locator | Integrity/status |
+| --- | --- | --- | --- |
+| Frozen campaign inputs | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/campaigns/trumark-deceased-accounts-v14/campaign.json` | hash-pinned |
+| Current measured facts | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-v14/trumark-deceased-accounts-v14-v006/deceased-account/facts.json` | unavailable |
+| Human labels | `human_verified` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/harness.sqlite` | 0 verified |
+
+## Human Notes
+
+Human-authored notes are contextual and do not become verified scoring truth unless they are also saved as reviewed labels.
+
+No human-authored notes have been added.
 
 ## Artifacts
 

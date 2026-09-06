@@ -4,11 +4,22 @@
 
 Improve generic Phase 2 source-backed adjudication accuracy using PR 45 durable diagnostic correlation. Preserve requirement, source, model, prompt, budget, and knowledge pins; distinguish measured facts, deterministic reconstruction, model diagnosis, and human truth. Reduce false build and false extend decisions without introducing false reuse or customer-specific production heuristics. Use the target-excluded arm only as a promotion guard against over-eager reuse and target leakage, never as a fitness reward.
 
-## Hypothesis
+## Base Assumptions
 
-The hypothesis below is model-generated and remains unverified until the experiment completes.
+No explicit assumptions were captured for this legacy hypothesis.
+
+## Observed Issues
+
+This is a baseline observation with no parent diagnosis. No causal issue is asserted.
+
+## Planned Change
+
+The baseline plan below is harness-authored. It is recorded before execution so the result can be evaluated against the original intervention.
 
 > Measure the selected seed revision before applying an experimental mutation.
+
+Implementation instructions:
+> Do not modify the planner.
 
 Expected impact: Establish reproducible primary and holdout facts for this campaign.
 
@@ -30,6 +41,10 @@ Risk: Provider nondeterminism means one screening run is descriptive rather than
 | Patch | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr45/trumark-deceased-accounts-pr45-v000/variant.patch` |
 | Image | `ainative-planner-eval:trumark-deceased-accounts-pr45-35e2f0bb57-0` |
 | Artifact collection | complete |
+
+## Baseline Metrics
+
+No parent metrics exist. This experiment establishes a campaign-local baseline.
 
 ## Actual Facts
 
@@ -64,6 +79,20 @@ Risk: Provider nondeterminism means one screening run is descriptive rather than
 | Persisted labels | 0 |
 | Cohort pin mismatches | none |
 
+## Experiment Arms
+
+| Arm | Status | Units | Build | Reuse | Extend | Defer | Question | Agreement |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Standard | pending | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |
+
+No target-safe control or target-excluded result is available for this experiment.
+
+## Conclusion
+
+Status: `pending`
+
+No measured conclusion is available while the experiment is failed.
+
 ## LLM Suggestion
 
 This section is model-generated interpretation, not verified fact. Per-unit suggestions require human review in the dashboard.
@@ -77,6 +106,8 @@ This diagnosis is unverified model interpretation. It is shown separately from m
 Status: `not_started`
 
 Input hash: unavailable
+
+Result hash: unavailable
 
 > No model-generated diagnosis is available.
 
@@ -98,6 +129,7 @@ No diagnosis findings are available.
 | Planner requirements-agent answers | 0 |
 | Planner source fallback answers | 0 |
 | Planner reused answers | 0 |
+| Planner human answers | 0 |
 
 #### 01M1Q2R1VHAKDZHSQ7TQDBA8B2
 
@@ -130,6 +162,7 @@ Evidence:
 | Planner requirements-agent answers | 0 |
 | Planner source fallback answers | 0 |
 | Planner reused answers | 0 |
+| Planner human answers | 0 |
 
 No blocking question required an answer.
 
@@ -144,6 +177,20 @@ Not configured or not run for this variant.
 ## Failure
 
 `POST /api/planning-cases/5G8QW5W8H275206QZYZANP54E8/runs failed (409): {"error":"AnalysisNotReady"}`
+
+## Evidence Ledger
+
+| Evidence | Authority | Locator | Integrity/status |
+| --- | --- | --- | --- |
+| Frozen campaign inputs | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/campaigns/trumark-deceased-accounts-pr45/campaign.json` | hash-pinned |
+| Current measured facts | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr45/trumark-deceased-accounts-pr45-v000/deceased-account/facts.json` | unavailable |
+| Human labels | `human_verified` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/harness.sqlite` | 0 verified |
+
+## Human Notes
+
+Human-authored notes are contextual and do not become verified scoring truth unless they are also saved as reviewed labels.
+
+No human-authored notes have been added.
 
 ## Artifacts
 
