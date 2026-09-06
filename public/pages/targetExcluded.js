@@ -156,8 +156,8 @@ export function targetExcludedPanel(context, campaign, variant) {
   const comparisons = evaluation.comparisons ?? [];
   const pendingQuestions = questionPanel(context, variant, evaluation);
   const retry = evaluation.status === 'failed'
-    ? element('button', {
-        className: 'button button-secondary',
+      ? element('button', {
+        className: 'button button-secondary counterfactual-retry',
         text: 'Retry complete evaluation',
         attributes: { type: 'button', disabled: context.state.pendingAction },
         on: { click: () => context.runTargetExcluded(variant.id) },

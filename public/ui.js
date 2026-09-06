@@ -115,10 +115,23 @@ export function frozenMetadata(campaign) {
   return list;
 }
 
-function decisionsText(row) {
+function decisionsContent(row) {
   const decisions = row.facts?.decisions ?? row.execution?.decisions;
-  if (!decisions || row.state === 'pending') return '—';
-  return `B ${decisions.build ?? 0} · R ${decisions.reuse ?? 0} · E ${decisions.extend ?? 0} · D ${decisions.defer ?? 0} · Q ${decisions.question ?? 0}`;
+  if (!decisions || row.state === 'pending') return [text('—')];
+  const values = [
+    ['build', 'B', decisions.build],
+    ['reuse', 'R', decisions.reuse],
+    ['extend', 'E', decisions.extend],
+    ['defer', 'D', decisions.defer],
+    ['question', 'Q', decisions.question],
+  ];
+  return values.flatMap(([decision, label, count], index) => [
+    ...(index === 0 ? [] : [element('span', { className: 'decision-separator', text: ' · ' })]),
+    element('span', {
+      className: `decision-code decision-code-${decision}`,
+      text: `${label} ${count ?? 0}`,
+    }),
+  ]);
 }
 
 function progressContent(row) {
@@ -168,7 +181,7 @@ export function replicateTable(campaign, variant) {
         tableCell(`${row.replicate} / ${row.replicateCount}`, 'mono'),
         element('td', {}, [statusLabel(rowState(row))]),
         element('td', { className: 'progress-cell' }, progressContent(row)),
-        tableCell(decisionsText(row), 'mono decision-cell'),
+        element('td', { className: 'mono decision-cell' }, decisionsContent(row)),
         tableCell(
           row.state === 'pending'
             ? '—'

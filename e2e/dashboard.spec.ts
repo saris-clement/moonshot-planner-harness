@@ -524,11 +524,16 @@ test('opens review evidence at the cited lines in the frozen workflows source', 
 });
 
 test('shows the immutable two-run target-excluded guard and separate review truth', async ({ page }) => {
+  database.updateTargetExcludedEvaluation(baselineId, { status: 'failed' });
   await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${baselineId}?tab=target-excluded`);
   await expect(page.getByText('trumark/deceased-accounts')).toBeVisible();
   await expect(page.getByText('2 runs · concurrency 2')).toBeVisible();
   await expect(page.getByText('Disposition profile')).toBeVisible();
   await expect(page.getByText('Valid', { exact: true })).toBeVisible();
+  const retry = page.getByRole('button', { name: 'Retry complete evaluation' });
+  await expect(retry).toBeVisible();
+  await expect(retry).not.toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+  database.updateTargetExcludedEvaluation(baselineId, { status: 'completed' });
 
   await page.getByRole('link', { name: 'Review excluded requirements' }).click();
   await expect(page).toHaveURL(/scope=target-excluded/);
@@ -564,6 +569,13 @@ test('refreshes a deep-linked overview with completed, live, and pending replica
   await expect(running.getByRole('progressbar')).toHaveAttribute('value', '2');
   await expect(running).toContainText('2 / 5');
   await expect(running).toContainText('B 1 · R 1 · E 0');
+  await expect(running.locator('.decision-code-build')).toHaveText('B 1');
+  await expect(running.locator('.decision-code-reuse')).toHaveText('R 1');
+  await expect(running.locator('.decision-code-extend')).toHaveText('E 0');
+  await expect(running.locator('.decision-code-defer')).toHaveText('D 0');
+  await expect(running.locator('.decision-code-question')).toHaveText('Q 0');
+  const decisionColors = await page.evaluate<string[]>(`[...document.querySelectorAll('[data-testid="replicate-${liveId}-primary-pack-2"] .decision-code')].map((element) => getComputedStyle(element).color)`);
+  expect(new Set(decisionColors).size).toBe(5);
   await expect(running).toContainText(/(?:[4-9](?:\.\d)?|[1-9]\d+) s/);
   await expect(running).toContainText('3.0 s');
   await expect(running).toContainText('500');
@@ -639,6 +651,51 @@ test('shows dependency connectors, truthful lineage cards, and an equivalent lis
 });
 
 test('isolates duplicate question IDs by benchmark and replicate and serves artifacts', async ({ page }) => {
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${baselineId}`);
+  await expect(page.getByRole('link', { name: 'Summary' })).toHaveAttribute('aria-current', 'page');
+  await page.getByRole('link', { name: 'Markdown' }).click();
+  await expect(page.getByRole('heading', { name: 'Experiment Markdown' })).toBeVisible();
+  const markdownViewer = page.getByTestId('experiment-markdown');
+  await expect(markdownViewer.getByRole('heading', { name: 'Base Assumptions' })).toBeVisible();
+  await expect(markdownViewer.getByRole('heading', { name: 'Conclusion' })).toBeVisible();
+  await expect(markdownViewer.getByRole('table').first()).toBeVisible();
+  const onThisPage = page.getByRole('navigation', { name: 'On this page' });
+  await expect(onThisPage.getByRole('link', { name: 'Base Assumptions' })).toBeVisible();
+  await expect(onThisPage.getByRole('link', { name: /^question\./ })).toHaveCount(0);
+  const conclusionLink = onThisPage.getByRole('link', { name: 'Conclusion' });
+  await conclusionLink.click();
+  await expect.poll(() => markdownViewer.evaluate((element) => element.scrollTop)).toBeGreaterThan(100);
+  await expect(conclusionLink).toHaveAttribute('aria-current', 'location');
+  await expect(page).toHaveURL(/#conclusion$/);
+  await expect(markdownViewer.getByRole('heading', { name: 'Conclusion' })).toBeFocused();
+  await page.reload();
+  await expect.poll(() => markdownViewer.evaluate((element) => element.scrollTop)).toBeGreaterThan(100);
+  await expect(conclusionLink).toHaveAttribute('aria-current', 'location');
+  await expect(page.getByRole('link', { name: 'Open raw Markdown' })).toBeVisible();
+  await markdownViewer.focus();
+  await markdownViewer.evaluate((element) => {
+    element.scrollTop = 120;
+  });
+  const humanNotesDirectory = path.join(paths.reports, campaignId, 'human');
+  await mkdir(humanNotesDirectory, { recursive: true });
+  await writeFile(
+    path.join(humanNotesDirectory, `${baselineId}.md`),
+    'Reviewer refresh marker.\n<img src=x onerror="window.__markdownExecuted=true">\n',
+  );
+  const refreshed = page.waitForResponse(
+    (response) => response.url() === `${baseUrl}/api/campaigns/${campaignId}`,
+  );
+  await orchestrator.refreshReports(campaignId);
+  await refreshed;
+  await expect(markdownViewer).toContainText('Reviewer refresh marker.');
+  await expect(page.locator('.markdown-panel img')).toHaveCount(0);
+  expect(await page.evaluate('window.__markdownExecuted')).toBeUndefined();
+  await expect(markdownViewer).toBeFocused();
+  await expect.poll(() => markdownViewer.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+  await page.getByRole('link', { name: 'Runs' }).click();
+  await page.getByRole('link', { name: 'Markdown' }).click();
+  await expect(markdownViewer).not.toBeFocused();
+
   await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${baselineId}?tab=runs`);
   await expect(page.getByRole('heading', { name: 'Seed observation' })).toBeVisible();
   await expect(page.getByLabel('Experiment timing and planner usage').first()).toContainText('20 s');
@@ -656,6 +713,7 @@ test('isolates duplicate question IDs by benchmark and replicate and serves arti
   await expect(page.getByRole('link', { name: /planner-output.json/ })).toBeVisible();
   const report = await page.request.get(`${baseUrl}${await reportLink.getAttribute('href')}`);
   expect(report.ok()).toBe(true);
+  expect(report.headers()['content-type']).toBe('text/markdown; charset=utf-8');
   expect(await report.text()).toContain('## Actual Facts');
 
   await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${reviewId}`);
@@ -729,6 +787,12 @@ test('retains a central dirty review draft across SSE and guards navigation befo
 
 test('provides a mobile drawer, defaults lineage to list, and preserves campaign creation', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${baselineId}?tab=markdown`);
+  await expect(
+    page.getByTestId('experiment-markdown').getByRole('heading', { name: 'Conclusion' }),
+  ).toBeVisible();
+  expect(await page.evaluate<number>('document.documentElement.scrollWidth')).toBe(390);
+
   await page.goto(
     `${baseUrl}/campaigns/${campaignId}/review/${baselineId}?benchmark=primary-pack&filter=all&unit=unit-a`,
   );

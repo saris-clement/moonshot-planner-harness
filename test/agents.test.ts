@@ -87,6 +87,7 @@ test('strategist prompt and schema require current diagnosis finding citations',
             expectedImpact: 'Reduce unsupported build decisions.',
             risk: 'Could admit declarations without behavior.',
             findingIds: ['finding-hydration'],
+            assumptions: ['The diagnosed evidence loss is causally relevant.'],
           },
         ],
       }),
@@ -96,8 +97,39 @@ test('strategist prompt and schema require current diagnosis finding citations',
   });
   const hypotheses = await runner.proposeHypotheses('/tmp', '/tmp/history.json', 1);
   assert.deepEqual(hypotheses[0]?.findingIds, ['finding-hydration']);
+  assert.deepEqual(hypotheses[0]?.assumptions, [
+    'The diagnosed evidence loss is causally relevant.',
+  ]);
   assert.match(calls[0]!.join(' '), /real finding IDs/);
   assert.match(calls[0]!.join(' '), /counterevidence/);
+  assert.match(calls[0]!.join(' '), /assumptions/);
+});
+
+test('strategist output is rejected when it omits explicit assumptions', async () => {
+  const runner = new AgentRunner(campaign, async (command, args): Promise<CommandResult> => ({
+    command,
+    args: [...args],
+    exitCode: 0,
+    stdout: JSON.stringify({
+      hypotheses: [
+        {
+          title: 'Missing assumption',
+          rationale: 'A bounded rationale.',
+          instructions: 'Make one bounded change.',
+          expectedImpact: 'A measurable change.',
+          risk: 'The mechanism may be wrong.',
+          findingIds: ['finding-hydration'],
+        },
+      ],
+    }),
+    stderr: '',
+    durationMs: 1,
+  }));
+
+  await assert.rejects(
+    runner.proposeHypotheses('/tmp', '/tmp/history.json', 1),
+    /invalid structured output/,
+  );
 });
 
 test('diagnostician archives strict cited unverified output and mutator receives bounded context', async () => {

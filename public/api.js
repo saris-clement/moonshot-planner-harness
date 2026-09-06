@@ -8,6 +8,16 @@ export async function api(requestPath, init) {
   return value;
 }
 
+export async function apiText(requestPath) {
+  const response = await fetch(requestPath, {
+    cache: 'no-store',
+    headers: { Accept: 'text/markdown, text/plain' },
+  });
+  const value = await response.text();
+  if (!response.ok) throw new Error(`Request failed (${response.status})`);
+  return value;
+}
+
 export async function uploadRequirementsZip(file) {
   const response = await fetch('/api/uploads/requirements-pack', {
     method: 'POST',

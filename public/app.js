@@ -5,7 +5,7 @@ import { navigate, parseRoute, startRouter } from './router.js';
 import { renderShell } from './shell.js';
 import { clearReviewDraft, hasDirtyDraft, state } from './state.js';
 import { campaignsPage } from './pages/campaigns.js';
-import { experimentPage } from './pages/experiment.js';
+import { experimentPage, invalidateExperimentMarkdown } from './pages/experiment.js';
 import { experimentsPage } from './pages/experiments.js';
 import { lineagePage } from './pages/lineage.js';
 import { newCampaignPage } from './pages/newCampaign.js';
@@ -132,6 +132,10 @@ function connectEvents() {
     'target_excluded.question_waiting',
     'target_excluded.label_updated',
   ]) source.addEventListener(eventName, refreshCurrent);
+  source.addEventListener('reports.refreshed', () => {
+    if (state.campaign) invalidateExperimentMarkdown(state.campaign.id);
+    void refreshCurrent();
+  });
 }
 
 async function runAction(action, message) {
