@@ -36,6 +36,19 @@ const reviewId = 'ui-e2e-v002';
 async function gitFixture(directory: string, remote = false): Promise<string> {
   await mkdir(directory, { recursive: true });
   await writeFile(path.join(directory, 'README.md'), 'fixture\n');
+  if (remote) {
+    await mkdir(path.join(directory, 'src/shared'), { recursive: true });
+    await writeFile(
+      path.join(directory, 'src/shared/account.ts'),
+      [
+        'export interface Account {',
+        '  accountId: string;',
+        '  verified: boolean;',
+        '}',
+        '',
+      ].join('\n'),
+    );
+  }
   await runCommand('git', ['init'], { cwd: directory });
   await runCommand('git', ['add', '.'], { cwd: directory });
   await runCommand(
@@ -52,7 +65,7 @@ async function gitFixture(directory: string, remote = false): Promise<string> {
 }
 
 function runFacts(usage: PlannerUsage, decision: 'build' | 'reuse' = 'build'): RunFacts {
-  const sourceRefs = decision === 'reuse' ? [{ path: 'src/shared/account.ts', symbol: 'accountId' }] : [];
+  const sourceRefs = decision === 'reuse' ? [{ path: 'src/shared/account.ts:2-3', symbol: 'accountId' }] : [];
   return extractRunFacts(
     {
       analysis: {
@@ -175,7 +188,7 @@ async function seedCampaign(): Promise<void> {
         classification: 'real_gap',
         confidence: 'high',
         rationale: 'No existing source behavior captures this identifier.',
-        evidence: ['src/shared/account.ts: absent after source search'],
+        evidence: ['src/shared/account.ts:2-3 defines the verified account identifier.'],
       },
     ],
   };
@@ -393,6 +406,11 @@ test.beforeAll(async () => {
   database = new HarnessDatabase(paths.database);
   orchestrator = new CampaignOrchestrator(paths, database);
   await seedCampaign();
+  const frozenWorkflows = path.join(paths.worktrees, campaignId, 'frozen-workflows');
+  await mkdir(path.dirname(frozenWorkflows), { recursive: true });
+  await runCommand('git', ['worktree', 'add', '--detach', frozenWorkflows, workflowsSha], {
+    cwd: workflowsRepo,
+  });
   server = startDashboard({
     port: 0,
     publicDirectory: path.resolve(process.cwd(), 'public'),
@@ -432,6 +450,36 @@ test('serves valid HTML deep links and never falls back for APIs or extensions',
     headers: { Accept: 'application/json' },
   });
   expect(nonHtmlDeepLink.status()).toBe(404);
+});
+
+test('opens review evidence at the cited lines in the frozen workflows source', async ({ page, request }) => {
+  const unsafe = await request.get(
+    `${baseUrl}/campaigns/${campaignId}/source?path=${encodeURIComponent('../planner/README.md')}&lines=1`,
+  );
+  expect(unsafe.status()).toBe(400);
+
+  await page.goto(
+    `${baseUrl}/campaigns/${campaignId}/review/${baselineId}?benchmark=primary-pack&filter=all&unit=unit-a`,
+  );
+  const judgeEvidence = page.locator('.evidence-block.suggestion');
+  const judgeLink = judgeEvidence.getByRole('link', { name: 'src/shared/account.ts:2-3' });
+  await expect(judgeLink).toHaveAttribute('target', '_blank');
+
+  const popupPromise = page.waitForEvent('popup');
+  await judgeLink.click();
+  const sourcePage = await popupPromise;
+  await expect(sourcePage).toHaveURL(/\/campaigns\/ui-e2e\/source\?.*#L2$/);
+  await expect(sourcePage.getByRole('heading', { name: 'src/shared/account.ts' })).toBeVisible();
+  await expect(sourcePage.locator('#L2')).toHaveClass(/source-line-selected/);
+  await expect(sourcePage.locator('#L3')).toHaveClass(/source-line-selected/);
+  await expect(sourcePage.locator('#L2')).toBeInViewport();
+  await sourcePage.close();
+
+  await page.goto(
+    `${baseUrl}/campaigns/${campaignId}/review/${baselineId}?benchmark=holdout-pack&filter=all&unit=unit-a`,
+  );
+  const plannerEvidence = page.locator('.evidence-block').first();
+  await expect(plannerEvidence.getByRole('link', { name: 'src/shared/account.ts:2-3' })).toBeVisible();
 });
 
 test('refreshes a deep-linked overview with completed, live, and pending replicate telemetry', async ({ page }) => {

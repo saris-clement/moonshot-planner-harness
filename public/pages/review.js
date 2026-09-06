@@ -12,6 +12,47 @@ const filters = [
   ['extend', 'Extend'],
 ];
 
+const sourceReferencePattern = /(?<![a-z0-9_.\/-])((?:[a-z0-9_.-]+\/)*[a-z0-9_.-]+\.(?:c|cc|cpp|cs|go|h|hpp|java|js|jsx|json|kt|kts|md|php|py|rb|rs|sh|sql|toml|ts|tsx|yaml|yml))(?::(\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*))?/gi;
+
+function sourceUrl(campaign, sourcePath, ranges) {
+  const query = new URLSearchParams({ path: sourcePath });
+  if (ranges) query.set('lines', ranges);
+  const firstLine = ranges?.match(/^\d+/)?.[0];
+  return `/campaigns/${encodeURIComponent(campaign.id)}/source?${query}${firstLine ? `#L${firstLine}` : ''}`;
+}
+
+function linkedSourceText(campaign, value) {
+  const children = [];
+  let cursor = 0;
+  for (const match of value.matchAll(sourceReferencePattern)) {
+    const index = match.index ?? 0;
+    if (index > cursor) children.push(text(value.slice(cursor, index)));
+    const [label, sourcePath, ranges] = match;
+    children.push(element('a', {
+      className: 'source-reference',
+      text: label,
+      attributes: {
+        href: sourceUrl(campaign, sourcePath, ranges),
+        target: '_blank',
+        rel: 'noopener',
+        title: `Open ${sourcePath}${ranges ? ` at lines ${ranges}` : ''} from the frozen campaign source`,
+      },
+    }));
+    cursor = index + label.length;
+  }
+  if (cursor < value.length) children.push(text(value.slice(cursor)));
+  return children.length ? children : [text(value)];
+}
+
+function sourceReferenceList(campaign, values, separator) {
+  const children = [];
+  values.forEach((value, index) => {
+    if (index > 0) children.push(text(separator));
+    children.push(...linkedSourceText(campaign, value));
+  });
+  return children;
+}
+
 function evaluationFor(variant, benchmark, primaryName) {
   return benchmark === primaryName
     ? { facts: variant.facts, judgment: variant.judgment }
@@ -206,7 +247,7 @@ function reviewDetail(context, campaign, variant, benchmark, unit, suggestion, l
       context.notify(error.message);
     }
   });
-  const refs = unit.sourceRefs.map((item) => item.path ?? item.capabilityId).filter(Boolean).join(', ') || 'none';
+  const refs = unit.sourceRefs.map((item) => item.path ?? item.capabilityId).filter(Boolean);
   return element('aside', { className: 'review-detail' }, [
     element('p', { className: 'overline', text: unit.ref.entity }),
     element('div', { className: 'review-unit-anchor' }, [
@@ -228,12 +269,17 @@ function reviewDetail(context, campaign, variant, benchmark, unit, suggestion, l
     element('section', { className: 'evidence-block' }, [
       element('h3', { text: 'Planner rationale · measured output' }),
       element('p', { text: unit.rationale }),
-      element('p', { className: 'muted', text: `Source references: ${refs}` }),
+      element('p', { className: 'muted source-evidence' }, [
+        text('Source references: '),
+        ...(refs.length ? sourceReferenceList(campaign, refs, ', ') : [text('none')]),
+      ]),
     ]),
     element('section', { className: 'evidence-block suggestion' }, [
       element('h3', { text: 'Blind judge · suggestion' }),
       element('p', { text: suggestion?.rationale ?? 'No suggestion available.' }),
-      suggestion?.evidence?.length ? element('p', { className: 'muted', text: suggestion.evidence.join(' · ') }) : null,
+      suggestion?.evidence?.length
+        ? element('p', { className: 'muted source-evidence' }, sourceReferenceList(campaign, suggestion.evidence, ' · '))
+        : null,
     ]),
     form,
   ]);

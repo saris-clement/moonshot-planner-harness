@@ -10,6 +10,7 @@ import type { HarnessDatabase } from './db.js';
 import type { CampaignOrchestrator } from './orchestrator.js';
 import { DecisionSchema } from './types.js';
 import { campaignReportDirectory, variantArtifactDirectory } from './paths.js';
+import { parseSourceLineRanges, readFrozenSourceFile, renderSourceViewer } from './sourceViewer.js';
 
 const LabelInputSchema = z.object({
   benchmark: z.string().min(1),
@@ -29,6 +30,15 @@ function sendJson(response: ServerResponse, status: number, value: unknown): voi
     'Cache-Control': 'no-store',
   });
   response.end(body);
+}
+
+function sendHtml(response: ServerResponse, status: number, body: string, headOnly = false): void {
+  response.writeHead(status, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+  });
+  response.end(headOnly ? undefined : body);
 }
 
 function requireSameOrigin(request: IncomingMessage): void {
@@ -204,6 +214,34 @@ export function startDashboard(input: {
       response.setHeader('Referrer-Policy', 'no-referrer');
       const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
       const segments = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+
+      if (
+        (request.method === 'GET' || request.method === 'HEAD') &&
+        segments[0] === 'campaigns' &&
+        segments[1] &&
+        segments[2] === 'source' &&
+        segments.length === 3
+      ) {
+        const campaign = input.database.getCampaign(segments[1]);
+        const relativePath = url.searchParams.get('path');
+        if (!relativePath) throw new Error('source path is required');
+        const ranges = parseSourceLineRanges(url.searchParams.get('lines'));
+        const sourceRoot = path.join(input.orchestrator.paths.worktrees, campaign.id, 'frozen-workflows');
+        const source = await readFrozenSourceFile(sourceRoot, relativePath);
+        sendHtml(
+          response,
+          200,
+          renderSourceViewer({
+            campaignId: campaign.id,
+            workflowsSha: campaign.workflowsSha,
+            relativePath,
+            source,
+            ranges,
+          }),
+          request.method === 'HEAD',
+        );
+        return;
+      }
 
       if (request.method === 'POST' && url.pathname === '/api/uploads/requirements-pack') {
         const upload = await stageRequirementsZip(
