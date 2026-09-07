@@ -879,13 +879,31 @@ export async function writeAgentHistory(
   variants: readonly VariantRecord[],
   labels: readonly LabelRecord[],
   targetEvaluations: readonly TargetExcludedEvaluationRecord[] = [],
+  allowedCurrentParentFindingIds?: readonly string[],
 ): Promise<void> {
   const [historicalExperiments, researchContext] = await Promise.all([
     readHistoricalExperiments(experimentsRoot),
     readFrozenResearchContext(campaign.config.researchPaths, campaign.config.researchSha256),
   ]);
+  const currentParent = variants.find(({ id }) => id === campaign.currentParentVariantId) ?? null;
+  const allowedFindingIds = new Set(
+    allowedCurrentParentFindingIds ??
+      (currentParent?.diagnosisStatus === 'completed'
+        ? currentParent.diagnosis?.findings.map(({ id }) => id) ?? []
+        : []),
+  );
+  const currentParentFindings =
+    currentParent?.diagnosisStatus === 'completed'
+      ? currentParent.diagnosis?.findings.filter(({ id }) => allowedFindingIds.has(id)) ?? []
+      : [];
   const history = {
     goal: campaign.config.goal,
+    currentParent: currentParent
+      ? {
+          id: currentParent.id,
+          allowedFindingIds: currentParentFindings.map(({ id }) => id),
+        }
+      : null,
     genericityConstraints: [
       'No customer or workflow constants in production code.',
       'Prefer a single causal mechanism per experiment.',
@@ -912,7 +930,10 @@ export async function writeAgentHistory(
       id: variant.id,
       parent: variant.parentVariantId,
       round: variant.round,
-      hypothesis: variant.hypothesis,
+      hypothesis:
+        variant.id === currentParent?.id
+          ? variant.hypothesis
+          : { ...variant.hypothesis, findingSnapshots: [] },
       status: variant.status,
       patchSha256: variant.patchHash,
       decisions: variant.facts?.decisions,
@@ -925,9 +946,9 @@ export async function writeAgentHistory(
         status: variant.diagnosisStatus,
         inputSha256: variant.diagnosisInputHash,
         interpretationStatus: variant.diagnosis?.interpretationStatus ?? null,
-        summary: variant.diagnosis?.summary ?? null,
+        summary: variant.id === currentParent?.id ? variant.diagnosis?.summary ?? null : null,
         findings:
-          variant.diagnosis?.findings.map(
+          (variant.id === currentParent?.id ? currentParentFindings : []).map(
             ({
               id,
               category,

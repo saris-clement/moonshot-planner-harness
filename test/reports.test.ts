@@ -304,6 +304,7 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
     );
     const campaignWithResearch = {
       ...campaign,
+      currentParentVariantId: variant.id,
       config: {
         ...campaign.config,
         researchPaths: [frozenResearchPath],
@@ -312,10 +313,44 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
         ],
       },
     };
-    await writeAgentHistory(historyPath, paths.reports, campaignWithResearch, [variant], [label]);
+    const sibling = {
+      ...variant,
+      id: 'report-diagnosis-v999',
+      hypothesis: {
+        ...variant.hypothesis,
+        findingSnapshots: [
+          {
+            ...variant.diagnosis!.findings[0]!,
+            id: 'finding-sibling-snapshot',
+          },
+        ],
+      },
+      diagnosis: {
+        ...variant.diagnosis!,
+        summary: 'Sibling semantic summary must stay hidden.',
+        findings: [
+          {
+            ...variant.diagnosis!.findings[0]!,
+            id: 'finding-sibling-secret',
+          },
+        ],
+      },
+    };
+    await writeAgentHistory(
+      historyPath,
+      paths.reports,
+      campaignWithResearch,
+      [variant, sibling],
+      [label],
+    );
     const history = JSON.parse(await readFile(historyPath, 'utf8')) as Record<string, unknown>;
     const serialized = JSON.stringify(history);
     assert.match(serialized, /"benchmark":"primary-pack"/);
+    assert.match(serialized, /"currentParent":\{"id":"report-diagnosis-v000"/);
+    assert.match(serialized, /"allowedFindingIds":\["finding-hydration"\]/);
+    assert.doesNotMatch(serialized, /finding-sibling-secret/);
+    assert.doesNotMatch(serialized, /finding-sibling-snapshot/);
+    assert.doesNotMatch(serialized, /Sibling semantic summary/);
     assert.match(serialized, /"interpretationStatus":"unverified_model_judgment"/);
     assert.match(serialized, /"unverified":true/);
     assert.match(serialized, /"holdouts":\{"holdout-pack"/);
@@ -347,7 +382,7 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
     await rm(manifestPath);
     await symlink(outsideManifest, manifestPath);
     await assert.rejects(
-      writeAgentHistory(historyPath, paths.reports, campaignWithResearch, [variant], [label]),
+      writeAgentHistory(historyPath, paths.reports, campaignWithResearch, [variant, sibling], [label]),
       /historical research manifest must be a contained regular file/,
     );
 
@@ -356,7 +391,7 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
     await mkdir(outsideHistory);
     await symlink(outsideHistory, path.join(paths.reports, 'history'));
     await assert.rejects(
-      writeAgentHistory(historyPath, paths.reports, campaignWithResearch, [variant], [label]),
+      writeAgentHistory(historyPath, paths.reports, campaignWithResearch, [variant, sibling], [label]),
       /historical research root must be a real directory/,
     );
   } finally {

@@ -1536,14 +1536,19 @@ export class CampaignOrchestrator {
       this.ensureFrozenPlannerSource(campaign),
       this.ensureFrozenWorkflowsSource(campaign),
     ]);
-    const historyPath = await this.refreshAgentHistory(campaignId);
+    const parentDiagnosis = diagnosisAvailable
+      ? this.database.getVariant(campaign.currentParentVariantId).diagnosis
+      : null;
+    const currentParentFindingIds = parentDiagnosis?.findings.map(({ id }) => id) ?? [];
+    const parentBeforeStrategy = this.database.getVariant(campaign.currentParentVariantId);
+    const historyPath = await this.refreshAgentHistory(campaignId, currentParentFindingIds);
     const proposedHypotheses = await new AgentRunner(campaign).proposeHypotheses(
       campaignDirectory(this.paths, campaignId),
       historyPath,
       count,
       diagnosisAvailable,
+      currentParentFindingIds,
     );
-    const parentDiagnosis = this.database.getVariant(campaign.currentParentVariantId).diagnosis;
     const hypotheses = proposedHypotheses.map((hypothesis) => ({
       ...hypothesis,
       findingSnapshots:
@@ -1583,6 +1588,20 @@ export class CampaignOrchestrator {
       }
       if (!diagnosisAvailable && hypothesis.findingIds.length > 0) {
         throw new Error('strategist invented diagnosis finding IDs during the explicit opt-out');
+      }
+    }
+    if (diagnosisAvailable) {
+      const stillAvailable = await this.requireCurrentParentDiagnosis(
+        this.database.getCampaign(campaignId),
+      );
+      const parentAfterStrategy = this.database.getVariant(campaign.currentParentVariantId);
+      if (
+        !stillAvailable ||
+        parentAfterStrategy.diagnosisStatus !== 'completed' ||
+        parentAfterStrategy.diagnosisInputHash !== parentBeforeStrategy.diagnosisInputHash ||
+        parentAfterStrategy.diagnosisResultHash !== parentBeforeStrategy.diagnosisResultHash
+      ) {
+        throw new Error('current parent diagnosis became stale while the strategist was running');
       }
     }
     let ordinal = Math.max(0, ...variants.map((variant) => variant.ordinal));
@@ -5111,7 +5130,10 @@ export class CampaignOrchestrator {
     }
   }
 
-  private async refreshAgentHistory(campaignId: string): Promise<string> {
+  private async refreshAgentHistory(
+    campaignId: string,
+    allowedCurrentParentFindingIds: readonly string[] = [],
+  ): Promise<string> {
     const campaign = this.database.getCampaign(campaignId);
     const filePath = path.join(campaignDirectory(this.paths, campaignId), 'history.json');
     await writeAgentHistory(
@@ -5121,6 +5143,7 @@ export class CampaignOrchestrator {
       this.database.listVariants(campaignId),
       this.database.listLabels(campaignId),
       this.database.listTargetExcludedEvaluations(campaignId),
+      allowedCurrentParentFindingIds,
     );
     return filePath;
   }

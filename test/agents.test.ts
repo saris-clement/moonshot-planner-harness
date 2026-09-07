@@ -154,7 +154,13 @@ test('strategist prompt and schema require current diagnosis finding citations',
       durationMs: 1,
     };
   });
-  const hypotheses = await runner.proposeHypotheses('/tmp', '/tmp/history.json', 1);
+  const hypotheses = await runner.proposeHypotheses(
+    '/tmp',
+    '/tmp/history.json',
+    1,
+    true,
+    ['finding-hydration'],
+  );
   assert.deepEqual(hypotheses[0]?.findingIds, ['finding-hydration']);
   assert.deepEqual(hypotheses[0]?.assumptions, [
     'The diagnosed evidence loss is causally relevant.',
@@ -166,6 +172,62 @@ test('strategist prompt and schema require current diagnosis finding citations',
   assert.match(calls[0]!.join(' '), /not current-run evidence/i);
   assert.match(calls[0]!.join(' '), /every material clause/i);
   assert.match(calls[0]!.join(' '), /campaign-level falsification/i);
+  assert.match(calls[0]!.join(' '), /finding-hydration/);
+});
+
+test('strategist repairs stale diagnosis IDs against the current-parent allowlist', async () => {
+  const calls: string[][] = [];
+  const outputs = [
+    {
+      hypotheses: [
+        {
+          title: 'Stale finding',
+          rationale: 'Incorrectly selected a sibling diagnosis.',
+          instructions: 'Implement a stale mechanism.',
+          expectedImpact: 'None.',
+          risk: 'Stale context.',
+          findingIds: ['finding-sibling'],
+          assumptions: ['The stale finding belongs to the parent.'],
+        },
+      ],
+    },
+    {
+      hypotheses: [
+        {
+          title: 'Current finding',
+          rationale: 'Uses the current parent diagnosis.',
+          instructions: 'Implement the current mechanism.',
+          expectedImpact: 'A bounded measurable change.',
+          risk: 'The mechanism may be wrong.',
+          findingIds: ['finding-current'],
+          assumptions: ['The current finding is causally relevant.'],
+        },
+      ],
+    },
+  ];
+  const runner = new AgentRunner(campaign, async (command, args): Promise<CommandResult> => {
+    calls.push([...args]);
+    return {
+      command,
+      args: [...args],
+      exitCode: 0,
+      stdout: JSON.stringify(outputs[calls.length - 1]),
+      stderr: '',
+      durationMs: 1,
+    };
+  });
+
+  const hypotheses = await runner.proposeHypotheses(
+    '/tmp',
+    '/tmp/history.json',
+    1,
+    true,
+    ['finding-current'],
+  );
+  assert.equal(calls.length, 2);
+  assert.deepEqual(hypotheses[0]?.findingIds, ['finding-current']);
+  assert.match(calls[1]!.join(' '), /previous hypotheses cited stale or unknown finding IDs/i);
+  assert.match(calls[1]!.join(' '), /finding-current/);
 });
 
 test('strategist output is rejected when it omits explicit assumptions', async () => {
@@ -480,6 +542,32 @@ test('hypothesis compliance reviewer binds its unverified verdict to patch and m
       ),
       /agent returned invalid structured output/,
     );
+    let bindingCalls = 0;
+    const bindingRunner = new AgentRunner(
+      campaign,
+      async (command, args): Promise<CommandResult> => {
+        bindingCalls += 1;
+        return {
+          command,
+          args: [...args],
+          exitCode: 0,
+          stdout: JSON.stringify(
+            bindingCalls === 1 ? { ...output, variantId: 'wrong-variant' } : output,
+          ),
+          stderr: '',
+          durationMs: 1,
+        };
+      },
+    );
+    const bindingRepaired = await bindingRunner.assessHypothesisCompliance(
+      variant,
+      patchPath,
+      mutationContextPath,
+      directory,
+      directory,
+    );
+    assert.equal(bindingCalls, 2);
+    assert.equal(bindingRepaired.result.variantId, variant.id);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
