@@ -20,6 +20,7 @@ Improve generic Phase 2 source-backed adjudication accuracy using PR 45 durable 
 ## Target-Excluded Evaluations
 
 - trumark-deceased-accounts-pr45c-v000: completed; gate=passed; build drop=0.0%
+- trumark-deceased-accounts-pr45c-v002: waiting_for_input; gate=pending; build drop=unscored
 
 ## Experiments
 
@@ -27,5 +28,5 @@ Improve generic Phase 2 source-backed adjudication accuracy using PR 45 durable 
 | ---: | --- | ---: | --- | --- | ---: | ---: |
 | 0 | trumark-deceased-accounts-pr45c-v000 | 0 | Unmodified campaign seed | completed | unscored | 28.0% |
 | 1 | trumark-deceased-accounts-pr45c-v001 | 1 | Stage behavioral and structural retrieval | failed | unscored | unscored |
-| 2 | trumark-deceased-accounts-pr45c-v002 | 1 | Compose selected evidence into a coverage chain | starting | unscored | unscored |
+| 2 | trumark-deceased-accounts-pr45c-v002 | 1 | Compose selected evidence into a coverage chain | running | unscored | unscored |
 | 3 | trumark-deceased-accounts-pr45c-v003 | 1 | Verify callable boundaries separately from implementation visibility | failed | unscored | unscored |
