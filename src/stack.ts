@@ -1,6 +1,7 @@
 import { createServer } from 'node:net';
-import { createHash } from 'node:crypto';
-import { lstat, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { copyFile, lstat, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { GetObjectCommand, ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3';
 import type { CampaignRecord, VariantRecord } from './types.js';
@@ -14,6 +15,12 @@ export interface DiffGateResult {
   addedLines: number;
   removedLines: number;
   forbiddenAdditions: Array<{ file: string; line: string }>;
+}
+
+export interface MutationDiffResult {
+  changedFiles: string[];
+  addedLines: number;
+  removedLines: number;
 }
 
 export interface StackHandle {
@@ -71,25 +78,212 @@ function safeName(value: string): string {
   return `${normalized.slice(0, 36)}-${suffix}`;
 }
 
+function gitDiffArguments(...args: string[]): string[] {
+  return [
+    '-c',
+    'core.fileMode=true',
+    '-c',
+    'core.attributesFile=/dev/null',
+    'diff',
+    ...args,
+  ];
+}
+
 export async function prepareVariantWorktree(
   paths: HarnessPaths,
   campaign: CampaignRecord,
   variant: VariantRecord,
   parentPatchPath: string | null,
+  parentPatchSha256: string | null,
 ): Promise<string> {
   const worktree = variantWorktreePath(paths, campaign.id, variant.id);
-  if (await pathIsDirectory(worktree)) return worktree;
+  let parentPatch: Buffer | null = null;
+  if (parentPatchPath) {
+    parentPatch = await readFile(parentPatchPath);
+    const actualSha256 = `sha256:${createHash('sha256').update(parentPatch).digest('hex')}`;
+    if (!parentPatchSha256 || actualSha256 !== parentPatchSha256) {
+      throw new Error('parent patch hash changed before application');
+    }
+  }
+  if (await pathIsDirectory(worktree)) {
+    await verifyVariantWorktreeState(
+      worktree,
+      campaign,
+      parentPatchSha256,
+      'existing variant worktree differs from the hash-bound parent state',
+    );
+    return worktree;
+  }
   await mkdir(path.dirname(worktree), { recursive: true });
   await runCommand('git', ['worktree', 'add', '--detach', worktree, campaign.seedSha], {
     cwd: campaign.config.plannerRepo,
   });
-  if (parentPatchPath) {
-    const patch = await readFile(parentPatchPath);
-    if (patch.byteLength > 0) {
-      await runCommand('git', ['apply', '--binary', parentPatchPath], { cwd: worktree });
+  if (parentPatchPath && parentPatch) {
+    if (parentPatch.byteLength > 0) {
+      await runCommand('git', ['apply', '--binary', '-'], {
+        cwd: worktree,
+        input: parentPatch.toString('utf8'),
+      });
     }
   }
+  await verifyVariantWorktreeState(
+    worktree,
+    campaign,
+    parentPatchSha256,
+    'prepared variant worktree differs from the hash-bound parent state',
+  );
   return worktree;
+}
+
+export async function stageMutationBaseline(worktree: string): Promise<string> {
+  await runCommand('git', ['add', '--all'], { cwd: worktree });
+  return await mutationIndexFingerprint(worktree);
+}
+
+async function mutationIndexFingerprint(worktree: string): Promise<string> {
+  const [tree, flags, config] = await Promise.all([
+    runCommand('git', ['write-tree'], { cwd: worktree }),
+    runCommand('git', ['ls-files', '-v', '-z'], { cwd: worktree, maxCapturedBytes: 16 * 1_024 * 1_024 }),
+    runCommand('git', ['config', '--null', '--list', '--show-origin', '--show-scope'], {
+      cwd: worktree,
+      maxCapturedBytes: 16 * 1_024 * 1_024,
+    }),
+  ]);
+  return `sha256:${createHash('sha256')
+    .update(tree.stdout.trim())
+    .update('\0')
+    .update(flags.stdout)
+    .update('\0')
+    .update(config.stdout)
+    .digest('hex')}`;
+}
+
+async function temporaryDiffIndex(
+  worktree: string,
+): Promise<{ environment: NodeJS.ProcessEnv; dispose: () => Promise<void> }> {
+  const indexLocation = (
+    await runCommand('git', ['rev-parse', '--git-path', 'index'], { cwd: worktree })
+  ).stdout.trim();
+  const sourceIndex = path.isAbsolute(indexLocation)
+    ? indexLocation
+    : path.resolve(worktree, indexLocation);
+  const temporaryIndex = path.join(os.tmpdir(), `ainative-planner-diff-index-${randomUUID()}`);
+  await copyFile(sourceIndex, temporaryIndex);
+  const environment = { ...process.env, GIT_INDEX_FILE: temporaryIndex };
+  try {
+    const untracked = await runCommand(
+      'git',
+      ['ls-files', '--others', '-z'],
+      { cwd: worktree, env: environment, maxCapturedBytes: 16 * 1_024 * 1_024 },
+    );
+    const files = untracked.stdout.split('\0').filter(Boolean);
+    if (files.length > 0) {
+      await runCommand('git', ['add', '--intent-to-add', '--force', '--', ...files], {
+        cwd: worktree,
+        env: environment,
+      });
+    }
+  } catch (error) {
+    await rm(temporaryIndex, { force: true });
+    throw error;
+  }
+  return {
+    environment,
+    dispose: async () => await rm(temporaryIndex, { force: true }),
+  };
+}
+
+async function verifyVariantWorktreeState(
+  worktree: string,
+  campaign: CampaignRecord,
+  parentPatchSha256: string | null,
+  message: string,
+): Promise<void> {
+  const indexFlags = (
+    await runCommand('git', ['ls-files', '-v', '-z'], {
+      cwd: worktree,
+      maxCapturedBytes: 16 * 1_024 * 1_024,
+    })
+  ).stdout.split('\0').filter(Boolean);
+  if (indexFlags.some((entry) => /^[a-zS] /.test(entry))) {
+    throw new Error(message);
+  }
+  const temporaryIndex = await temporaryDiffIndex(worktree);
+  let patch: Awaited<ReturnType<typeof runCommand>>;
+  try {
+    patch = await runCommand('git', gitDiffArguments('--binary', '--no-ext-diff', 'HEAD'), {
+      cwd: worktree,
+      env: temporaryIndex.environment,
+      maxCapturedBytes: campaign.config.limits.maxPatchBytes + 1,
+    });
+  } finally {
+    await temporaryIndex.dispose();
+  }
+  const [head, patchSha256] = await Promise.all([
+    runCommand('git', ['rev-parse', 'HEAD'], { cwd: worktree }),
+    Promise.resolve(`sha256:${createHash('sha256').update(patch.stdout).digest('hex')}`),
+  ]);
+  const expectedPatchSha256 =
+    parentPatchSha256 ?? `sha256:${createHash('sha256').update('').digest('hex')}`;
+  if (head.stdout.trim() !== campaign.seedSha || patchSha256 !== expectedPatchSha256) {
+    throw new Error(message);
+  }
+}
+
+export async function captureMutationDiff(
+  campaign: CampaignRecord,
+  variant: VariantRecord,
+  worktree: string,
+  artifactDirectory: string,
+  expectedIndexTree: string,
+): Promise<{ patchPath: string; patch: string; result: MutationDiffResult }> {
+  const actualIndexTree = await mutationIndexFingerprint(worktree);
+  if (actualIndexTree !== expectedIndexTree) {
+    throw new Error('mutator altered the staged parent baseline');
+  }
+  const temporaryIndex = await temporaryDiffIndex(worktree);
+  let patch: Awaited<ReturnType<typeof runCommand>>;
+  let names: Awaited<ReturnType<typeof runCommand>>;
+  let numstat: Awaited<ReturnType<typeof runCommand>>;
+  try {
+    [patch, names, numstat] = await Promise.all([
+      runCommand('git', gitDiffArguments('--binary', '--no-ext-diff'), {
+        cwd: worktree,
+        env: temporaryIndex.environment,
+        maxCapturedBytes: campaign.config.limits.maxPatchBytes + 1,
+      }),
+      runCommand('git', gitDiffArguments('--name-only'), { cwd: worktree, env: temporaryIndex.environment }),
+      runCommand('git', gitDiffArguments('--numstat'), { cwd: worktree, env: temporaryIndex.environment }),
+    ]);
+  } finally {
+    await temporaryIndex.dispose();
+  }
+  if (Buffer.byteLength(patch.stdout) > campaign.config.limits.maxPatchBytes) {
+    throw new Error(`mutation patch exceeds ${campaign.config.limits.maxPatchBytes} bytes`);
+  }
+  const changedFiles = names.stdout.split(/\r?\n/).filter(Boolean);
+  let addedLines = 0;
+  let removedLines = 0;
+  for (const line of numstat.stdout.split(/\r?\n/)) {
+    const [added, removed] = line.split('\t');
+    if (added === '-' || removed === '-') throw new Error('binary mutation changes are not allowed');
+    addedLines += Number.parseInt(added ?? '0', 10) || 0;
+    removedLines += Number.parseInt(removed ?? '0', 10) || 0;
+  }
+  const patchPath = path.join(artifactDirectory, 'mutation.patch');
+  const result = { changedFiles, addedLines, removedLines };
+  await Promise.all([
+    writeFile(patchPath, patch.stdout),
+    writeFile(
+      path.join(artifactDirectory, 'mutation-diff.json'),
+      `${JSON.stringify({ variantId: variant.id, ...result }, null, 2)}\n`,
+    ),
+  ]);
+  return {
+    patchPath,
+    patch: patch.stdout,
+    result,
+  };
 }
 
 function productionFile(file: string): boolean {
@@ -129,19 +323,33 @@ function forbiddenDiffAdditions(diff: string): Array<{ file: string; line: strin
 
 export async function captureAndGateDiff(
   campaign: CampaignRecord,
-  variant: VariantRecord,
+  _variant: VariantRecord,
   worktree: string,
   artifactDirectory: string,
 ): Promise<{ patchPath: string; result: DiffGateResult }> {
-  await runCommand('git', ['add', '--intent-to-add', '--all'], { cwd: worktree });
-  const [patch, names, numstat] = await Promise.all([
-    runCommand('git', ['diff', '--binary', '--no-ext-diff', 'HEAD'], {
-      cwd: worktree,
-      maxCapturedBytes: campaign.config.limits.maxPatchBytes + 1,
-    }),
-    runCommand('git', ['diff', '--name-only', 'HEAD'], { cwd: worktree }),
-    runCommand('git', ['diff', '--numstat', 'HEAD'], { cwd: worktree }),
-  ]);
+  const temporaryIndex = await temporaryDiffIndex(worktree);
+  let patch: Awaited<ReturnType<typeof runCommand>>;
+  let names: Awaited<ReturnType<typeof runCommand>>;
+  let numstat: Awaited<ReturnType<typeof runCommand>>;
+  try {
+    [patch, names, numstat] = await Promise.all([
+      runCommand('git', gitDiffArguments('--binary', '--no-ext-diff', 'HEAD'), {
+        cwd: worktree,
+        env: temporaryIndex.environment,
+        maxCapturedBytes: campaign.config.limits.maxPatchBytes + 1,
+      }),
+      runCommand('git', gitDiffArguments('--name-only', 'HEAD'), {
+        cwd: worktree,
+        env: temporaryIndex.environment,
+      }),
+      runCommand('git', gitDiffArguments('--numstat', 'HEAD'), {
+        cwd: worktree,
+        env: temporaryIndex.environment,
+      }),
+    ]);
+  } finally {
+    await temporaryIndex.dispose();
+  }
   const patchPath = path.join(artifactDirectory, 'variant.patch');
   if (Buffer.byteLength(patch.stdout) > campaign.config.limits.maxPatchBytes) {
     throw new Error(`patch exceeds ${campaign.config.limits.maxPatchBytes} bytes`);
@@ -160,6 +368,9 @@ export async function captureAndGateDiff(
     const details = await lstat(path.join(worktree, file)).catch(() => null);
     if (details?.isSymbolicLink()) {
       throw new Error(`changed files cannot be symbolic links: ${file}`);
+    }
+    if (details?.isDirectory()) {
+      throw new Error(`changed paths cannot be directories or embedded repositories: ${file}`);
     }
   }
   let addedLines = 0;
@@ -190,7 +401,6 @@ export async function captureAndGateDiff(
   if (result.forbiddenAdditions.length > 0) {
     throw new Error('diff adds customer-specific or privileged production logic; see diff-gate.json');
   }
-  if (variant.round > 0 && changedFiles.length === 0) throw new Error('mutator produced no code changes');
   return { patchPath, result };
 }
 

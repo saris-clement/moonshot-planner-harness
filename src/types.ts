@@ -272,6 +272,60 @@ export const HypothesisSchema = z
 export type HypothesisInput = z.input<typeof HypothesisSchema>;
 export type Hypothesis = z.infer<typeof HypothesisSchema>;
 
+const HypothesisComplianceCheckSchema = z
+  .object({
+    status: z.enum(['satisfied', 'not_satisfied', 'uncertain']),
+    rationale: z.string().min(1).max(4_000),
+    evidence: z.array(z.string().min(1).max(1_000)).min(1).max(20),
+  })
+  .strict();
+
+const HypothesisFalsificationCheckSchema = z
+  .object({
+    status: z.enum(['satisfied', 'not_satisfied', 'uncertain', 'not_applicable']),
+    rationale: z.string().min(1).max(4_000),
+    evidence: z.array(z.string().min(1).max(1_000)).min(1).max(20),
+  })
+  .strict();
+
+export const HypothesisComplianceOutputSchema = z
+  .object({
+    kind: z.literal('ainative-planner-eval/hypothesis-compliance'),
+    schemaVersion: z.literal(1),
+    interpretationStatus: z.literal('unverified_model_judgment'),
+    variantId: z.string().min(1).max(256),
+    patchSha256: Sha256Schema,
+    mutationContextSha256: Sha256Schema,
+    status: z.enum(['passed', 'failed']),
+    summary: z.string().min(1).max(8_000),
+    intervention: HypothesisComplianceCheckSchema,
+    falsificationTest: HypothesisFalsificationCheckSchema,
+    limitations: z.array(z.string().min(1).max(2_000)).min(1).max(50),
+  })
+  .strict()
+  .superRefine((output, context) => {
+    const checksPass =
+      output.intervention.status === 'satisfied' &&
+      ['satisfied', 'not_applicable'].includes(output.falsificationTest.status);
+    if ((output.status === 'passed') !== checksPass) {
+      context.addIssue({
+        code: 'custom',
+        path: ['status'],
+        message: 'overall compliance status must agree with the intervention and falsification checks',
+      });
+    }
+  });
+export type HypothesisComplianceOutput = z.infer<typeof HypothesisComplianceOutputSchema>;
+
+export const HypothesisComplianceStatusSchema = z.enum([
+  'not_required',
+  'not_started',
+  'running',
+  'passed',
+  'failed',
+]);
+export type HypothesisComplianceStatus = z.infer<typeof HypothesisComplianceStatusSchema>;
+
 const RelativeArtifactPathSchema = z
   .string()
   .min(1)
@@ -903,6 +957,13 @@ export interface VariantRecord {
   composeProject: string | null;
   baseUrl: string | null;
   patchPath: string | null;
+  patchHash: string | null;
+  hypothesisComplianceStatus: HypothesisComplianceStatus;
+  hypothesisCompliancePatchHash: string | null;
+  hypothesisComplianceCandidatePatchHash: string | null;
+  hypothesisComplianceResultHash: string | null;
+  hypothesisCompliance: HypothesisComplianceOutput | null;
+  hypothesisComplianceError: string | null;
   artifactCollectionComplete: boolean;
   facts: RunFacts | null;
   replicateFacts: RunFacts[] | null;

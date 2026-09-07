@@ -6,6 +6,8 @@ import type {
   DiagnosisOutput,
   DiagnosisStatus,
   Hypothesis,
+  HypothesisComplianceOutput,
+  HypothesisComplianceStatus,
   HypothesisInput,
   JudgeOutput,
   LabelRecord,
@@ -25,6 +27,7 @@ import type {
 import {
   CampaignConfigSchema,
   DiagnosisOutputSchema,
+  HypothesisComplianceOutputSchema,
   HypothesisSchema,
   TargetExcludedConfigSchema,
   TargetNormalArmBindingSchema,
@@ -92,6 +95,32 @@ function variantFromRow(row: Row): VariantRecord {
     composeProject: row.compose_project === null ? null : String(row.compose_project),
     baseUrl: row.base_url === null ? null : String(row.base_url),
     patchPath: row.patch_path === null ? null : String(row.patch_path),
+    patchHash: row.patch_hash === null ? null : String(row.patch_hash),
+    hypothesisComplianceStatus: String(
+      row.hypothesis_compliance_status,
+    ) as HypothesisComplianceStatus,
+    hypothesisCompliancePatchHash:
+      row.hypothesis_compliance_patch_hash === null
+        ? null
+        : String(row.hypothesis_compliance_patch_hash),
+    hypothesisComplianceCandidatePatchHash:
+      row.hypothesis_compliance_candidate_patch_hash === null
+        ? null
+        : String(row.hypothesis_compliance_candidate_patch_hash),
+    hypothesisComplianceResultHash:
+      row.hypothesis_compliance_result_hash === null
+        ? null
+        : String(row.hypothesis_compliance_result_hash),
+    hypothesisCompliance:
+      row.hypothesis_compliance_json === null
+        ? null
+        : HypothesisComplianceOutputSchema.parse(
+            parseJson<HypothesisComplianceOutput>(row.hypothesis_compliance_json),
+          ),
+    hypothesisComplianceError:
+      row.hypothesis_compliance_error === null
+        ? null
+        : String(row.hypothesis_compliance_error),
     artifactCollectionComplete: Boolean(row.artifact_collection_complete),
     facts: row.facts_json === null ? null : parseJson<RunFacts>(row.facts_json),
     replicateFacts:
@@ -264,6 +293,13 @@ export class HarnessDatabase {
         compose_project TEXT,
         base_url TEXT,
         patch_path TEXT,
+        patch_hash TEXT,
+        hypothesis_compliance_status TEXT NOT NULL DEFAULT 'not_required',
+        hypothesis_compliance_patch_hash TEXT,
+        hypothesis_compliance_candidate_patch_hash TEXT,
+        hypothesis_compliance_result_hash TEXT,
+        hypothesis_compliance_json TEXT,
+        hypothesis_compliance_error TEXT,
         artifact_collection_complete INTEGER NOT NULL DEFAULT 0,
         facts_json TEXT,
         replicate_facts_json TEXT,
@@ -361,6 +397,7 @@ export class HarnessDatabase {
     this.ensureColumn('campaigns', 'lease_owner', 'TEXT');
     this.ensureColumn('campaigns', 'lease_expires_at', 'INTEGER');
     this.ensureColumn('variants', 'holdout_facts_json', 'TEXT');
+    this.ensureColumn('variants', 'patch_hash', 'TEXT');
     this.ensureColumn('variants', 'artifact_collection_complete', 'INTEGER NOT NULL DEFAULT 0');
     this.ensureColumn('variants', 'replicate_facts_json', 'TEXT');
     this.ensureColumn('variants', 'holdout_replicate_facts_json', 'TEXT');
@@ -373,6 +410,16 @@ export class HarnessDatabase {
     this.ensureColumn('variants', 'diagnosis_result_hash', 'TEXT');
     this.ensureColumn('variants', 'diagnosis_json', 'TEXT');
     this.ensureColumn('variants', 'diagnosis_error', 'TEXT');
+    this.ensureColumn(
+      'variants',
+      'hypothesis_compliance_status',
+      "TEXT NOT NULL DEFAULT 'not_required'",
+    );
+    this.ensureColumn('variants', 'hypothesis_compliance_patch_hash', 'TEXT');
+    this.ensureColumn('variants', 'hypothesis_compliance_candidate_patch_hash', 'TEXT');
+    this.ensureColumn('variants', 'hypothesis_compliance_result_hash', 'TEXT');
+    this.ensureColumn('variants', 'hypothesis_compliance_json', 'TEXT');
+    this.ensureColumn('variants', 'hypothesis_compliance_error', 'TEXT');
     this.ensureColumn('variants', 'started_at', 'TEXT');
     this.ensureColumn('variants', 'completed_at', 'TEXT');
     this.ensureColumn('variants', 'elapsed_ms', 'INTEGER');
@@ -509,8 +556,8 @@ export class HarnessDatabase {
     this.database
       .prepare(
         `INSERT INTO variants
-          (id, campaign_id, parent_variant_id, round, ordinal, hypothesis_json, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+          (id, campaign_id, parent_variant_id, round, ordinal, hypothesis_json, status, hypothesis_compliance_status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`,
       )
       .run(
         input.id,
@@ -519,6 +566,7 @@ export class HarnessDatabase {
         input.round,
         input.ordinal,
         JSON.stringify(hypothesis),
+        input.round === 0 ? 'not_required' : 'not_started',
         timestamp,
         timestamp,
       );
@@ -549,6 +597,13 @@ export class HarnessDatabase {
       composeProject: string | null;
       baseUrl: string | null;
       patchPath: string | null;
+      patchHash: string | null;
+      hypothesisComplianceStatus: HypothesisComplianceStatus;
+      hypothesisCompliancePatchHash: string | null;
+      hypothesisComplianceCandidatePatchHash: string | null;
+      hypothesisComplianceResultHash: string | null;
+      hypothesisCompliance: HypothesisComplianceOutput | null;
+      hypothesisComplianceError: string | null;
       artifactCollectionComplete: boolean;
       facts: RunFacts | null;
       replicateFacts: RunFacts[] | null;
@@ -581,6 +636,13 @@ export class HarnessDatabase {
       composeProject: 'compose_project',
       baseUrl: 'base_url',
       patchPath: 'patch_path',
+      patchHash: 'patch_hash',
+      hypothesisComplianceStatus: 'hypothesis_compliance_status',
+      hypothesisCompliancePatchHash: 'hypothesis_compliance_patch_hash',
+      hypothesisComplianceCandidatePatchHash: 'hypothesis_compliance_candidate_patch_hash',
+      hypothesisComplianceResultHash: 'hypothesis_compliance_result_hash',
+      hypothesisCompliance: 'hypothesis_compliance_json',
+      hypothesisComplianceError: 'hypothesis_compliance_error',
       artifactCollectionComplete: 'artifact_collection_complete',
       facts: 'facts_json',
       replicateFacts: 'replicate_facts_json',
@@ -617,6 +679,7 @@ export class HarnessDatabase {
       'questionResolutions',
       'executionState',
       'diagnosis',
+      'hypothesisCompliance',
     ]);
     const assignments: string[] = [];
     const values: SQLInputValue[] = [];

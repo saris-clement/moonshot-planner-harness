@@ -8,6 +8,7 @@ It is deliberately a one-machine tool: one coordinator process, SQLite state, di
 
 - Freezes the planner seed, workflows source, primary pack, holdout packs, environment profile, and optional campaign research files.
 - Uses GPT-5.6 Sol through OpenCode to propose and implement bounded generic changes.
+- Isolates each current mutation from its inherited parent diff and runs a patch-bound hypothesis-compliance review before image build or planner execution.
 - Builds and runs up to three isolated planner stacks concurrently.
 - Stops each evaluation after Phase 2.
 - Collects API output, Docker logs, image metadata, generated patches, and local S3 objects.
@@ -82,6 +83,8 @@ npm run cli -- auto phase2-source-policy-search
 
 OpenCode permissions remain authoritative. Set `agent.autoApprove` only when you accept unattended tool use in disposable worktrees. The mutator is instructed not to commit, push, alter Git configuration, or run Docker; the coordinator owns those operations.
 
+For generated variants, the inherited parent state is staged before mutation so `mutation.patch` contains only the current treatment while `variant.patch` remains the cumulative candidate diff. A separate read-only agent checks that treatment against the selected generic intervention and falsification test. The structured verdict is hash-bound and explicitly `unverified_model_judgment`; `uncertain`, missing intervention behavior, missing required regression coverage, no-op mutations, or reviewer-side input changes fail closed before expensive execution.
+
 Generated tests run in a networkless, read-only, resource-bounded Docker builder container rather than on the host. Planner stacks receive the campaign's immutable copy of the repository `.env`; the harness overrides only isolated infrastructure names and ports, frozen source identity, image identity, and an approved GitHub CLI token fallback when source credentials are absent.
 
 ## Scoring Semantics
@@ -96,6 +99,7 @@ Decision counts are observations, not fitness.
 - Every run must contain nonempty units, complete adjudications, runtime pins, model usage, semantics, and rationale before it is considered meaningful.
 - Lower cost and latency are visible but do not override correctness.
 - Model-generated diagnosis is shown separately and never contributes to numeric scoring. A next round requires a current, hash-verified parent diagnosis unless the campaign explicitly sets `diagnosis.allowMissingParent` to `true`. Use `npm run cli -- diagnose <campaign-id> <variant-id>` to backfill or retry an archived variant; the equivalent API is `POST /api/campaigns/<campaign-id>/variants/<variant-id>/diagnose`.
+- Hypothesis-compliance verdicts gate execution but never contribute to numeric scoring or become verified evidence. Failed and operationally incomplete reviews remain visible in experiment history.
 
 The blind judge sees the exact frozen workflows checkout and the selected run facts. It does not receive the candidate hypothesis or planner patch.
 
@@ -112,6 +116,8 @@ Blocking requirements questions are resolved once per campaign before evaluation
     research/                    hash-pinned optional research copies and manifest
   worktrees/<id>/                planner candidates and frozen workflows source
   artifacts/<id>/<variant>/      raw output, patches, logs, S3 objects
+    mutation.patch               current treatment relative to the inherited parent
+    hypothesis-compliance/       immutable prompts, logs, and patch-bound verdict
     diagnosis/                   immutable bounded inputs, manifests, optional telemetry, prompts, logs, and results
 docs/experiments/<id>/           trackable Markdown facts and conclusions
   human/<variant>.md             optional human context, never generator-owned
@@ -136,5 +142,6 @@ The test suite covers persistence, scoring precedence, cohort drift, command arg
 - New campaigns reserve twelve hours of aggregate Phase 2 model duration so V13 cohorts up to 144 requirement units fit the five-call, five-minute per-unit envelope.
 - V2 target-enabled campaigns fix the repetition count at two. With one holdout, all three cohorts start together for six planner cases per variant; a three-wide round may therefore sustain up to eighteen concurrent provider operations across isolated stacks.
 - Campaign execution is single-coordinator. Do not run dashboard and mutating CLI commands against the same campaign simultaneously.
+- Hypothesis compliance is a conservative same-model semantic review. It reduces obviously unfaithful experiments but may reject a valid mutation and is not independent correctness evidence.
 - Node currently labels built-in SQLite as experimental; all state is also represented by raw artifacts and generated Markdown.
 - Live execution projections must be persisted in SQLite. The server does not hydrate missing execution state from archived artifacts.

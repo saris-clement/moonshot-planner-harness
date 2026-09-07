@@ -37,6 +37,11 @@ import {
 import { writeAgentHistory, writeCampaignIndex, writeVariantReport } from './reports.js';
 import { captureResearchInputs, freezeResearchInputs } from './research.js';
 import {
+  hypothesisComplianceResultPath,
+  mutationContextRequiresFalsification,
+  verifyHypothesisComplianceResult,
+} from './hypothesisCompliance.js';
+import {
   assembleDiagnosisInput,
   diagnosisResultPath,
   readDiagnosisInput,
@@ -48,6 +53,7 @@ import { runCommand } from './process.js';
 import {
   buildVariantImage,
   captureAndGateDiff,
+  captureMutationDiff,
   collectStackArtifacts,
   ensureVariantArtifactDirectory,
   loadCampaignEnvironment,
@@ -55,6 +61,7 @@ import {
   reattachVariantStack,
   runVariantGates,
   startVariantStack,
+  stageMutationBaseline,
   stopVariantStack,
   type StackHandle,
 } from './stack.js';
@@ -1593,6 +1600,7 @@ export class CampaignOrchestrator {
           variant.status === 'review' &&
           variant.artifactCollectionComplete &&
           variant.score !== null &&
+          variant.hypothesisComplianceStatus === 'passed' &&
           variant.diagnosisStatus === 'completed' &&
           variant.diagnosisInputHash !== null,
       )
@@ -1672,6 +1680,8 @@ export class CampaignOrchestrator {
       !variant.artifactCollectionComplete ||
       !variant.facts ||
       !variant.score ||
+      (variant.round > 0 &&
+        !['passed', 'not_required'].includes(variant.hypothesisComplianceStatus)) ||
       variant.diagnosisStatus !== 'completed' ||
       !variant.diagnosisInputHash ||
       !variant.diagnosisResultHash
@@ -1683,6 +1693,7 @@ export class CampaignOrchestrator {
     if (variant.score.cohortMismatches.includes('requirement units')) {
       throw new Error('variant changed the frozen requirement-unit cohort');
     }
+    await this.verifyVariantHypothesisCompliance(campaign, variant, true);
     await verifyDiagnosisArtifacts(
       variantArtifactDirectory(this.paths, campaign.id, variant.id),
       variant.diagnosisInputHash,
@@ -2231,6 +2242,9 @@ export class CampaignOrchestrator {
     });
     let stack: StackHandle | null = null;
     let artifactDirectory = '';
+    let mutationContextPath: string | null = null;
+    let mutationContextSha256: string | null = null;
+    let mutationBaselineTree: string | null = null;
     let automaticV2Config: TargetExcludedConfig | null = null;
     let standardCohortsComplete = false;
     try {
@@ -2240,22 +2254,32 @@ export class CampaignOrchestrator {
         variant.id,
       );
       variant = this.database.updateVariant(variant.id, { status: mutate ? 'mutating' : 'gating' });
-      const parentPatch = variant.parentVariantId
-        ? this.database.getVariant(variant.parentVariantId).patchPath
+      const parentVariant = variant.parentVariantId
+        ? this.database.getVariant(variant.parentVariantId)
         : null;
+      const parentPatch = parentVariant?.patchPath ?? null;
+      let parentPatchHash = parentVariant?.patchHash ?? null;
+      if (parentVariant && parentPatch && !parentPatchHash) {
+        parentPatchHash = await sha256File(parentPatch);
+        this.database.updateVariant(parentVariant.id, { patchHash: parentPatchHash });
+        this.database.addEvent(campaign.id, parentVariant.id, 'variant.legacy_patch_bound', {
+          patchHash: parentPatchHash,
+        });
+      }
       const worktree = await prepareVariantWorktree(
         this.paths,
         campaign,
         variant,
         parentPatch,
+        parentPatchHash,
       );
       variant = this.database.updateVariant(variant.id, { worktreePath: worktree });
       if (mutate) {
+        mutationBaselineTree = await stageMutationBaseline(worktree);
         const parent = variant.parentVariantId
           ? this.database.getVariant(variant.parentVariantId)
           : null;
         if (!parent) throw new Error('mutation parent is unavailable');
-        let mutationContextPath: string;
         if (parent.diagnosisInputHash && parent.diagnosisStatus === 'completed') {
           const parentInput = await readDiagnosisInput(
             variantArtifactDirectory(this.paths, campaign.id, parent.id),
@@ -2293,6 +2317,7 @@ export class CampaignOrchestrator {
         } else {
           throw new Error('mutation parent has no completed diagnosis input');
         }
+        mutationContextSha256 = await sha256File(mutationContextPath);
         await new AgentRunner(campaign).mutate(
           variant,
           worktree,
@@ -2301,13 +2326,52 @@ export class CampaignOrchestrator {
         );
         variant = this.database.updateVariant(variant.id, { status: 'gating' });
       }
+      let mutationDiff: Awaited<ReturnType<typeof captureMutationDiff>> | null = null;
+      if (mutate) {
+        try {
+          mutationDiff = await captureMutationDiff(
+            campaign,
+            variant,
+            worktree,
+            artifactDirectory,
+            mutationBaselineTree!,
+          );
+        } catch (error) {
+          const message = errorMessage(error).slice(0, 20_000);
+          this.database.updateVariant(variant.id, {
+            hypothesisComplianceStatus: 'failed',
+            hypothesisComplianceError: message,
+          });
+          this.database.addEvent(campaign.id, variant.id, 'hypothesis_compliance.failed', {
+            mutationContextSha256,
+            error: message,
+          });
+          throw error;
+        }
+      }
       const { patchPath } = await captureAndGateDiff(
         campaign,
         variant,
         worktree,
         artifactDirectory,
       );
-      variant = this.database.updateVariant(variant.id, { patchPath });
+      const patchHash = await sha256File(patchPath);
+      variant = this.database.updateVariant(variant.id, { patchPath, patchHash });
+      if (mutate) {
+        if (!mutationContextPath) throw new Error('mutation context is unavailable for compliance');
+        if (!mutationContextSha256) throw new Error('mutation context hash is unavailable for compliance');
+        variant = await this.runHypothesisCompliance(
+          campaign,
+          variant,
+          worktree,
+          artifactDirectory,
+          mutationContextPath,
+          mutationDiff!.patchPath,
+          patchPath,
+          mutationContextSha256,
+          mutationBaselineTree!,
+        );
+      }
 
       const workflowsSource = await this.ensureFrozenWorkflowsSource(campaign);
       let targetConfig = this.database.getTargetExcludedConfig(campaign.id);
@@ -2849,6 +2913,233 @@ export class CampaignOrchestrator {
       await this.refreshReports(campaign.id);
     }
     return variant;
+  }
+
+  private async runHypothesisCompliance(
+    campaign: CampaignRecord,
+    variant: VariantRecord,
+    worktree: string,
+    artifactDirectory: string,
+    mutationContextPath: string,
+    treatmentPatchPath: string,
+    cumulativePatchPath: string,
+    expectedMutationContextSha256: string,
+    expectedIndexTree: string,
+    dependencies: {
+      assess?: AgentRunner['assessHypothesisCompliance'];
+      captureMutation?: typeof captureMutationDiff;
+      captureDiff?: typeof captureAndGateDiff;
+    } = {},
+  ): Promise<VariantRecord> {
+    const expectedResultSha256 = variant.hypothesisComplianceResultHash;
+    const expectedCandidatePatchSha256 = variant.hypothesisComplianceCandidatePatchHash;
+    const [
+      patchSha256,
+      cumulativePatchSha256,
+      mutationContextSha256,
+      treatmentDetails,
+    ] = await Promise.all([
+      sha256File(treatmentPatchPath),
+      sha256File(cumulativePatchPath),
+      sha256File(mutationContextPath),
+      stat(treatmentPatchPath),
+    ]);
+    this.database.updateVariant(variant.id, {
+      hypothesisComplianceStatus: 'running',
+      hypothesisCompliancePatchHash: patchSha256,
+      hypothesisComplianceCandidatePatchHash: cumulativePatchSha256,
+      hypothesisComplianceResultHash: null,
+      hypothesisCompliance: null,
+      hypothesisComplianceError: null,
+    });
+    this.database.addEvent(campaign.id, variant.id, 'hypothesis_compliance.running', {
+      patchSha256,
+      cumulativePatchSha256,
+      mutationContextSha256,
+    });
+    const failBeforeAssessment = (message: string): never => {
+      this.database.updateVariant(variant.id, {
+        hypothesisComplianceStatus: 'failed',
+        hypothesisCompliancePatchHash: patchSha256,
+        hypothesisComplianceCandidatePatchHash: cumulativePatchSha256,
+        hypothesisComplianceResultHash: null,
+        hypothesisCompliance: null,
+        hypothesisComplianceError: message,
+      });
+      this.database.addEvent(campaign.id, variant.id, 'hypothesis_compliance.failed', {
+        patchSha256,
+        cumulativePatchSha256,
+        mutationContextSha256,
+        error: message,
+      });
+      throw new Error(message);
+    };
+    if (mutationContextSha256 !== expectedMutationContextSha256) {
+      failBeforeAssessment('mutator modified the immutable mutation context');
+    }
+    const falsificationRequired = await mutationContextRequiresFalsification(
+      mutationContextPath,
+    ).catch((error) =>
+      failBeforeAssessment(`mutation context is invalid: ${errorMessage(error)}`),
+    );
+    if (treatmentDetails.size === 0) {
+      failBeforeAssessment('mutator produced no changes beyond the inherited parent');
+    }
+    if (
+      expectedResultSha256 &&
+      (variant.hypothesisCompliancePatchHash !== patchSha256 ||
+        expectedCandidatePatchSha256 !== cumulativePatchSha256 ||
+        variant.hypothesisCompliance?.mutationContextSha256 !== mutationContextSha256)
+    ) {
+      failBeforeAssessment('persisted hypothesis compliance result is stale for this mutation');
+    }
+    let assessmentPersisted = false;
+    try {
+      const runner = new AgentRunner(campaign);
+      const assess = dependencies.assess ?? runner.assessHypothesisCompliance.bind(runner);
+      const assessment = await assess(
+        variant,
+        treatmentPatchPath,
+        mutationContextPath,
+        artifactDirectory,
+        worktree,
+        expectedResultSha256,
+      );
+      const recapturedMutation = await (dependencies.captureMutation ?? captureMutationDiff)(
+        campaign,
+        variant,
+        worktree,
+        artifactDirectory,
+        expectedIndexTree,
+      );
+      const recaptured = await (dependencies.captureDiff ?? captureAndGateDiff)(
+        campaign,
+        variant,
+        worktree,
+        artifactDirectory,
+      );
+      if (
+        (await sha256File(recapturedMutation.patchPath)) !== patchSha256 ||
+        (await sha256File(recaptured.patchPath)) !== cumulativePatchSha256 ||
+        (await sha256File(mutationContextPath)) !== mutationContextSha256
+      ) {
+        throw new Error('hypothesis compliance reviewer modified its immutable inputs');
+      }
+      const resultSha256 = await sha256File(assessment.resultPath);
+      const verified = await verifyHypothesisComplianceResult(
+        assessment.resultPath,
+        variant.id,
+        patchSha256,
+        mutationContextSha256,
+        resultSha256,
+        falsificationRequired,
+      );
+      if (!isDeepStrictEqual(verified, assessment.result)) {
+        throw new Error('hypothesis compliance result differs from its immutable artifact');
+      }
+      const persisted = this.database.updateVariant(variant.id, {
+        hypothesisComplianceStatus: verified.status,
+        hypothesisCompliancePatchHash: patchSha256,
+        hypothesisComplianceCandidatePatchHash: cumulativePatchSha256,
+        hypothesisComplianceResultHash: resultSha256,
+        hypothesisCompliance: verified,
+        hypothesisComplianceError: null,
+      });
+      assessmentPersisted = true;
+      this.database.addEvent(
+        campaign.id,
+        variant.id,
+        `hypothesis_compliance.${verified.status}`,
+        {
+          patchSha256,
+          cumulativePatchSha256,
+          mutationContextSha256,
+          resultSha256,
+          intervention: verified.intervention.status,
+          falsificationTest: verified.falsificationTest.status,
+        },
+      );
+      if (verified.status === 'failed') {
+        throw new Error(`hypothesis compliance failed: ${verified.summary}`);
+      }
+      return persisted;
+    } catch (error) {
+      if (!assessmentPersisted) {
+        const message = errorMessage(error).slice(0, 20_000);
+        this.database.updateVariant(variant.id, {
+          hypothesisComplianceStatus: 'failed',
+          hypothesisCompliancePatchHash: patchSha256,
+          hypothesisComplianceCandidatePatchHash: cumulativePatchSha256,
+          hypothesisComplianceResultHash: null,
+          hypothesisCompliance: null,
+          hypothesisComplianceError: message,
+        });
+        this.database.addEvent(campaign.id, variant.id, 'hypothesis_compliance.failed', {
+          patchSha256,
+          cumulativePatchSha256,
+          mutationContextSha256,
+          error: message,
+        });
+      }
+      throw error;
+    }
+  }
+
+  private async verifyVariantHypothesisCompliance(
+    campaign: CampaignRecord,
+    variant: VariantRecord,
+    allowLegacyParent = false,
+  ): Promise<void> {
+    if (variant.round === 0) return;
+    if (allowLegacyParent && variant.hypothesisComplianceStatus === 'not_required') {
+      this.database.addEvent(campaign.id, variant.id, 'hypothesis_compliance.legacy_parent', {});
+      return;
+    }
+    if (
+      variant.hypothesisComplianceStatus !== 'passed' ||
+      !variant.hypothesisCompliance ||
+      !variant.hypothesisCompliancePatchHash ||
+      !variant.hypothesisComplianceCandidatePatchHash ||
+      !variant.hypothesisComplianceResultHash ||
+      !variant.patchPath ||
+      !variant.patchHash
+    ) {
+      throw new Error('variant has no completed hypothesis compliance preflight');
+    }
+    const artifactDirectory = variantArtifactDirectory(this.paths, campaign.id, variant.id);
+    const mutationPatchPath = path.join(artifactDirectory, 'mutation.patch');
+    const mutationContextPath = path.join(artifactDirectory, 'mutation-context.json');
+    const [patchSha256, candidatePatchSha256, mutationContextSha256, falsificationRequired] =
+      await Promise.all([
+        sha256File(mutationPatchPath),
+        sha256File(variant.patchPath),
+        sha256File(mutationContextPath),
+        mutationContextRequiresFalsification(mutationContextPath),
+      ]);
+    if (
+      patchSha256 !== variant.hypothesisCompliancePatchHash ||
+      candidatePatchSha256 !== variant.hypothesisComplianceCandidatePatchHash ||
+      candidatePatchSha256 !== variant.patchHash ||
+      mutationContextSha256 !== variant.hypothesisCompliance.mutationContextSha256
+    ) {
+      throw new Error('hypothesis compliance inputs are missing or stale');
+    }
+    const resultPath = hypothesisComplianceResultPath(
+      artifactDirectory,
+      patchSha256,
+      mutationContextSha256,
+    );
+    const verified = await verifyHypothesisComplianceResult(
+      resultPath,
+      variant.id,
+      patchSha256,
+      mutationContextSha256,
+      variant.hypothesisComplianceResultHash,
+      falsificationRequired,
+    );
+    if (verified.status !== 'passed' || !isDeepStrictEqual(verified, variant.hypothesisCompliance)) {
+      throw new Error('persisted hypothesis compliance differs from its immutable result artifact');
+    }
   }
 
   private async runBenchmark(
@@ -4204,6 +4495,7 @@ export class CampaignOrchestrator {
   private async requireCurrentParentDiagnosis(campaign: CampaignRecord): Promise<boolean> {
     if (!campaign.currentParentVariantId) throw new Error('campaign has no current parent variant');
     const parent = this.database.getVariant(campaign.currentParentVariantId);
+    await this.verifyVariantHypothesisCompliance(campaign, parent, true);
     let failure: string | null = null;
     if (
       parent.diagnosisStatus !== 'completed' ||

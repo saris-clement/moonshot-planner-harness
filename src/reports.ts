@@ -12,6 +12,7 @@ import type { HarnessPaths } from './paths.js';
 import { campaignReportDirectory } from './paths.js';
 import { compareCohort } from './metrics.js';
 import { readFrozenResearchContext } from './research.js';
+import { hypothesisComplianceResultPath } from './hypothesisCompliance.js';
 
 function markdown(value: string): string {
   return value.replaceAll('|', '\\|').replace(/[\r\n]+/g, ' ').trim();
@@ -204,6 +205,48 @@ function renderConclusion(
   return `Status: \`${variant.status === 'failed' ? 'failed' : 'measured'}\`\n\n${statements.join('\n\n')}`;
 }
 
+function renderHypothesisCompliance(variant: VariantRecord): string {
+  const result = variant.hypothesisCompliance;
+  if (!result) {
+    return `This preflight is a model-generated semantic review and is never measured or human-verified truth.
+
+Status: \`${variant.hypothesisComplianceStatus}\`
+
+${variant.hypothesisComplianceError ? quote(variant.hypothesisComplianceError) : 'No compliance result is available.'}`;
+  }
+  const renderCheck = (
+    name: string,
+    check: typeof result.intervention | typeof result.falsificationTest,
+  ) => `### ${name}
+
+Status: \`${check.status}\`
+
+${quote(check.rationale)}
+
+Evidence:
+${check.evidence.map((item) => `- ${markdown(item)}`).join('\n')}`;
+  return `This preflight is an unverified model judgment. It gates expensive execution but does not become measured output, numeric scoring truth, or human-verified evidence.
+
+Status: \`${variant.hypothesisComplianceStatus}\`
+
+Patch hash: \`${result.patchSha256}\`
+
+Cumulative candidate patch hash: ${variant.hypothesisComplianceCandidatePatchHash ? `\`${variant.hypothesisComplianceCandidatePatchHash}\`` : 'unavailable'}
+
+Mutation context hash: \`${result.mutationContextSha256}\`
+
+Result hash: ${variant.hypothesisComplianceResultHash ? `\`${variant.hypothesisComplianceResultHash}\`` : 'unavailable'}
+
+${quote(result.summary)}
+
+${renderCheck('Intervention', result.intervention)}
+
+${renderCheck('Falsification Test', result.falsificationTest)}
+
+Limitations:
+${result.limitations.map((item) => `- ${markdown(item)}`).join('\n')}`;
+}
+
 function renderEvidenceLedger(
   paths: HarnessPaths,
   campaign: CampaignRecord,
@@ -241,6 +284,24 @@ function renderEvidenceLedger(
       'model_inference',
       `${root}/diagnosis/diagnosis-result-${variant.diagnosisInputHash.slice(7)}.json`,
       variant.diagnosisStatus,
+    ]);
+  }
+  if (variant.hypothesisCompliance && variant.hypothesisComplianceResultHash) {
+    rows.push([
+      'Current treatment patch',
+      'observed_durable',
+      path.join(root, 'mutation.patch'),
+      variant.hypothesisCompliancePatchHash ?? 'unavailable',
+    ]);
+    rows.push([
+      'Hypothesis compliance preflight',
+      'model_inference',
+      hypothesisComplianceResultPath(
+        root,
+        variant.hypothesisCompliance.patchSha256,
+        variant.hypothesisCompliance.mutationContextSha256,
+      ),
+      variant.hypothesisComplianceStatus,
     ]);
   }
   if (targetExcluded) {
@@ -522,6 +583,10 @@ Expected impact: ${markdown(variant.hypothesis.expectedImpact)}
 
 Risk: ${markdown(variant.hypothesis.risk)}
 
+## Hypothesis Compliance Preflight
+
+${renderHypothesisCompliance(variant)}
+
 ## Provenance
 
 | Field | Value |
@@ -536,6 +601,7 @@ Risk: ${markdown(variant.hypothesis.risk)}
 | Environment | \`${campaign.environmentSha}\` |
 | Primary pack | \`${campaign.config.benchmarks.find((item) => item.role === 'primary')?.sha256 ?? 'unavailable'}\` |
 | Patch | ${variant.patchPath ? `\`${variant.patchPath}\`` : 'none'} |
+| Patch hash | ${variant.patchHash ? `\`${variant.patchHash}\`` : 'unavailable'} |
 | Image | ${variant.imageTag ? `\`${variant.imageTag}\`` : 'not built'} |
 | Artifact collection | ${variant.artifactCollectionComplete ? 'complete' : 'incomplete'} |
 
@@ -791,6 +857,7 @@ export async function writeAgentHistory(
       round: variant.round,
       hypothesis: variant.hypothesis,
       status: variant.status,
+      patchSha256: variant.patchHash,
       decisions: variant.facts?.decisions,
       evidence: variant.facts?.evidence,
       usage: variant.facts?.usage,
@@ -830,6 +897,19 @@ export async function writeAgentHistory(
             }),
           ) ?? [],
         error: variant.diagnosisError,
+      },
+      hypothesisCompliance: {
+        status: variant.hypothesisComplianceStatus,
+        patchSha256: variant.hypothesisCompliancePatchHash,
+        candidatePatchSha256: variant.hypothesisComplianceCandidatePatchHash,
+        mutationContextSha256: variant.hypothesisCompliance?.mutationContextSha256 ?? null,
+        resultSha256: variant.hypothesisComplianceResultHash,
+        interpretationStatus: variant.hypothesisCompliance?.interpretationStatus ?? null,
+        summary: variant.hypothesisCompliance?.summary ?? null,
+        intervention: variant.hypothesisCompliance?.intervention ?? null,
+        falsificationTest: variant.hypothesisCompliance?.falsificationTest ?? null,
+        limitations: variant.hypothesisCompliance?.limitations ?? [],
+        error: variant.hypothesisComplianceError,
       },
       holdouts: Object.fromEntries(
         Object.entries(variant.holdoutFacts ?? {}).map(([name, facts]) => [

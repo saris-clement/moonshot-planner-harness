@@ -5,6 +5,7 @@ import {
   DiagnosisFindingSchema,
   DiagnosisProvenanceSchema,
   HypothesisSchema,
+  HypothesisComplianceOutputSchema,
   TargetExcludedConfigSchema,
   type BenchmarkQuestionResolution,
   type QuestionResolutionEntry,
@@ -284,5 +285,45 @@ test('diagnosis and strategist handoff schemas are strict and provenance-explici
       risk: 'Variance.',
     }).findingIds,
     [],
+  );
+});
+
+test('hypothesis compliance passes only when intervention and falsification checks are satisfied', () => {
+  const output = {
+    kind: 'ainative-planner-eval/hypothesis-compliance' as const,
+    schemaVersion: 1 as const,
+    interpretationStatus: 'unverified_model_judgment' as const,
+    variantId: 'campaign-v001',
+    patchSha256: `sha256:${'a'.repeat(64)}`,
+    mutationContextSha256: `sha256:${'b'.repeat(64)}`,
+    status: 'passed' as const,
+    summary: 'The patch implements the bounded intervention and its regression test.',
+    intervention: {
+      status: 'satisfied' as const,
+      rationale: 'Runtime code changes the cited mechanism.',
+      evidence: ['server/src/policy.ts:12'],
+    },
+    falsificationTest: {
+      status: 'satisfied' as const,
+      rationale: 'The regression covers both admitted and rejected evidence.',
+      evidence: ['server/test/policy.test.ts:40'],
+    },
+    limitations: ['This is a model-generated semantic review, not verified truth.'],
+  };
+  assert.equal(HypothesisComplianceOutputSchema.parse(output).status, 'passed');
+  assert.equal(
+    HypothesisComplianceOutputSchema.safeParse({
+      ...output,
+      intervention: { ...output.intervention, status: 'uncertain' },
+    }).success,
+    false,
+  );
+  assert.equal(
+    HypothesisComplianceOutputSchema.safeParse({
+      ...output,
+      status: 'failed',
+      falsificationTest: { ...output.falsificationTest, status: 'not_satisfied' },
+    }).success,
+    true,
   );
 });

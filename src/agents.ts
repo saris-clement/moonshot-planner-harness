@@ -5,10 +5,12 @@ import {
   DiagnosisInputSchema,
   DiagnosisOutputSchema,
   HypothesisSchema,
+  HypothesisComplianceOutputSchema,
   JudgeOutputSchema,
   type CampaignRecord,
   type DiagnosisOutput,
   type Hypothesis,
+  type HypothesisComplianceOutput,
   type JudgeOutput,
   type RunFacts,
   type VariantRecord,
@@ -16,6 +18,11 @@ import {
 import { runCommand } from './process.js';
 import { sha256File } from './config.js';
 import { diagnosisResultPath, validateDiagnosisFindingReferences } from './diagnosis.js';
+import {
+  hypothesisComplianceResultPath,
+  mutationContextRequiresFalsification,
+  verifyHypothesisComplianceResult,
+} from './hypothesisCompliance.js';
 
 const StrategyOutputSchema = z
   .object({
@@ -184,6 +191,7 @@ Rules:
 - Add or update a regression test before fixing the behavior when feasible.
 - Do not edit the evaluation harness, campaign data, or experiment reports.
 - Do not commit, push, create branches, alter git configuration, or start Docker.
+- Do not stage changes or alter the Git index; the coordinator uses the staged parent state to isolate this mutation.
 - Do not run host tests; the coordinator runs trusted tests in a networkless builder container.
 - Leave all intended changes in the worktree when done.`;
     await writeFile(path.join(artifactDirectory, 'mutator-prompt.txt'), `${prompt}\n`);
@@ -196,6 +204,110 @@ Rules:
         logPath: path.join(artifactDirectory, 'mutator.jsonl'),
       },
     );
+  }
+
+  async assessHypothesisCompliance(
+    variant: VariantRecord,
+    patchPath: string,
+    mutationContextPath: string,
+    artifactDirectory: string,
+    contextDirectory: string,
+    expectedResultSha256: string | null = null,
+  ): Promise<{ result: HypothesisComplianceOutput; resultPath: string }> {
+    const [patchSha256, mutationContextSha256, falsificationRequired] = await Promise.all([
+      sha256File(patchPath),
+      sha256File(mutationContextPath),
+      mutationContextRequiresFalsification(mutationContextPath),
+    ]);
+    const resultPath = hypothesisComplianceResultPath(
+      artifactDirectory,
+      patchSha256,
+      mutationContextSha256,
+    );
+    if ((await stat(resultPath).catch(() => null))?.isFile()) {
+      if (!expectedResultSha256) {
+        throw new Error('hypothesis compliance result exists without a trusted persisted hash');
+      }
+      return {
+        result: await verifyHypothesisComplianceResult(
+          resultPath,
+          variant.id,
+          patchSha256,
+          mutationContextSha256,
+          expectedResultSha256,
+          falsificationRequired,
+        ),
+        resultPath,
+      };
+    }
+    if (expectedResultSha256) {
+      throw new Error('trusted persisted hypothesis compliance result is missing');
+    }
+    const prompt = `Act as a read-only hypothesis-compliance reviewer for a planner experiment.
+
+The attached mutation context contains the selected unverified diagnosis findings, proposed generic interventions, and falsification tests. The attached patch is the isolated current mutation relative to its inherited parent. The working directory contains the complete candidate planner source.
+
+Assess whether the concrete runtime change implements this hypothesis:
+${JSON.stringify(variant.hypothesis, null, 2)}
+
+Rules:
+- Inspect the current code contract and the patch itself. Do not accept invented fixture shapes, metadata, APIs, or behavior absent from source.
+- Do not accept a prompt-only change for a claim of deterministic runtime behavior or identical evidence replay. Judge the claimed mechanism, not the patch description.
+- Do not credit behavior inherited from the parent unless the isolated mutation patch changes it for this hypothesis.
+- The intervention passes only if executable code implements every cited generic intervention without customer, workflow, source-path, alias, capability-ID, requirement-text, or fixed-distribution heuristics.
+- The falsification check passes only if executable falsification regression coverage directly exercises every cited test, including its positive and negative boundary when stated. Use not_applicable only when the mutation context contains no falsification test.
+- Uncertain is fail-closed. This review is an unverified model judgment, not measured output or human-verified truth.
+- Do not modify files, the Git index, or HEAD.
+
+Return JSON only:
+{"kind":"ainative-planner-eval/hypothesis-compliance","schemaVersion":1,"interpretationStatus":"unverified_model_judgment","variantId":"${variant.id}","patchSha256":"${patchSha256}","mutationContextSha256":"${mutationContextSha256}","status":"passed|failed","summary":"...","intervention":{"status":"satisfied|not_satisfied|uncertain","rationale":"...","evidence":["path:line or exact patch fact"]},"falsificationTest":{"status":"satisfied|not_satisfied|uncertain|not_applicable","rationale":"...","evidence":["path:line or exact patch fact"]},"limitations":["This is an unverified model judgment."]}`;
+    const directory = path.join(artifactDirectory, 'hypothesis-compliance');
+    const promptPath = path.join(
+      directory,
+      `prompt-${patchSha256.slice(7)}-${mutationContextSha256.slice(7)}.txt`,
+    );
+    await writeImmutableText(promptPath, `${prompt}\n`);
+    const run = async (reviewPrompt: string, suffix = '') =>
+      await this.commandRunner(
+        this.campaign.config.agent.command,
+        this.argumentsFor(
+          reviewPrompt,
+          `${variant.id} hypothesis compliance${suffix ? ' repair' : ''}`,
+          [patchPath, mutationContextPath],
+          contextDirectory,
+        ),
+        {
+          cwd: contextDirectory,
+          timeoutMs: 900_000,
+          logPath: path.join(
+            directory,
+            `review-${patchSha256.slice(7)}-${mutationContextSha256.slice(7)}${suffix}.jsonl`,
+          ),
+        },
+      );
+    const initial = await run(prompt);
+    let result: HypothesisComplianceOutput;
+    try {
+      result = parseJsonResponse(initial.stdout, HypothesisComplianceOutputSchema);
+    } catch {
+      const repaired = await run(
+        `${prompt}\n\nYour previous response did not satisfy the required JSON contract. Return exactly one corrected JSON object with the bound variant and hashes. Do not narrate progress or tool use.`,
+        '-repair',
+      );
+      result = parseJsonResponse(repaired.stdout, HypothesisComplianceOutputSchema);
+    }
+    if (
+      result.variantId !== variant.id ||
+      result.patchSha256 !== patchSha256 ||
+      result.mutationContextSha256 !== mutationContextSha256
+    ) {
+      throw new Error('hypothesis compliance reviewer returned a result for another mutation');
+    }
+    if (falsificationRequired && result.falsificationTest.status === 'not_applicable') {
+      throw new Error('hypothesis compliance falsification check cannot be not_applicable');
+    }
+    await writeImmutableText(resultPath, `${JSON.stringify(result, null, 2)}\n`);
+    return { result, resultPath };
   }
 
   async diagnose(

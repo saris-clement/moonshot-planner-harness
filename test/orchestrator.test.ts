@@ -15,12 +15,13 @@ import {
   targetSafeJudgeOutput,
   withRuntimeQuestions,
 } from '../src/orchestrator.js';
-import type { HarnessPaths } from '../src/paths.js';
+import { variantArtifactDirectory, type HarnessPaths } from '../src/paths.js';
 import { resolveCampaignConfig } from '../src/config.js';
 import { runCommand } from '../src/process.js';
 import type { PlannerQuestionRecord } from '../src/plannerClient.js';
 import { canonicalHash, computeTargetExcludedGate } from '../src/metrics.js';
 import { summarizeTargetExcludedComparisonReport } from '../src/targetExcludedComparison.js';
+import { hypothesisComplianceResultPath } from '../src/hypothesisCompliance.js';
 import {
   CampaignConfigSchema,
   TargetExcludedAnswerInputSchema,
@@ -996,6 +997,319 @@ test('diagnosis failure preserves measured facts, score, artifact completeness, 
   } finally {
     database.close();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('hypothesis compliance preflight persists its patch-bound verdict and fails closed on rejection', async () => {
+  const fixture = await v2LifecycleFixture('hypothesis-compliance-preflight');
+  try {
+    const artifactDirectory = path.join(fixture.root, 'compliance-artifacts');
+    const treatmentPatchPath = path.join(artifactDirectory, 'mutation.patch');
+    const patchPath = path.join(artifactDirectory, 'variant.patch');
+    const mutationContextPath = path.join(artifactDirectory, 'mutation-context.json');
+    const patch = 'diff --git a/server/src/policy.ts b/server/src/policy.ts\n+export const policy = true;\n';
+    const mutationContext = '{"selectedFindings":[]}\n';
+    await mkdir(artifactDirectory, { recursive: true });
+    await Promise.all([
+      writeFile(treatmentPatchPath, patch),
+      writeFile(patchPath, patch),
+      writeFile(mutationContextPath, mutationContext),
+    ]);
+    const patchSha256 = `sha256:${createHash('sha256').update(patch).digest('hex')}`;
+    const mutationContextSha256 = `sha256:${createHash('sha256')
+      .update(mutationContext)
+      .digest('hex')}`;
+    const createCandidate = (suffix: string) =>
+      fixture.database.createVariant({
+        id: `${fixture.campaign.id}-${suffix}`,
+        campaignId: fixture.campaign.id,
+        parentVariantId: fixture.variant.id,
+        round: 1,
+        ordinal: Number.parseInt(suffix.slice(1), 10),
+        hypothesis: {
+          title: 'Bounded policy change',
+          rationale: 'Exercise semantic compliance before expensive execution.',
+          instructions: 'Change the runtime policy and add its falsification regression.',
+          expectedImpact: 'Reject mutations that do not test their stated mechanism.',
+          risk: 'The semantic reviewer remains model-generated.',
+          findingIds: [],
+          assumptions: ['The patch is the complete mutation.'],
+        },
+      });
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      runHypothesisCompliance: (
+        campaign: CampaignRecord,
+        variant: VariantRecord,
+        worktree: string,
+        artifactDirectory: string,
+        mutationContextPath: string,
+        treatmentPatchPath: string,
+        cumulativePatchPath: string,
+        expectedMutationContextSha256: string,
+        expectedIndexTree: string,
+        dependencies: {
+          assess: (
+            variant: VariantRecord,
+            patchPath: string,
+            mutationContextPath: string,
+            artifactDirectory: string,
+            contextDirectory: string,
+          ) => Promise<{ result: Record<string, unknown>; resultPath: string }>;
+          captureMutation: typeof import('../src/stack.js').captureMutationDiff;
+          captureDiff: typeof import('../src/stack.js').captureAndGateDiff;
+        },
+      ) => Promise<VariantRecord>;
+      verifyVariantHypothesisCompliance: (
+        campaign: CampaignRecord,
+        variant: VariantRecord,
+        allowLegacyParent?: boolean,
+      ) => Promise<void>;
+    };
+    const captureDiff: typeof import('../src/stack.js').captureAndGateDiff = async () => ({
+      patchPath,
+      result: { changedFiles: ['server/src/policy.ts'], addedLines: 1, removedLines: 0, forbiddenAdditions: [] },
+    });
+    const captureMutation: typeof import('../src/stack.js').captureMutationDiff = async () => ({
+      patchPath: treatmentPatchPath,
+      patch,
+      result: { changedFiles: ['server/src/policy.ts'], addedLines: 1, removedLines: 0 },
+    });
+    const assessment = async (variant: VariantRecord, status: 'passed' | 'failed') => {
+      const result = {
+        kind: 'ainative-planner-eval/hypothesis-compliance',
+        schemaVersion: 1,
+        interpretationStatus: 'unverified_model_judgment',
+        variantId: variant.id,
+        patchSha256,
+        mutationContextSha256,
+        status,
+        summary: status === 'passed' ? 'The mutation is aligned.' : 'The mutation misses its test.',
+        intervention: {
+          status: 'satisfied',
+          rationale: 'Runtime code changes the intended policy.',
+          evidence: ['server/src/policy.ts:1'],
+        },
+        falsificationTest: {
+          status: status === 'passed' ? 'not_applicable' : 'not_satisfied',
+          rationale: status === 'passed' ? 'No finding supplied a test.' : 'No regression was added.',
+          evidence: ['mutation-context.json:selectedFindings'],
+        },
+        limitations: ['This is an unverified model judgment.'],
+      };
+      const resultPath = hypothesisComplianceResultPath(
+        artifactDirectory,
+        patchSha256,
+        mutationContextSha256,
+      );
+      await mkdir(path.dirname(resultPath), { recursive: true });
+      await writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`);
+      return { result, resultPath };
+    };
+
+    const passing = createCandidate('v001');
+    const persisted = await internal.runHypothesisCompliance(
+      fixture.campaign,
+      passing,
+      fixture.root,
+      artifactDirectory,
+      mutationContextPath,
+      treatmentPatchPath,
+      patchPath,
+      mutationContextSha256,
+      'baseline-tree',
+      {
+        assess: async (variant) => await assessment(variant, 'passed'),
+        captureMutation,
+        captureDiff,
+      },
+    );
+    assert.equal(persisted.hypothesisComplianceStatus, 'passed');
+    assert.equal(persisted.hypothesisCompliance?.status, 'passed');
+    assert.equal(persisted.hypothesisCompliancePatchHash, patchSha256);
+    assert.equal(persisted.hypothesisComplianceCandidatePatchHash, patchSha256);
+    assert.ok(persisted.hypothesisComplianceResultHash);
+    const persistedWithPatch = fixture.database.updateVariant(persisted.id, {
+      patchPath,
+      patchHash: patchSha256,
+    });
+    const canonicalArtifacts = variantArtifactDirectory(
+      fixture.paths,
+      fixture.campaign.id,
+      persisted.id,
+    );
+    const canonicalResultPath = hypothesisComplianceResultPath(
+      canonicalArtifacts,
+      patchSha256,
+      mutationContextSha256,
+    );
+    await mkdir(path.dirname(canonicalResultPath), { recursive: true });
+    await Promise.all([
+      writeFile(path.join(canonicalArtifacts, 'mutation.patch'), patch),
+      writeFile(path.join(canonicalArtifacts, 'mutation-context.json'), mutationContext),
+      writeFile(
+        canonicalResultPath,
+        await readFile(
+          hypothesisComplianceResultPath(
+            artifactDirectory,
+            patchSha256,
+            mutationContextSha256,
+          ),
+        ),
+      ),
+    ]);
+    await internal.verifyVariantHypothesisCompliance(fixture.campaign, persistedWithPatch);
+    await writeFile(path.join(canonicalArtifacts, 'mutation.patch'), 'tampered treatment');
+    await assert.rejects(
+      internal.verifyVariantHypothesisCompliance(fixture.campaign, persistedWithPatch),
+      /inputs are missing or stale/,
+    );
+    await writeFile(path.join(canonicalArtifacts, 'mutation.patch'), patch);
+    await writeFile(canonicalResultPath, '{"tampered":true}\n');
+    await assert.rejects(
+      internal.verifyVariantHypothesisCompliance(fixture.campaign, persistedWithPatch),
+      /result hash does not match/,
+    );
+
+    const failing = createCandidate('v002');
+    await assert.rejects(
+      internal.runHypothesisCompliance(
+        fixture.campaign,
+        failing,
+        fixture.root,
+        artifactDirectory,
+        mutationContextPath,
+        treatmentPatchPath,
+        patchPath,
+        mutationContextSha256,
+        'baseline-tree',
+        {
+          assess: async (variant) => await assessment(variant, 'failed'),
+          captureMutation,
+          captureDiff,
+        },
+      ),
+      /hypothesis compliance failed: The mutation misses its test/,
+    );
+    const rejected = fixture.database.getVariant(failing.id);
+    assert.equal(rejected.hypothesisComplianceStatus, 'failed');
+    assert.equal(rejected.hypothesisCompliance?.falsificationTest.status, 'not_satisfied');
+    assert.equal(rejected.imageTag, null);
+    assert.equal(rejected.facts, null);
+
+    const tampered = createCandidate('v003');
+    await writeFile(patchPath, patch);
+    await assert.rejects(
+      internal.runHypothesisCompliance(
+        fixture.campaign,
+        tampered,
+        fixture.root,
+        artifactDirectory,
+        mutationContextPath,
+        treatmentPatchPath,
+        patchPath,
+        mutationContextSha256,
+        'baseline-tree',
+        {
+          assess: async (variant) => {
+            const result = await assessment(variant, 'passed');
+            await writeFile(patchPath, `${patch} reviewer mutation\n`);
+            return result;
+          },
+          captureMutation,
+          captureDiff,
+        },
+      ),
+      /reviewer modified its immutable inputs/,
+    );
+    assert.equal(
+      fixture.database.getVariant(tampered.id).hypothesisComplianceStatus,
+      'failed',
+    );
+
+    const noOp = createCandidate('v004');
+    const noOpPatchPath = path.join(artifactDirectory, 'empty-mutation.patch');
+    await Promise.all([writeFile(noOpPatchPath, ''), writeFile(patchPath, patch)]);
+    let assessedNoOp = false;
+    await assert.rejects(
+      internal.runHypothesisCompliance(
+        fixture.campaign,
+        noOp,
+        fixture.root,
+        artifactDirectory,
+        mutationContextPath,
+        noOpPatchPath,
+        patchPath,
+        mutationContextSha256,
+        'baseline-tree',
+        {
+          assess: async (variant) => {
+            assessedNoOp = true;
+            return await assessment(variant, 'failed');
+          },
+          captureMutation,
+          captureDiff,
+        },
+      ),
+      /mutator produced no changes beyond the inherited parent/,
+    );
+    assert.equal(assessedNoOp, false);
+    const noOpPersisted = fixture.database.getVariant(noOp.id);
+    assert.equal(noOpPersisted.hypothesisComplianceStatus, 'failed');
+    assert.match(noOpPersisted.hypothesisComplianceError ?? '', /no changes beyond/);
+    assert.match(noOpPersisted.hypothesisCompliancePatchHash ?? '', /^sha256:/);
+
+    const contextTampered = createCandidate('v005');
+    await Promise.all([
+      writeFile(treatmentPatchPath, patch),
+      writeFile(patchPath, patch),
+      writeFile(mutationContextPath, '{"selectedFindings":[{"id":"removed"}]}\n'),
+    ]);
+    let assessedTamperedContext = false;
+    await assert.rejects(
+      internal.runHypothesisCompliance(
+        fixture.campaign,
+        contextTampered,
+        fixture.root,
+        artifactDirectory,
+        mutationContextPath,
+        treatmentPatchPath,
+        patchPath,
+        mutationContextSha256,
+        'baseline-tree',
+        {
+          assess: async (variant) => {
+            assessedTamperedContext = true;
+            return await assessment(variant, 'failed');
+          },
+          captureMutation,
+          captureDiff,
+        },
+      ),
+      /mutator modified the immutable mutation context/,
+    );
+    assert.equal(assessedTamperedContext, false);
+    const legacyReviewed = fixture.database.updateVariant(createCandidate('v006').id, {
+      status: 'review',
+      hypothesisComplianceStatus: 'not_required',
+    });
+    await internal.verifyVariantHypothesisCompliance(
+      fixture.campaign,
+      legacyReviewed,
+      true,
+    );
+    await assert.rejects(
+      internal.verifyVariantHypothesisCompliance(fixture.campaign, legacyReviewed),
+      /no completed hypothesis compliance preflight/,
+    );
+    const events = fixture.database.listEvents(fixture.campaign.id);
+    assert.ok(events.some(({ type, variantId }) => type === 'hypothesis_compliance.passed' && variantId === passing.id));
+    assert.ok(events.some(({ type, variantId }) => type === 'hypothesis_compliance.failed' && variantId === failing.id));
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
   }
 });
 
