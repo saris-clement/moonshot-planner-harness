@@ -43,12 +43,14 @@ const campaign: CampaignRecord = {
 
 test('source-answer agent retries progress-only output with a JSON repair request', async () => {
   const calls: string[][] = [];
+  const environments: Array<NodeJS.ProcessEnv | undefined> = [];
   const outputs = [
     'I am tracing the source before answering.',
     '{"resolution":"answered","answer":"Use the shared format.","evidence":["src/shared.ts:1"]}',
   ];
-  const runner = new AgentRunner(campaign, async (command, args): Promise<CommandResult> => {
+  const runner = new AgentRunner(campaign, async (command, args, options): Promise<CommandResult> => {
     calls.push([...args]);
+    environments.push(options?.env);
     return {
       command,
       args: [...args],
@@ -61,11 +63,15 @@ test('source-answer agent retries progress-only output with a JSON repair reques
 
   const answer = await runner.answerUpstreamQuestion(
     { id: 'question-a', question: 'Which format?', type: 'free_text', options: [] },
-    '/tmp',
+    '/tmp/target-safe-source',
     '/tmp',
   );
 
   assert.equal(calls.length, 2);
+  assert.equal(environments[0]?.GIT_CEILING_DIRECTORIES, '/tmp');
+  assert.equal(environments[1]?.GIT_CEILING_DIRECTORIES, '/tmp');
+  assert.match(calls[0]!.join(' '), /current working directory as a hard source boundary/i);
+  assert.match(calls[0]!.join(' '), /Do not inspect parent, sibling, or external paths/i);
   assert.match(calls[0]!.join(' '), /Use only behavior and deployment facts proven by source/);
   assert.match(
     calls[0]!.join(' '),

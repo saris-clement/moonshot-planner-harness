@@ -442,6 +442,10 @@ ${JSON.stringify({ units: repairUnits })}`;
     artifactDirectory: string,
     options: { mode?: 'source-grounded' | 'pm-simulation' } = {},
   ): Promise<SourceQuestionAnswer> {
+    const sourceBoundaryEnvironment = {
+      ...process.env,
+      GIT_CEILING_DIRECTORIES: path.dirname(path.resolve(workflowsSource)),
+    };
     const prompt =
       options.mode === 'pm-simulation'
         ? `Answer one blocking requirements question for an evaluation run by simulating the product manager responsible for the frozen implementation.
@@ -462,7 +466,7 @@ or
 Question:
 ${JSON.stringify(input, null, 2)}
 
-Use only behavior and deployment facts proven by source. Keep the answer concise and directly usable as a requirements answer. Do not invent endpoint URLs, credentials, customer policy, or production configuration absent from source. If source proves the environment, access surface, and read/write boundary but leaves an exact endpoint or secret to deployment configuration, return answered with those proven facts and explicitly say the remaining value is deployment-provided. Return unresolved only when source cannot establish the implementation's operational behavior or a safe read/write boundary at all.
+Treat the current working directory as a hard source boundary. Do not inspect parent, sibling, or external paths. Use only behavior and deployment facts proven by source within that boundary. Keep the answer concise and directly usable as a requirements answer. Do not invent endpoint URLs, credentials, customer policy, or production configuration absent from source. If source proves the environment, access surface, and read/write boundary but leaves an exact endpoint or secret to deployment configuration, return answered with those proven facts and explicitly say the remaining value is deployment-provided. Return unresolved only when source cannot establish the implementation's operational behavior or a safe read/write boundary at all.
 
 Return JSON only:
 {"resolution":"answered","answer":"...","selectedOptionId":"only when selecting one supplied option","evidence":["path:line or exact source fact"]}
@@ -473,6 +477,7 @@ or
       this.argumentsFor(prompt, `${this.campaign.id} upstream source answer`, [], workflowsSource),
       {
         cwd: workflowsSource,
+        env: sourceBoundaryEnvironment,
         timeoutMs: 1_800_000,
         logPath: path.join(artifactDirectory, `source-answer-${input.id}.jsonl`),
       },
@@ -490,6 +495,7 @@ or
         ),
         {
           cwd: workflowsSource,
+          env: sourceBoundaryEnvironment,
           timeoutMs: 1_800_000,
           logPath: path.join(artifactDirectory, `source-answer-${input.id}-repair.jsonl`),
         },
