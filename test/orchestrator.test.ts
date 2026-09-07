@@ -1148,6 +1148,151 @@ test('V2 replicate options share target-safe answers without applying exclusion 
   }
 });
 
+test('V2 primary resolution uses full-source PM simulation while preserving excluded snapshot isolation', async () => {
+  const fixture = await v2LifecycleFixture('v2-pm-primary-resolution');
+  try {
+    const primary = fixture.campaign.config.benchmarks[0]!;
+    const fullSource = path.join(fixture.root, 'full-frozen-workflows');
+    const excludedSource = path.join(fixture.root, 'target-excluded-workflows');
+    await Promise.all([mkdir(fullSource), mkdir(excludedSource)]);
+    let snapshotEnsured = 0;
+    let resolverSource: string | null = null;
+    let resolverMode: string | null = null;
+    const summary: BenchmarkQuestionResolution = {
+      ...resolution('primary', `sha256:${'9'.repeat(64)}`),
+      sourceFallbackAnswers: 0,
+      pmSimulationAnswers: 1,
+      entries: [
+        {
+          id: 'pm-question',
+          question: 'Which behavior should requirements specify?',
+          resolution: 'pm_simulation',
+          answer: 'Specify the observed account workflow behavior without naming its implementation.',
+          evidence: ['src/customers/trumark/deceased-accounts/index.ts:42'],
+        },
+      ],
+    };
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      ensureTargetExcludedWorkflowsSource: () => Promise<string>;
+      ensureFrozenWorkflowsSource: () => Promise<string>;
+      resolveV2PrimaryBenchmark: (
+        campaign: CampaignRecord,
+        benchmark: Benchmark,
+        targetWorkflow: string,
+        artifactDirectory: string,
+        dependencies: {
+          resolveBenchmarkQuestions: (input: {
+            benchmark: Benchmark;
+            workflowsSource: string;
+            sourceAnswerMode?: string;
+            answerAllowed?: (candidate: {
+              answer: string;
+              evidence: string[];
+              resolution: 'pm_simulation';
+            }) => boolean;
+          }) => Promise<{ benchmark: Benchmark; summary: BenchmarkQuestionResolution }>;
+        },
+      ) => Promise<{ benchmark: Benchmark; summary: BenchmarkQuestionResolution }>;
+      runBaseline: (campaignId: string) => Promise<VariantRecord>;
+      hasCompleteEvaluationArtifacts: () => Promise<boolean>;
+      recoverEvaluation: (campaign: CampaignRecord, variant: VariantRecord) => Promise<VariantRecord>;
+      prepareAutomaticV2Config: () => Promise<TargetExcludedConfig>;
+      persistAutomaticV2Config: (
+        campaign: CampaignRecord,
+        config: TargetExcludedConfig,
+      ) => Promise<TargetExcludedConfig>;
+      targetExcludedEvaluationReady: () => boolean;
+      finalizeBaseline: (campaignId: string, variant: VariantRecord) => Promise<VariantRecord>;
+      runVariant: () => Promise<VariantRecord>;
+      refreshReports: () => Promise<void>;
+    };
+    internal.ensureTargetExcludedWorkflowsSource = async () => {
+      snapshotEnsured += 1;
+      return excludedSource;
+    };
+    internal.ensureFrozenWorkflowsSource = async () => fullSource;
+    const resolved = await internal.resolveV2PrimaryBenchmark(
+      fixture.campaign,
+      primary,
+      fixture.targetConfig.targetImplementationWorkflow,
+      path.join(fixture.root, 'pack-questions'),
+      {
+        resolveBenchmarkQuestions: async (input) => {
+          resolverSource = input.workflowsSource;
+          resolverMode = input.sourceAnswerMode ?? null;
+          assert.equal(
+            input.answerAllowed?.({
+              answer: 'Specify the observed behavior.',
+              evidence: ['src/customers/trumark/deceased-accounts/index.ts:42'],
+              resolution: 'pm_simulation',
+            }),
+            true,
+          );
+          assert.equal(
+            input.answerAllowed?.({
+              answer: 'Use src/customers/trumark/deceased-accounts/index.ts directly.',
+              evidence: ['harness-only PM rationale'],
+              resolution: 'pm_simulation',
+            }),
+            false,
+          );
+          return {
+            benchmark: {
+              ...input.benchmark,
+              zipPath: path.join(fixture.root, 'resolved-primary.zip'),
+              sha256: summary.resolvedArtifactSha,
+            },
+            summary,
+          };
+        },
+      },
+    );
+
+    assert.equal(snapshotEnsured, 1);
+    assert.equal(resolverSource, fullSource);
+    assert.equal(resolverMode, 'pm-simulation');
+    assert.deepEqual(resolved.summary.entries[0]?.evidence, [
+      'src/customers/trumark/deceased-accounts/index.ts:42',
+    ]);
+    assert.equal(resolved.benchmark.zipPath, path.join(fixture.root, 'resolved-primary.zip'));
+
+    fixture.database.updateVariant(fixture.variant.id, {
+      status: 'failed',
+      questionResolutions: {
+        ...fixture.variant.questionResolutions,
+        primary: resolved.summary,
+      },
+    });
+    internal.hasCompleteEvaluationArtifacts = async () => true;
+    internal.recoverEvaluation = async (_campaign, variant) =>
+      fixture.database.updateVariant(variant.id, { status: 'review', error: null });
+    internal.prepareAutomaticV2Config = async () => fixture.targetConfig;
+    internal.persistAutomaticV2Config = async (_campaign, config) => {
+      if (!fixture.database.getTargetExcludedConfig(fixture.campaign.id)) {
+        fixture.database.createTargetExcludedConfig(fixture.campaign.id, config);
+      }
+      return config;
+    };
+    internal.targetExcludedEvaluationReady = () => true;
+    internal.finalizeBaseline = async (_campaignId, variant) =>
+      fixture.database.updateVariant(variant.id, { status: 'completed' });
+    internal.runVariant = async () => {
+      throw new Error('created a replacement after successful PM resolution');
+    };
+    internal.refreshReports = async () => undefined;
+
+    const recovered = await internal.runBaseline(fixture.campaign.id);
+    assert.equal(recovered.id, fixture.variant.id);
+    assert.equal(fixture.database.listVariants(fixture.campaign.id).length, 1);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 const baselineHypothesisForTest = {
   title: 'Seed',
   rationale: 'Observe the seed.',

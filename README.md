@@ -99,7 +99,7 @@ Decision counts are observations, not fitness.
 
 The blind judge sees the exact frozen workflows checkout and the selected run facts. It does not receive the candidate hypothesis or planner patch.
 
-Blocking requirements questions are resolved once per campaign before evaluation. The harness calls the configured online requirements-agent first. If it raises or cannot answer, a separate GPT-5.6 Sol session inspects the frozen workflows source. For V2, primary answers are derived only from the target-filtered source and the exact resulting ZIP is used by both normal and excluded cases. The resulting original/resolved hashes, question text, answer, evidence, and per-experiment request/reuse counts are persisted and shown in Markdown.
+Blocking requirements questions are resolved once per campaign before evaluation. The harness calls the configured online requirements-agent first. For V2, if requirements-agent raises or cannot answer, a PM-simulation session may privately inspect the full frozen implementation and return a concise product or operational decision. Only that brief answer and PM-simulation provenance enter the shared requirements pack; source citations remain harness-only audit evidence. The answer is rejected if it exposes the target identity, path, symbols, capability IDs, or implementation narration. Normal and excluded cases then use the exact same resolved ZIP. Original/resolved hashes, question text, answer, evidence, and per-experiment request/reuse counts are persisted and shown in Markdown.
 
 ## Data Layout
 

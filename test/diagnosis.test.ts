@@ -943,6 +943,32 @@ test('standard-primary-v2 diagnosis reuses standard lineage and filters target s
       holdoutReplicateFacts: null,
       excludedFacts,
       excludedReplicateFacts: excludedReplicates,
+      questionResolution: {
+        derivationVersion: 2,
+        benchmark: 'primary-pack',
+        originalArtifactSha: `sha256:${'5'.repeat(64)}`,
+        resolvedArtifactSha,
+        blockingQuestions: 1,
+        requirementsAgentRequests: 0,
+        requirementsAgentAnswers: 0,
+        sourceFallbackAnswers: 0,
+        pmSimulationAnswers: 1,
+        reusedAnswers: 0,
+        plannerQuestions: 0,
+        plannerRequirementsAgentRequests: 0,
+        plannerRequirementsAgentAnswers: 0,
+        plannerSourceFallbackAnswers: 0,
+        plannerReusedAnswers: 0,
+        entries: [
+          {
+            id: 'question-pm-simulation',
+            question: 'Which behavior should the pack assume?',
+            resolution: 'pm_simulation',
+            answer: 'Assume the account remains queryable.',
+            evidence: ['Synthetic PM simulation; not human-reviewed.'],
+          },
+        ],
+      },
       executionState: {
         executions: excludedReplicates.map((runFacts, index) => ({
           benchmark: 'primary-pack:excluded',
@@ -1014,6 +1040,13 @@ test('standard-primary-v2 diagnosis reuses standard lineage and filters target s
     assert.match(bindingEvidence[0]?.summary ?? '', /reused as the comparison normal arm/);
     const summary = assembled.input.evidence.find(
       ({ kind }) => kind === 'target_excluded_summary',
+    );
+    assert.match(summary?.summary ?? '', /unverified PM-simulation answer/);
+    assert.equal(summary?.provenance.source, 'harness');
+    assert.notEqual(summary?.provenance.source, 'human_label');
+    assert.match(
+      JSON.stringify((summary?.data as Record<string, unknown>).questionResolution),
+      /"resolution":"pm_simulation"/,
     );
     assert.equal(
       Object.hasOwn(summary?.data as object, 'controlDecisions'),

@@ -669,7 +669,12 @@ export interface Score {
 export interface QuestionResolutionEntry {
   id: string;
   question: string;
-  resolution: 'requirements_agent' | 'source_fallback' | 'reused_source_answer' | 'human_answer';
+  resolution:
+    | 'requirements_agent'
+    | 'source_fallback'
+    | 'pm_simulation'
+    | 'reused_source_answer'
+    | 'human_answer';
   answer: string;
   selectedOptionId?: string;
   evidence: string[];
@@ -685,6 +690,7 @@ export interface BenchmarkQuestionResolution {
   requirementsAgentRequests: number;
   requirementsAgentAnswers: number;
   sourceFallbackAnswers: number;
+  pmSimulationAnswers?: number;
   reusedAnswers: number;
   plannerQuestions: number;
   plannerRequirementsAgentRequests: number;

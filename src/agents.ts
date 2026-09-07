@@ -440,8 +440,24 @@ ${JSON.stringify({ units: repairUnits })}`;
     },
     workflowsSource: string,
     artifactDirectory: string,
+    options: { mode?: 'source-grounded' | 'pm-simulation' } = {},
   ): Promise<SourceQuestionAnswer> {
-    const prompt = `Answer one blocking requirements question for an evaluation run by inspecting the exact frozen workflows source.
+    const prompt =
+      options.mode === 'pm-simulation'
+        ? `Answer one blocking requirements question for an evaluation run by simulating the product manager responsible for the frozen implementation.
+
+Question:
+${JSON.stringify(input, null, 2)}
+
+Inspect the full frozen implementation as private context. Act like a real PM supplying the intended product or operational decision, informed by what the product actually implements and operates. Return a concise human answer with a maximum of 3 sentences. If no defensible intended decision can be determined, return unresolved.
+
+The answer is planner-visible. Do not put source paths, symbols, capability IDs, workflow identity, or implementation narration in the answer. The evidence field remains required and may cite exact source paths for harness-only audit. Evidence is never planner-visible.
+
+Return JSON only:
+{"resolution":"answered","answer":"...","selectedOptionId":"only when selecting one supplied option","evidence":["path:line or exact source fact"]}
+or
+{"resolution":"unresolved","reason":"...","evidence":["path:line or exact source fact"]}`
+        : `Answer one blocking requirements question for an evaluation run by inspecting the exact frozen workflows source.
 
 Question:
 ${JSON.stringify(input, null, 2)}

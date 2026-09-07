@@ -6,6 +6,8 @@ import {
   DiagnosisProvenanceSchema,
   HypothesisSchema,
   TargetExcludedConfigSchema,
+  type BenchmarkQuestionResolution,
+  type QuestionResolutionEntry,
   type TargetExcludedComparison,
   TargetNormalArmBindingSchema,
 } from '../src/types.js';
@@ -187,6 +189,36 @@ test('persisted target-excluded comparisons permit absent legacy case and run ID
   assert.equal(comparison.excludedCaseId, null);
   assert.equal(comparison.normalRunId, null);
   assert.equal(comparison.excludedRunId, null);
+});
+
+test('question resolution types represent PM simulation while legacy summaries omit its counter', () => {
+  const entry: QuestionResolutionEntry = {
+    id: 'question-pm',
+    question: 'Which policy should apply?',
+    resolution: 'pm_simulation',
+    answer: 'Use the reviewed default policy.',
+    evidence: ['PM simulation based on the supplied requirements context.'],
+  };
+  const legacySummary: BenchmarkQuestionResolution = {
+    derivationVersion: 2,
+    benchmark: 'legacy-pack',
+    originalArtifactSha: `sha256:${'a'.repeat(64)}`,
+    resolvedArtifactSha: `sha256:${'b'.repeat(64)}`,
+    blockingQuestions: 1,
+    requirementsAgentRequests: 1,
+    requirementsAgentAnswers: 0,
+    sourceFallbackAnswers: 1,
+    reusedAnswers: 0,
+    plannerQuestions: 0,
+    plannerRequirementsAgentRequests: 0,
+    plannerRequirementsAgentAnswers: 0,
+    plannerSourceFallbackAnswers: 0,
+    plannerReusedAnswers: 0,
+    entries: [],
+  };
+
+  assert.equal(entry.resolution, 'pm_simulation');
+  assert.equal(legacySummary.pmSimulationAnswers ?? 0, 0);
 });
 
 test('diagnosis and strategist handoff schemas are strict and provenance-explicit', () => {

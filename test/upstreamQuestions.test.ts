@@ -396,6 +396,183 @@ test('source fallback materializes and reuses its grounded second option', async
   }
 });
 
+test('PM simulation materializes concise answers while keeping evidence in harness artifacts', async () => {
+  const fixture = await sourceSelectionFixture();
+  let sourceCalls = 0;
+  let receivedMode: string | undefined;
+  let allowedResolution: string | undefined;
+  const input = {
+    campaign: fixture.campaign,
+    benchmark: fixture.benchmark,
+    workflowsSource: fixture.root,
+    sharedDirectory: fixture.sharedDirectory,
+    artifactDirectory: fixture.artifactDirectory,
+    sourceAnswerMode: 'pm-simulation' as const,
+    answerAllowed: (candidate: { resolution: string }) => {
+      allowedResolution = candidate.resolution;
+      return true;
+    },
+    agent: {
+      answerUpstreamQuestion: async (
+        _question: unknown,
+        _workflowsSource: string,
+        _artifactDirectory: string,
+        options?: { mode?: 'source-grounded' | 'pm-simulation' },
+      ) => {
+        sourceCalls += 1;
+        receivedMode = options?.mode;
+        return {
+          resolution: 'answered' as const,
+          answer: 'Use the second integration as the planning assumption.',
+          selectedOptionId: 'option-second',
+          evidence: ['PM simulation inferred this choice from the requirements context.'],
+        };
+      },
+    },
+  };
+  try {
+    const first = await resolveBenchmarkQuestions(input);
+    assert.equal(receivedMode, 'pm-simulation');
+    assert.equal(allowedResolution, 'pm_simulation');
+    assert.equal(first.summary.pmSimulationAnswers, 1);
+    assert.equal(first.summary.sourceFallbackAnswers, 0);
+    assert.equal(first.summary.entries[0]?.resolution, 'pm_simulation');
+    assert.deepEqual(first.summary.entries[0]?.evidence, [
+      'PM simulation inferred this choice from the requirements context.',
+    ]);
+
+    const files = unzipSync(new Uint8Array(await readFile(first.benchmark.zipPath)));
+    const question = parse(
+      strFromU8(files['questions/question-source-selection.yaml']!),
+    ) as typeof fixture.question & {
+      answer: { selected: string[]; value: string; by: string; evidence?: unknown };
+    };
+    assert.equal(question.answer.by, 'planner-eval-harness/pm_simulation');
+    assert.deepEqual(question.answer.selected, ['option-second']);
+    assert.equal(question.answer.evidence, undefined);
+    assert.equal(
+      strFromU8(files['questions/question-source-selection.yaml']!).includes(
+        'PM simulation inferred this choice',
+      ),
+      false,
+    );
+    const artifactSummary = JSON.parse(
+      await readFile(path.join(fixture.artifactDirectory, 'question-resolutions.json'), 'utf8'),
+    ) as BenchmarkQuestionResolution;
+    assert.deepEqual(artifactSummary.entries[0]?.evidence, first.summary.entries[0]?.evidence);
+
+    const reused = await resolveBenchmarkQuestions(input);
+    assert.equal(reused.summary.pmSimulationAnswers, 1);
+    assert.equal(reused.summary.reusedAnswers, 1);
+    assert.equal(reused.summary.entries[0]?.resolution, 'pm_simulation');
+    assert.equal(sourceCalls, 1);
+    await assert.rejects(
+      resolveBenchmarkQuestions({ ...input, sourceAnswerMode: 'source-grounded' }),
+      /resolved pack cache provenance mode mismatch for primary: source-grounded/,
+    );
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('PM simulation rejects answers beyond its planner-visible concision limits', async () => {
+  const fixture = await sourceSelectionFixture();
+  let answer = '   ';
+  const resolve = () =>
+    resolveBenchmarkQuestions({
+      campaign: fixture.campaign,
+      benchmark: fixture.benchmark,
+      workflowsSource: fixture.root,
+      sharedDirectory: fixture.sharedDirectory,
+      artifactDirectory: fixture.artifactDirectory,
+      sourceAnswerMode: 'pm-simulation',
+      agent: {
+        answerUpstreamQuestion: async () => ({
+          resolution: 'answered',
+          answer,
+          evidence: ['Harness-only PM simulation rationale.'],
+        }),
+      },
+    });
+  try {
+    await assert.rejects(resolve(), /PM-simulation answer.*must be nonempty/);
+    answer = 'One sentence. Two sentences. Three sentences. Four sentences.';
+    await assert.rejects(resolve(), /PM-simulation answer.*at most 3 sentences/);
+    answer = 'x'.repeat(1_001);
+    await assert.rejects(resolve(), /PM-simulation answer.*at most 1000 characters/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('legacy cached summaries reuse with a zero PM simulation count', async () => {
+  const fixture = await cachedAnsweredResolutionFixture();
+  try {
+    const legacySummary = { ...fixture.summary };
+    delete legacySummary.pmSimulationAnswers;
+    await writeFile(fixture.sharedSummaryPath, `${JSON.stringify(legacySummary, null, 2)}\n`);
+
+    const reused = await resolveBenchmarkQuestions({
+      campaign: fixture.campaign,
+      benchmark: fixture.benchmark,
+      workflowsSource: fixture.root,
+      sharedDirectory: fixture.sharedDirectory,
+      artifactDirectory: fixture.artifactDirectory,
+    });
+
+    assert.equal(reused.summary.pmSimulationAnswers, 0);
+    assert.equal(reused.summary.reusedAnswers, 1);
+    assert.equal(reused.summary.entries[0]?.resolution, 'source_fallback');
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('PM simulation cache rejects jointly rehashed provenance substitution', async () => {
+  const fixture = await sourceSelectionFixture();
+  const input = {
+    campaign: fixture.campaign,
+    benchmark: fixture.benchmark,
+    workflowsSource: fixture.root,
+    sharedDirectory: fixture.sharedDirectory,
+    artifactDirectory: fixture.artifactDirectory,
+    sourceAnswerMode: 'pm-simulation' as const,
+    agent: {
+      answerUpstreamQuestion: async () => ({
+        resolution: 'answered' as const,
+        answer: 'Use the second integration as the planning assumption.',
+        selectedOptionId: 'option-second',
+        evidence: ['Harness-only PM simulation rationale.'],
+      }),
+    },
+  };
+  try {
+    const first = await resolveBenchmarkQuestions(input);
+    const files = unzipSync(new Uint8Array(await readFile(first.benchmark.zipPath)));
+    const question = parse(
+      strFromU8(files['questions/question-source-selection.yaml']!),
+    ) as typeof fixture.question & { answer: { by: string } };
+    question.answer.by = 'planner-eval-harness/source_fallback';
+    files['questions/question-source-selection.yaml'] = strToU8(stringify(question));
+    const tamperedBytes = zipSync(files);
+    const persisted = JSON.parse(
+      await readFile(fixture.sharedSummaryPath, 'utf8'),
+    ) as BenchmarkQuestionResolution;
+    persisted.resolvedArtifactSha = sha256(tamperedBytes);
+    await Promise.all([
+      writeFile(fixture.sharedPackPath, tamperedBytes),
+      writeFile(fixture.sharedSummaryPath, `${JSON.stringify(persisted, null, 2)}\n`),
+    ]);
+
+    await assert.rejects(
+      resolveBenchmarkQuestions(input),
+      /resolved pack cache content mismatch for primary: provenance for question-source-selection/,
+    );
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test('source fallback rejects a selected option ID absent from the question', async () => {
   const fixture = await sourceSelectionFixture();
   try {

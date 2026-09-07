@@ -617,6 +617,7 @@ ${
 | Requirements-agent requests | ${resolution.requirementsAgentRequests} |
 | Requirements-agent answers | ${resolution.requirementsAgentAnswers} |
 | Source fallback answers | ${resolution.sourceFallbackAnswers} |
+| PM-simulation answers | ${resolution.pmSimulationAnswers ?? 0} |
 | Reused campaign answers | ${resolution.reusedAnswers} |
 | Planner questions | ${resolution.plannerQuestions} |
 | Planner requirements-agent requests | ${resolution.plannerRequirementsAgentRequests} |
@@ -634,7 +635,7 @@ ${
 
 Resolution: \`${entry.resolution}\`
 
-Question:
+${entry.resolution === 'pm_simulation' ? 'Authority: `unverified_pm_simulation`\n\nThis answer is simulated PM input, not human-verified authority.\n\n' : ''}Question:
 ${quote(entry.question)}
 
 Answer:

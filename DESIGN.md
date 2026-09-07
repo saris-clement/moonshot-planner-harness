@@ -129,8 +129,10 @@ holdout, and excluded artifacts. Missing protocol discriminators always parse as
 rows and sidecars are never rewritten.
 
 New `standard-primary-v2` campaigns freeze the target workflow at campaign creation. The primary
-pack is resolved once using the physically target-filtered source, and its measured ZIP SHA is bound
-to the runtime target configuration. Standard primary and excluded cases use those exact bytes;
+pack is resolved once through requirements-agent or a PM-simulation fallback. PM simulation may
+inspect the full frozen implementation as private decision context, but only its concise answer and
+provenance enter the pack; source citations remain harness-only. The measured ZIP SHA is bound to
+the runtime target configuration. Standard primary and excluded cases use those exact bytes;
 standard primary is the comparison normal arm and is never copied into a second control measurement.
 One normal-arm binding records the two standard case/run identities, and each comparison receipt binds
 those cases to the corresponding excluded cases and hash-verified report.

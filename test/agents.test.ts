@@ -66,8 +66,58 @@ test('source-answer agent retries progress-only output with a JSON repair reques
   );
 
   assert.equal(calls.length, 2);
+  assert.match(calls[0]!.join(' '), /Use only behavior and deployment facts proven by source/);
+  assert.match(
+    calls[0]!.join(' '),
+    /Return unresolved only when source cannot establish the implementation's operational behavior or a safe read\/write boundary at all/,
+  );
   assert.match(calls[1]!.join(' '), /previous response was not valid JSON/);
   assert.equal(answer.resolution, 'answered');
+});
+
+test('pm-simulation source-answer prompt keeps implementation private and evidence harness-only', async () => {
+  const calls: string[][] = [];
+  const runner = new AgentRunner(campaign, async (command, args): Promise<CommandResult> => {
+    calls.push([...args]);
+    return {
+      command,
+      args: [...args],
+      exitCode: 0,
+      stdout: JSON.stringify({
+        resolution: 'answered',
+        answer: 'Use the managed operating model.',
+        evidence: ['src/operations.ts:42'],
+      }),
+      stderr: '',
+      durationMs: 1,
+    };
+  });
+
+  const answer = await runner.answerUpstreamQuestion(
+    { id: 'question-pm', question: 'Which operating model?', type: 'free_text', options: [] },
+    '/tmp',
+    '/tmp',
+    { mode: 'pm-simulation' },
+  );
+
+  const prompt = calls[0]!.join(' ');
+  assert.equal(answer.resolution, 'answered');
+  assert.match(prompt, /full frozen implementation as private context/i);
+  assert.match(prompt, /act like a real PM/i);
+  assert.match(prompt, /intended product or operational decision/i);
+  assert.match(prompt, /concise human answer/i);
+  assert.match(prompt, /maximum of 3 sentences|max 3 sentences/i);
+  assert.match(prompt, /source paths/i);
+  assert.match(prompt, /symbols/i);
+  assert.match(prompt, /capability IDs/i);
+  assert.match(prompt, /workflow identity/i);
+  assert.match(prompt, /implementation narration/i);
+  assert.match(prompt, /evidence.*required/i);
+  assert.match(prompt, /exact source paths/i);
+  assert.match(prompt, /harness-only audit/i);
+  assert.match(prompt, /evidence.*never planner-visible/i);
+  assert.match(prompt, /"resolution":"answered"/);
+  assert.match(prompt, /"resolution":"unresolved"/);
 });
 
 test('strategist prompt and schema require current diagnosis finding citations', async () => {

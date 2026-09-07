@@ -411,6 +411,123 @@ test('experiment Markdown records the planned change, evidence-backed conclusion
   }
 });
 
+test('reports count PM-simulation answers and preserve their unverified provenance in history', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'planner-reports-pm-simulation-'));
+  const paths: HarnessPaths = {
+    root,
+    database: path.join(root, 'harness.sqlite'),
+    campaigns: path.join(root, 'campaigns'),
+    worktrees: path.join(root, 'worktrees'),
+    artifacts: path.join(root, 'artifacts'),
+    reports: path.join(root, 'reports'),
+  };
+  await Promise.all([mkdir(paths.reports), mkdir(paths.campaigns)]);
+  const database = new HarnessDatabase(paths.database);
+  try {
+    const config = CampaignConfigSchema.parse({
+      id: 'report-pm-simulation',
+      goal: 'Keep synthetic PM answers distinct from human-verified planning authority.',
+      plannerRepo: root,
+      workflowsRepo: root,
+      environmentFile: path.join(root, 'environment.env'),
+      seedRevision: 'seed',
+      workflowsRevision: 'workflows',
+      benchmarks: [
+        { name: 'primary-pack', role: 'primary', zipPath: path.join(root, 'primary.zip') },
+        { name: 'holdout-pack', role: 'holdout', zipPath: path.join(root, 'holdout.zip') },
+      ],
+    });
+    const campaign = database.createCampaign(
+      config,
+      'a'.repeat(40),
+      'b'.repeat(40),
+      `sha256:${'c'.repeat(64)}`,
+      'https://example.invalid/workflows.git',
+    );
+    const baseResolution = {
+      derivationVersion: 2 as const,
+      originalArtifactSha: `sha256:${'d'.repeat(64)}`,
+      resolvedArtifactSha: `sha256:${'e'.repeat(64)}`,
+      blockingQuestions: 1,
+      requirementsAgentRequests: 0,
+      requirementsAgentAnswers: 0,
+      sourceFallbackAnswers: 0,
+      reusedAnswers: 0,
+      plannerQuestions: 0,
+      plannerRequirementsAgentRequests: 0,
+      plannerRequirementsAgentAnswers: 0,
+      plannerSourceFallbackAnswers: 0,
+      plannerReusedAnswers: 0,
+    };
+    const pmEntry = {
+      id: 'question-pm-simulation',
+      question: 'Which behavior should this requirement assume?',
+      resolution: 'pm_simulation' as const,
+      answer: 'Assume the user confirms the proposed behavior.',
+      evidence: ['Synthetic PM simulation; not human-reviewed.'],
+    };
+    const variant = database.updateVariant(
+      database.createVariant({
+        id: 'report-pm-simulation-v000',
+        campaignId: campaign.id,
+        parentVariantId: null,
+        round: 0,
+        ordinal: 0,
+        hypothesis: {
+          title: 'Seed',
+          rationale: 'Observe.',
+          instructions: 'Do not edit.',
+          expectedImpact: 'Facts.',
+          risk: 'Variance.',
+          findingIds: [],
+        },
+      }).id,
+      {
+        status: 'review',
+        facts: runFacts,
+        replicateFacts: [runFacts],
+        artifactCollectionComplete: true,
+        questionResolutions: {
+          'primary-pack': {
+            ...baseResolution,
+            benchmark: 'primary-pack',
+            pmSimulationAnswers: 1,
+            entries: [pmEntry],
+          },
+          'holdout-pack': {
+            ...baseResolution,
+            benchmark: 'holdout-pack',
+            entries: [],
+          },
+        },
+      },
+    );
+
+    const report = await readFile(
+      await writeVariantReport(paths, campaign, variant, []),
+      'utf8',
+    );
+    assert.match(report, /### primary-pack[\s\S]*\| PM-simulation answers \| 1 \|/);
+    assert.match(report, /### holdout-pack[\s\S]*\| PM-simulation answers \| 0 \|/);
+    assert.match(report, /Resolution: `pm_simulation`/);
+    assert.match(report, /Authority: `unverified_pm_simulation`/);
+    assert.match(report, /not human-verified authority/);
+
+    const historyPath = path.join(paths.campaigns, 'pm-simulation-history.json');
+    await writeAgentHistory(historyPath, paths.reports, campaign, [variant], []);
+    const history = JSON.parse(await readFile(historyPath, 'utf8')) as {
+      variants: Array<{ questionResolutions: Record<string, unknown> }>;
+    };
+    const questionResolutions = history.variants[0]!.questionResolutions;
+    assert.match(JSON.stringify(questionResolutions), /"resolution":"pm_simulation"/);
+    assert.match(JSON.stringify(questionResolutions), /"pmSimulationAnswers":1/);
+    assert.doesNotMatch(JSON.stringify(questionResolutions), /human_verified/);
+  } finally {
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('target protocol reports and history distinguish dedicated control from standard-primary reuse', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'planner-reports-target-protocol-'));
   const paths: HarnessPaths = {

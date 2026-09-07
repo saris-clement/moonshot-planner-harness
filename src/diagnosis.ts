@@ -1565,6 +1565,11 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
   }> = [];
   if (input.targetExcluded) {
     const target = input.targetExcluded;
+    const pmSimulationAnswers =
+      target.questionResolution?.pmSimulationAnswers ??
+      target.questionResolution?.entries.filter(({ resolution }) => resolution === 'pm_simulation')
+        .length ??
+      0;
     if (standardPrimaryV2) {
       const binding = target.normalArmBinding;
       addEvidence(`target-normal-arm-binding|${target.variantId}`, {
@@ -1644,7 +1649,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
     }
     addEvidence(`target-excluded|${target.variantId}`, {
       kind: 'target_excluded_summary',
-      summary: `Target-excluded guard status is ${target.status} with gate ${target.gate?.status ?? 'pending'}; it is a guard, not a fitness reward.`,
+      summary: `Target-excluded guard status is ${target.status} with gate ${target.gate?.status ?? 'pending'}; it is a guard, not a fitness reward.${pmSimulationAnswers > 0 ? ` It includes ${pmSimulationAnswers} unverified PM-simulation answer${pmSimulationAnswers === 1 ? '' : 's'}, not human-verified authority.` : ''}`,
       affectedUnitKeys: target.excludedFacts?.units.map((unit) => unit.key).slice(0, 500) ?? [],
       provenance: {
         classification: 'deterministic_reconstruction',
@@ -1655,7 +1660,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
         caseId: null,
         runId: null,
         unitKey: null,
-        limitation: 'Target-excluded output and labels remain separate from normal measured facts.',
+        limitation: `Target-excluded output and labels remain separate from normal measured facts.${pmSimulationAnswers > 0 ? ' PM-simulation answers are unverified synthetic input, not human-verified authority.' : ''}`,
       },
       data: boundedJson({
         status: target.status,

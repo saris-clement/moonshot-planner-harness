@@ -49,8 +49,10 @@ export interface ResolvedBenchmarkPack {
 interface ResolvedAnswerCandidate {
   answer: string;
   evidence: string[];
-  resolution: 'requirements_agent' | 'source_fallback';
+  resolution: 'requirements_agent' | 'source_fallback' | 'pm_simulation';
 }
+
+const PM_SIMULATION_MAX_ANSWER_LENGTH = 1_000;
 
 const digest = (bytes: Uint8Array): string =>
   `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -64,6 +66,23 @@ function parsedQuestionFiles(files: Record<string, Uint8Array>): Array<[string, 
 function questionFiles(files: Record<string, Uint8Array>): Array<[string, RawQuestion]> {
   return parsedQuestionFiles(files)
     .filter(([, question]) => question.status === 'open' && question.severity === 'blocking');
+}
+
+function validatePmSimulationAnswer(answer: string, questionId: string): void {
+  if (answer.length === 0) {
+    throw new Error(`PM-simulation answer for blocking question ${questionId} must be nonempty`);
+  }
+  if (answer.length > PM_SIMULATION_MAX_ANSWER_LENGTH) {
+    throw new Error(
+      `PM-simulation answer for blocking question ${questionId} must be at most ${PM_SIMULATION_MAX_ANSWER_LENGTH} characters`,
+    );
+  }
+  const sentenceCount = [...new Intl.Segmenter('en', { granularity: 'sentence' }).segment(answer)]
+    .filter(({ segment }) => segment.trim().length > 0)
+    .length;
+  if (sentenceCount > 3) {
+    throw new Error(`PM-simulation answer for blocking question ${questionId} must be at most 3 sentences`);
+  }
 }
 
 function reconstructExpectedResolvedPack(
@@ -341,6 +360,7 @@ export async function resolveBenchmarkQuestions(input: {
   workflowsSource: string;
   sharedDirectory: string;
   artifactDirectory: string;
+  sourceAnswerMode?: 'source-grounded' | 'pm-simulation';
   answerAllowed?: (candidate: ResolvedAnswerCandidate) => boolean;
   agent?: Pick<AgentRunner, 'answerUpstreamQuestion'>;
 }): Promise<ResolvedBenchmarkPack> {
@@ -367,6 +387,29 @@ export async function resolveBenchmarkQuestions(input: {
   } else if (sharedPackExists && sharedSummaryExists) {
     const persisted = JSON.parse(await readFile(sharedSummaryPath, 'utf8')) as BenchmarkQuestionResolution;
     if (persisted.derivationVersion === 2) {
+      const pmSimulationAnswers = persisted.pmSimulationAnswers ?? 0;
+      const pmSimulationEntries = persisted.entries.filter(
+        (entry) => entry.resolution === 'pm_simulation',
+      ).length;
+      if (
+        !Number.isSafeInteger(pmSimulationAnswers) ||
+        pmSimulationAnswers < 0 ||
+        pmSimulationAnswers !== pmSimulationEntries
+      ) {
+        throw new Error(
+          `resolved pack cache content mismatch for ${input.benchmark.name}: PM simulation answer count`,
+        );
+      }
+      const sourceAnswerMode = input.sourceAnswerMode ?? 'source-grounded';
+      if (
+        (sourceAnswerMode === 'pm-simulation' &&
+          persisted.entries.some((entry) => entry.resolution === 'source_fallback')) ||
+        (sourceAnswerMode === 'source-grounded' && pmSimulationEntries > 0)
+      ) {
+        throw new Error(
+          `resolved pack cache provenance mode mismatch for ${input.benchmark.name}: ${sourceAnswerMode}`,
+        );
+      }
       if (
         input.answerAllowed &&
         persisted.entries.some((entry) =>
@@ -376,6 +419,8 @@ export async function resolveBenchmarkQuestions(input: {
             resolution:
               entry.resolution === 'requirements_agent'
                 ? 'requirements_agent'
+                : entry.resolution === 'pm_simulation'
+                  ? 'pm_simulation'
                 : 'source_fallback',
           }),
         )
@@ -412,6 +457,7 @@ export async function resolveBenchmarkQuestions(input: {
         requirementsAgentRequests: 0,
         requirementsAgentAnswers: 0,
         sourceFallbackAnswers: 0,
+        pmSimulationAnswers,
         reusedAnswers: persisted.entries.length,
         plannerQuestions: 0,
         plannerRequirementsAgentRequests: 0,
@@ -441,6 +487,7 @@ export async function resolveBenchmarkQuestions(input: {
   const entries: QuestionResolutionEntry[] = [];
   let advisorAnswers = 0;
   let sourceAnswers = 0;
+  let pmSimulationAnswers = 0;
   const answeredAt = new Date().toISOString();
   const agent = input.agent ?? new AgentRunner(input.campaign);
 
@@ -473,18 +520,27 @@ export async function resolveBenchmarkQuestions(input: {
       }
     }
     if (!answer) {
-      const source = await agent.answerUpstreamQuestion(
-        {
-          id: question.id,
-          question: question.question,
-          ...(question.entity ? { entity: question.entity } : {}),
-          ...(question.anchor ? { anchor: question.anchor } : {}),
-          type: question.type,
-          options: question.options,
-        },
-        input.workflowsSource,
-        input.artifactDirectory,
-      );
+      const sourceQuestion = {
+        id: question.id,
+        question: question.question,
+        ...(question.entity ? { entity: question.entity } : {}),
+        ...(question.anchor ? { anchor: question.anchor } : {}),
+        type: question.type,
+        options: question.options,
+      };
+      const source =
+        input.sourceAnswerMode === 'pm-simulation'
+          ? await agent.answerUpstreamQuestion(
+              sourceQuestion,
+              input.workflowsSource,
+              input.artifactDirectory,
+              { mode: 'pm-simulation' },
+            )
+          : await agent.answerUpstreamQuestion(
+              sourceQuestion,
+              input.workflowsSource,
+              input.artifactDirectory,
+            );
       if (source.resolution !== 'answered') {
         throw new Error(`blocking question ${question.id} remains unresolved: ${source.reason}`);
       }
@@ -498,12 +554,14 @@ export async function resolveBenchmarkQuestions(input: {
       }
       answer = source.answer.trim();
       evidence = source.evidence;
-      resolution = 'source_fallback';
+      resolution = input.sourceAnswerMode === 'pm-simulation' ? 'pm_simulation' : 'source_fallback';
+      if (resolution === 'pm_simulation') validatePmSimulationAnswer(answer, question.id);
       selectedOptionId = source.selectedOptionId ?? selectedOption(question)[0];
       if (input.answerAllowed && !input.answerAllowed({ answer, evidence, resolution })) {
         throw new Error(`blocking question ${question.id} produced a disallowed source answer`);
       }
-      sourceAnswers += 1;
+      if (resolution === 'pm_simulation') pmSimulationAnswers += 1;
+      else sourceAnswers += 1;
     }
     if (!answer || !evidence || !resolution) {
       throw new Error(`blocking question ${question.id} did not produce a complete answer`);
@@ -545,6 +603,7 @@ export async function resolveBenchmarkQuestions(input: {
     requirementsAgentRequests: openQuestions.length,
     requirementsAgentAnswers: advisorAnswers,
     sourceFallbackAnswers: sourceAnswers,
+    pmSimulationAnswers,
     reusedAnswers: 0,
     plannerQuestions: 0,
     plannerRequirementsAgentRequests: 0,

@@ -3987,16 +3987,18 @@ export class CampaignOrchestrator {
     benchmark: Benchmark,
     targetWorkflow: string,
     artifactDirectory: string,
+    dependencies: { resolveBenchmarkQuestions?: typeof resolveBenchmarkQuestions } = {},
   ): Promise<Awaited<ReturnType<typeof resolveBenchmarkQuestions>>> {
-    const workflowsSource = await this.ensureTargetExcludedWorkflowsSource(campaign, targetWorkflow);
-    return await resolveBenchmarkQuestions({
+    await this.ensureTargetExcludedWorkflowsSource(campaign, targetWorkflow);
+    const workflowsSource = await this.ensureFrozenWorkflowsSource(campaign);
+    return await (dependencies.resolveBenchmarkQuestions ?? resolveBenchmarkQuestions)({
       campaign,
       benchmark,
       workflowsSource,
       sharedDirectory: path.join(campaignDirectory(this.paths, campaign.id), 'resolved-packs'),
       artifactDirectory,
-      answerAllowed: ({ answer, evidence }) =>
-        !containsTargetIdentityLeak({ answer, evidence }, targetWorkflow),
+      sourceAnswerMode: 'pm-simulation',
+      answerAllowed: ({ answer }) => !containsTargetIdentityLeak(answer, targetWorkflow),
     });
   }
 
