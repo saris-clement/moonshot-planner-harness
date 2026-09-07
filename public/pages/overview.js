@@ -38,7 +38,7 @@ export function overviewPage(context) {
           ]),
           usageSummary(campaign, variant),
         ]),
-        replicateTable(campaign, variant),
+        replicateTable(campaign, variant, { includeTargetExcluded: true }),
       ]),
     );
   }

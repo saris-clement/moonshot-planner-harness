@@ -126,6 +126,7 @@ function execution(input: {
   benchmark: string;
   role: 'primary' | 'holdout';
   replicate: number;
+  replicateCount?: number;
   status?: string;
   stage?: string;
   elapsedMs?: number;
@@ -141,7 +142,7 @@ function execution(input: {
     benchmark: input.benchmark,
     role: input.role,
     replicate: input.replicate,
-    replicateCount: 3,
+    replicateCount: input.replicateCount ?? 3,
     caseId: `case-${input.benchmark}-${input.replicate}`,
     runId: `run-${input.benchmark}-${input.replicate}`,
     status: input.status ?? 'completed',
@@ -408,6 +409,27 @@ async function seedCampaign(): Promise<void> {
     startedAt: '2026-09-06T05:00:00.000Z',
     completedAt: '2026-09-06T05:00:10.000Z',
   });
+  database.createTargetExcludedEvaluation(campaignId, live.id);
+  database.updateTargetExcludedEvaluation(live.id, {
+    status: 'running',
+    executionState: {
+      executions: [
+        execution({
+          benchmark: 'primary-pack:control',
+          role: 'primary',
+          replicate: 1,
+          replicateCount: 2,
+          status: 'running',
+          stage: 'adjudicating',
+          elapsedMs: 3_500,
+          completedUnits: 1,
+          totalUnits: 5,
+          decisions: { build: 1, reuse: 0, extend: 0, defer: 0, question: 0 },
+        }),
+      ],
+    },
+    startedAt: new Date(Date.now() - 5_000).toISOString(),
+  });
   database.updateCampaign(campaign.id, {
     status: 'running_round',
     currentParentVariantId: baseline.id,
@@ -557,9 +579,21 @@ test('refreshes a deep-linked overview with completed, live, and pending replica
 
   const active = page.getByTestId(`active-variant-${liveId}`);
   await expect(active).toBeVisible();
-  await expect(active.locator('[data-replicate-state="completed"]')).toHaveCount(2);
-  await expect(active.locator('[data-replicate-state="current"]')).toHaveCount(1);
-  await expect(active.locator('[data-replicate-state="pending"]')).toHaveCount(3);
+  await expect(active.locator('[data-replicate-group="standard"][data-replicate-state="completed"]')).toHaveCount(2);
+  await expect(active.locator('[data-replicate-group="standard"][data-replicate-state="current"]')).toHaveCount(1);
+  await expect(active.locator('[data-replicate-group="standard"][data-replicate-state="pending"]')).toHaveCount(3);
+
+  const targetGroup = active.getByTestId(`replicate-group-${liveId}-target-excluded`);
+  await expect(targetGroup).toContainText('Target-excluded guard');
+  await expect(targetGroup).toContainText('Excluded from totals');
+  await expect(targetGroup).toContainText('running');
+  const targetRows = active.locator('[data-replicate-group="target-excluded"]');
+  await expect(targetRows).toHaveCount(4);
+  await expect(active.locator('[data-replicate-group="target-excluded"][data-replicate-state="current"]')).toHaveCount(1);
+  await expect(active.locator('[data-replicate-group="target-excluded"][data-replicate-state="pending"]')).toHaveCount(3);
+  const targetControl = active.getByTestId(`replicate-${liveId}-primary-pack:control-1`);
+  await expect(targetControl).toContainText('1 / 5');
+  await expect(active.getByTestId(`replicate-${liveId}-primary-pack:excluded-1`)).toContainText('—');
 
   const running = page.getByTestId(`replicate-${liveId}-primary-pack-2`);
   await expect(active.locator('th').first()).toHaveCSS('position', 'sticky');
@@ -594,6 +628,11 @@ test('refreshes a deep-linked overview with completed, live, and pending replica
   await expect(active.getByLabel('Experiment timing and planner usage')).toContainText('820 incl. reasoning');
   await expect(active.getByLabel('Experiment timing and planner usage')).toContainText('$0.95');
   await expect(active.locator('dt', { hasText: 'End-to-end' }).locator('..').locator('dd')).toContainText('s');
+
+  const navigationLabels = page.locator('.sidebar-nav .nav-label');
+  await expect(navigationLabels.first()).toHaveCSS('margin-bottom', '8px');
+  await expect(navigationLabels.nth(1)).toHaveCSS('border-top-style', 'solid');
+  await expect(navigationLabels.nth(1)).toHaveCSS('padding-top', '14px');
   await expect(active.locator('dt', { hasText: 'Phase 2' }).locator('..').locator('dd')).toContainText('s');
   const trace = running.getByRole('link', { name: 'Trace' });
   expect(new URL((await trace.getAttribute('href'))!).searchParams.get('filter')).toBe(

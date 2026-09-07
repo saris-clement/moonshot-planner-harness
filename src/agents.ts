@@ -179,6 +179,7 @@ Rules:
 - Preserve the cited counterevidence and implement the listed falsification test as a regression test when feasible.
 - Investigate the current code before editing.
 - Implement only this hypothesis using a generic mechanism.
+- Change files only under these configured path prefixes: ${JSON.stringify(this.campaign.config.gates.allowedPathPrefixes)}. Changes outside them are rejected before tests or evaluation; leave cross-surface synchronization for post-promotion integration.
 - Never hard-code customer names, workflow names, source paths, aliases, requirement text, or capability IDs.
 - Add or update a regression test before fixing the behavior when feasible.
 - Do not edit the evaluation harness, campaign data, or experiment reports.

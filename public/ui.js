@@ -16,6 +16,7 @@ import {
   langfuseUrlForVariant,
   plannerTotals,
   replicateMatrix,
+  targetExcludedReplicateMatrix,
 } from './models.js';
 
 export function routeLink(label, href, className = '') {
@@ -157,9 +158,9 @@ function rowState(row) {
   return row.execution?.stage ?? row.execution?.status ?? 'current';
 }
 
-export function replicateTable(campaign, variant) {
+export function replicateTable(campaign, variant, options = {}) {
   const body = element('tbody');
-  for (const row of replicateMatrix(campaign, variant)) {
+  const appendRow = (row, group) => {
     const traceCell = element('td');
     if (row.traceUrl) {
       traceCell.append(
@@ -174,6 +175,7 @@ export function replicateTable(campaign, variant) {
       element('tr', {
         attributes: {
           'data-testid': `replicate-${variant.id}-${row.benchmark}-${row.replicate}`,
+          'data-replicate-group': group,
           'data-replicate-state': row.state,
         },
       }, [
@@ -202,6 +204,35 @@ export function replicateTable(campaign, variant) {
         traceCell,
       ]),
     );
+  };
+  for (const row of replicateMatrix(campaign, variant)) {
+    appendRow(row, 'standard');
+  }
+  const targetRows = options.includeTargetExcluded
+    ? targetExcludedReplicateMatrix(campaign, variant)
+    : [];
+  if (targetRows.length) {
+    const evaluation = (campaign.targetExcludedEvaluations ?? []).find(
+      (candidate) => candidate.variantId === variant.id,
+    );
+    body.append(
+      element('tr', {
+        className: 'replicate-group-row',
+        attributes: { 'data-testid': `replicate-group-${variant.id}-target-excluded` },
+      }, [
+        element('th', { attributes: { colspan: '14', scope: 'rowgroup' } }, [
+          element('div', { className: 'replicate-group-heading' }, [
+            element('span', { className: 'replicate-group-title', text: 'Target-excluded guard' }),
+            statusLabel(evaluation?.status ?? 'pending'),
+            element('span', {
+              className: 'replicate-group-note',
+              text: 'Control + policy-hidden greenfield · Excluded from totals',
+            }),
+          ]),
+        ]),
+      ]),
+    );
+    for (const row of targetRows) appendRow(row, 'target-excluded');
   }
   return element('div', { className: 'table-scroll replicate-table-wrap' }, [
     element('table', { className: 'replicate-table' }, [

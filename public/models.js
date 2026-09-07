@@ -117,6 +117,55 @@ export function replicateMatrix(campaign, variant) {
   return rows;
 }
 
+export function targetExcludedReplicateMatrix(campaign, variant) {
+  const config = campaign.targetExcludedConfig;
+  const primary = campaign.config.benchmarks.find((benchmark) => benchmark.role === 'primary');
+  if (!config || !primary || variant.round === 0) return [];
+  const evaluation = (campaign.targetExcludedEvaluations ?? []).find(
+    (candidate) => candidate.variantId === variant.id,
+  );
+  const executions = evaluation?.executionState?.executions ?? [];
+  const rows = [];
+  for (const arm of ['control', 'excluded']) {
+    const benchmark = `${primary.name}:${arm}`;
+    const finalFacts = arm === 'control'
+      ? evaluation?.controlReplicateFacts ?? []
+      : evaluation?.excludedReplicateFacts ?? [];
+    for (let replicate = 1; replicate <= config.replicates; replicate += 1) {
+      const execution = executions.find(
+        (candidate) => candidate.benchmark === benchmark && candidate.replicate === replicate,
+      ) ?? null;
+      const facts = finalFacts[replicate - 1] ?? null;
+      const failed = execution?.status === 'failed';
+      const state = failed
+        ? 'failed'
+        : facts || execution?.status === 'completed'
+          ? 'completed'
+          : execution
+            ? 'current'
+            : 'pending';
+      rows.push({
+        benchmark,
+        role: arm === 'control' ? 'target control' : 'target excluded',
+        replicate,
+        replicateCount: config.replicates,
+        execution,
+        facts,
+        state,
+        observed: Boolean(execution || facts),
+        usage: facts?.usage ?? execution?.usage ?? null,
+        questions: execution?.questions ?? [],
+        traceUrl: langfuseUrlForCase(execution?.caseId),
+        stableProgress: Boolean(
+          execution?.progress &&
+            (execution.status === 'completed' || STABLE_PROGRESS_STAGES.has(execution.stage)),
+        ),
+      });
+    }
+  }
+  return rows;
+}
+
 export function plannerTotals(campaign, variant) {
   const values = replicateMatrix(campaign, variant)
     .map((row) => row.usage)

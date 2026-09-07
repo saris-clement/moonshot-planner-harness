@@ -137,8 +137,8 @@ code, .mono, .identifier { font-family: var(--mono); font-variant-numeric: tabul
 .sidebar-nav a { padding: 7px 8px; border-radius: 6px; color: var(--muted-foreground); font-size: 12px; font-weight: 500; text-decoration: none; }
 .sidebar-nav a:hover { background: var(--muted); color: var(--foreground); }
 .sidebar-nav a.active { background: var(--secondary); color: var(--foreground); font-weight: 650; }
-.nav-label { margin: 0 8px 5px; color: var(--tertiary-foreground); font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-.nav-label-secondary { margin-top: 15px; }
+.nav-label { margin: 0 8px 8px; color: var(--tertiary-foreground); font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.nav-label-secondary { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--border); }
 .sidebar-foot { margin: auto 14px 13px; color: var(--tertiary-foreground); font-size: 9px; }
 .sidebar-collapsed { grid-template-columns: 52px minmax(0, 1fr); }
 .sidebar-collapsed .sidebar-title > div, .sidebar-collapsed .sidebar-nav, .sidebar-collapsed .sidebar-foot { display: none; }
@@ -190,6 +190,10 @@ tr.selected td:first-child { background: var(--muted); }
 td small { display: block; margin-top: 1px; color: var(--tertiary-foreground); font-size: 9px; }
 .replicate-table { min-width: 1400px; }
 .replicate-table-wrap { border-radius: 0; }
+.replicate-group-row th { position: static; padding: 9px; border-block: 1px solid var(--border-contrast); background: var(--muted); text-transform: none; }
+.replicate-group-heading { display: flex; align-items: center; gap: 9px; }
+.replicate-group-title { color: var(--foreground); font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.replicate-group-note { color: var(--tertiary-foreground); font-size: 9px; font-weight: 500; letter-spacing: 0; }
 .decision-cell { min-width: 215px; }
 .progress-cell { min-width: 130px; }
 progress { width: 78px; height: 7px; overflow: hidden; border: 0; border-radius: 99px; background: var(--muted); vertical-align: middle; }

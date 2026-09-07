@@ -132,6 +132,54 @@ test('strategist output is rejected when it omits explicit assumptions', async (
   );
 });
 
+test('mutator prompt discloses the configured path allowlist', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'planner-agent-paths-'));
+  const contextPath = path.join(directory, 'mutation-context.json');
+  await writeFile(contextPath, '{"selectedFindings":[]}\n');
+  const scopedCampaign: CampaignRecord = {
+    ...campaign,
+    config: {
+      ...campaign.config,
+      gates: {
+        ...campaign.config.gates,
+        allowedPathPrefixes: ['server/src/custom/', 'server/test/custom/'],
+      },
+    },
+  };
+  const runner = new AgentRunner(
+    scopedCampaign,
+    async (command, args): Promise<CommandResult> => ({
+      command,
+      args: [...args],
+      exitCode: 0,
+      stdout: '',
+      stderr: '',
+      durationMs: 1,
+    }),
+  );
+  const variant = {
+    id: 'agent-paths-v001',
+    hypothesis: {
+      title: 'Bounded change',
+      rationale: 'Exercise the configured mutation boundary.',
+      instructions: 'Make one bounded change.',
+      expectedImpact: 'A measurable result.',
+      risk: 'The mechanism may be wrong.',
+      findingIds: ['finding-hydration'],
+    },
+  } as VariantRecord;
+
+  try {
+    await runner.mutate(variant, directory, directory, contextPath);
+    const prompt = await readFile(path.join(directory, 'mutator-prompt.txt'), 'utf8');
+    assert.match(prompt, /server\/src\/custom\//);
+    assert.match(prompt, /server\/test\/custom\//);
+    assert.match(prompt, /rejected before tests or evaluation/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('diagnostician archives strict cited unverified output and mutator receives bounded context', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'planner-agent-diagnosis-'));
   const inputPath = path.join(directory, 'diagnosis-input.json');
