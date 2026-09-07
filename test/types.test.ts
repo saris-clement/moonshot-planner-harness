@@ -30,6 +30,24 @@ test('campaign benchmark names are unique across primary and holdouts', () => {
   assert.equal(result.success, false);
 });
 
+test('campaign defaults reserve twelve hours of aggregate Phase 2 model duration', () => {
+  const config = CampaignConfigSchema.parse({
+    id: 'phase2-duration-default',
+    goal: 'Keep large V13 requirement cohorts inside the aggregate duration ceiling.',
+    plannerRepo: '/tmp/planner',
+    workflowsRepo: '/tmp/workflows',
+    environmentFile: '/tmp/planner.env',
+    seedRevision: 'seed',
+    workflowsRevision: 'source',
+    benchmarks: [
+      { name: 'primary', role: 'primary', zipPath: '/tmp/primary.zip' },
+      { name: 'holdout', role: 'holdout', zipPath: '/tmp/holdout.zip' },
+    ],
+  });
+
+  assert.equal(config.limits.phase2TimeoutMs, 43_200_000);
+});
+
 test('campaign target-excluded v2 declaration requires exactly two evaluation replicates', () => {
   const input = {
     id: 'target-excluded-v2',

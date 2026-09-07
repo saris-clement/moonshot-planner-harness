@@ -132,6 +132,7 @@ The test suite covers persistence, scoring precedence, cohort drift, command arg
 
 - A stop request prevents the next iteration and automatic promotion, but does not terminate a model call already in flight.
 - Two repetitions are the default. Increase `evaluation.replicates` for confirmation campaigns when decision agreement remains weak.
+- New campaigns reserve twelve hours of aggregate Phase 2 model duration so V13 cohorts up to 144 requirement units fit the five-call, five-minute per-unit envelope.
 - V2 target-enabled campaigns fix the repetition count at two. With one holdout, all three cohorts start together for six planner cases per variant; a three-wide round may therefore sustain up to eighteen concurrent provider operations across isolated stacks.
 - Campaign execution is single-coordinator. Do not run dashboard and mutating CLI commands against the same campaign simultaneously.
 - Node currently labels built-in SQLite as experimental; all state is also represented by raw artifacts and generated Markdown.

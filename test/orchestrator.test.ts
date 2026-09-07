@@ -468,7 +468,7 @@ test('campaign initialization freezes environment and pack bytes', async () => {
     assert.equal(campaign.config.environmentFile, path.join(data, 'campaigns/freeze-test/environment.env'));
     assert.match(
       await readFile(campaign.config.environmentFile, 'utf8'),
-      /PLANNER_ANALYSIS_TIMEOUT_MS=36000000/,
+      /PLANNER_ANALYSIS_TIMEOUT_MS=43200000/,
     );
     assert.match(
       await readFile(campaign.config.environmentFile, 'utf8'),

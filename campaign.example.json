@@ -32,7 +32,7 @@
     "concurrency": 3,
     "maxVariants": 9,
     "noImprovementRounds": 2,
-    "phase2TimeoutMs": 36000000,
+    "phase2TimeoutMs": 43200000,
     "stackReadyTimeoutMs": 300000,
     "maxChangedFiles": 20,
     "maxChangedLines": 2000,
