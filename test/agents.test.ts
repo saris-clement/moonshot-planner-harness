@@ -113,6 +113,9 @@ test('pm-simulation source-answer prompt keeps implementation private and eviden
   assert.match(prompt, /intended product or operational decision/i);
   assert.match(prompt, /concise human answer/i);
   assert.match(prompt, /maximum of 3 sentences|max 3 sentences/i);
+  assert.match(prompt, /exact endpoint, profile, service identity, or secret/i);
+  assert.match(prompt, /exact value is deployment-provided/i);
+  assert.match(prompt, /do not return unresolved merely because that deployment value is absent/i);
   assert.match(prompt, /source paths/i);
   assert.match(prompt, /symbols/i);
   assert.match(prompt, /capability IDs/i);
