@@ -51,6 +51,45 @@ function runStatus(value: unknown): string {
   );
 }
 
+function providerRetryInput(value: unknown): JsonRecord | null {
+  if (nestedValue(value, ['runtime', 'providerRetryBudgetAvailable']) !== true) return null;
+  const pins = nestedValue(value, ['runtime', 'pins']);
+  const failureCode = nestedString(value, ['runtime', 'failureCode']);
+  if (
+    !isRecord(pins) ||
+    typeof pins.inputSetHash !== 'string' ||
+    !Number.isSafeInteger(pins.decisionSetVersion) ||
+    typeof pins.decisionSetHash !== 'string' ||
+    !failureCode
+  ) {
+    return null;
+  }
+  const input: JsonRecord = {
+    expectedContext: {
+      inputSetHash: pins.inputSetHash,
+      decisionSetVersion: pins.decisionSetVersion,
+      decisionSetHash: pins.decisionSetHash,
+    },
+    expectedFailureCode: failureCode,
+    acknowledgeUncertainProviderBilling: true,
+  };
+  const checkpoint = nestedValue(value, ['checkpointMetadata']);
+  const checkpointSha = nestedString(checkpoint, ['checkpointRef', 'artifactSha256']);
+  if (
+    isRecord(checkpoint) &&
+    typeof checkpoint.id === 'string' &&
+    Number.isSafeInteger(checkpoint.version) &&
+    checkpointSha
+  ) {
+    input.expectedCheckpoint = {
+      id: checkpoint.id,
+      version: checkpoint.version,
+      artifactSha256: checkpointSha,
+    };
+  }
+  return input;
+}
+
 export interface Phase2Result {
   caseId: string;
   runId: string;
@@ -308,6 +347,7 @@ export class PlannerClient {
     let run: unknown = admitted;
     let status = runStatus(run);
     let transientPollFailures = 0;
+    let providerRetryCount = 0;
     while (true) {
       while (status === 'queued' || status === 'running') {
         if (Date.now() >= deadline) throw new Error(`Phase 2 run timed out after ${timeoutMs}ms`);
@@ -332,6 +372,29 @@ export class PlannerClient {
         }
         status = runStatus(run);
         await emitSnapshot(run, runId);
+      }
+      const retryInput = status === 'failed' ? providerRetryInput(run) : null;
+      if (retryInput) {
+        providerRetryCount += 1;
+        const retried = await this.request(
+          `analysis-provider-retry-${providerRetryCount}`,
+          `/api/planning-cases/${caseId}/runs/${runId}/retry-provider-failure`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Idempotency-Key': `${idempotencyPrefix}-provider-retry-${providerRetryCount}`,
+            },
+            body: JSON.stringify(retryInput),
+          },
+        );
+        const retryRunId = nestedString(retried, ['run', 'id']);
+        if (!retryRunId) throw new Error('provider retry response omitted successor run id');
+        runId = retryRunId;
+        run = retried;
+        status = runStatus(run);
+        await emitSnapshot(run, runId);
+        continue;
       }
       if (status !== 'waiting') break;
       if (!answerQuestion) throw new Error('Phase 2 requires a planner-question handler');

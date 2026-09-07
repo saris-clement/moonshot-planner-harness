@@ -227,6 +227,121 @@ test('PlannerClient answers a planner question and follows the successor run', a
   }
 });
 
+test('PlannerClient resumes an explicitly retryable provider failure from its checkpoint', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'planner-client-provider-retry-'));
+  const zipPath = path.join(directory, 'pack.zip');
+  const bytes = Buffer.from('fixed-pack');
+  await writeFile(zipPath, bytes);
+  const artifactSha = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+  let retryBody: unknown;
+  let retryIdempotencyKey: string | undefined;
+  const completedRun = {
+    run: { id: 'run-retry', status: 'completed' },
+    runtime: {
+      status: 'completed',
+      pins: {
+        inputSetHash: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        decisionSetVersion: 0,
+        decisionSetHash: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      },
+      aggregateUsage: {
+        calls: 2,
+        inputTokens: 20,
+        outputTokens: 4,
+        totalTokens: 24,
+        costUsd: 0.2,
+        durationMs: 50,
+      },
+    },
+  };
+  const server = createServer(async (request, response) => {
+    const body: Buffer[] = [];
+    for await (const chunk of request) body.push(Buffer.from(chunk));
+    response.setHeader('Content-Type', 'application/json');
+    if (request.url === '/api/requirements-packs') {
+      response.end(JSON.stringify({ metadata: { artifactSha256: artifactSha } }));
+    } else if (request.url === '/api/planning-cases' && request.method === 'POST') {
+      response.end('{"case":{"id":"case-retry"}}');
+    } else if (request.url?.endsWith('/analysis-readiness')) {
+      response.end('{"ready":true}');
+    } else if (request.url?.endsWith('/runs') && request.method === 'POST') {
+      response.end(
+        JSON.stringify({
+          run: { id: 'run-failed', status: 'failed' },
+          runtime: {
+            status: 'failed',
+            pins: {
+              inputSetHash:
+                'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+              decisionSetVersion: 0,
+              decisionSetHash:
+                'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+            },
+            failureCode: 'model_invalid_response',
+            providerRetryBudgetAvailable: true,
+          },
+          checkpointMetadata: {
+            id: 'checkpoint-a',
+            version: 17,
+            checkpointRef: {
+              artifactSha256:
+                'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+            },
+          },
+        }),
+      );
+    } else if (request.url?.endsWith('/runs/run-failed/retry-provider-failure')) {
+      retryBody = JSON.parse(Buffer.concat(body).toString('utf8'));
+      const header = request.headers['idempotency-key'];
+      retryIdempotencyKey = Array.isArray(header) ? header[0] : header;
+      response.end(JSON.stringify(completedRun));
+    } else if (request.url?.endsWith('/analysis')) {
+      response.end(
+        '{"analysis":{"requirementUnits":[{"id":"unit-a","ref":{"entity":"workflow","anchor":"a"},"kind":"field","semantics":"Capture A"}],"adjudications":[{"requirementUnitId":"unit-a","result":"build","confidence":"high","rationale":"No source","selectedCandidateIds":[],"sourceRefs":[],"uncoveredSemantics":["A"],"shortlist":{"candidates":[]}}]}}',
+      );
+    } else if (request.url?.endsWith('/runs/run-retry')) response.end(JSON.stringify(completedRun));
+    else if (request.url?.endsWith('/events')) response.end('{"events":[]}');
+    else if (request.url?.endsWith('/analyses')) response.end('{"analyses":[]}');
+    else if (request.url?.endsWith('/runs')) response.end('{"runs":[]}');
+    else response.end('{"case":{"id":"case-retry"}}');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('test server did not bind');
+  try {
+    const client = new PlannerClient(`http://127.0.0.1:${address.port}`, directory);
+    const result = await client.runPhase2(
+      zipPath,
+      'provider-retry-test',
+      10_000,
+      artifactSha,
+    );
+    assert.equal(result.status, 'completed');
+    assert.equal(result.runId, 'run-retry');
+    assert.equal(retryIdempotencyKey, 'provider-retry-test-provider-retry-1');
+    assert.deepEqual(retryBody, {
+      expectedContext: {
+        inputSetHash: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        decisionSetVersion: 0,
+        decisionSetHash: 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      },
+      expectedCheckpoint: {
+        id: 'checkpoint-a',
+        version: 17,
+        artifactSha256:
+          'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+      },
+      expectedFailureCode: 'model_invalid_response',
+      acknowledgeUncertainProviderBilling: true,
+    });
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('PlannerClient creates and validates an explicit target-excluded case', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'planner-client-excluded-'));
   const zipPath = path.join(directory, 'pack.zip');
