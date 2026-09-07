@@ -17,7 +17,7 @@ It is deliberately a one-machine tool: one coordinator process, SQLite state, di
 - Reconstructs bounded, cited post-run diagnoses from durable planner/S3 artifacts, optional Langfuse observations, frozen source references, judge evidence, labels, and replicate facts before proposing a planner mutation.
 - Generates one Markdown research record per experiment before execution and refreshes it with measured facts, evidence, and a conservative conclusion afterward.
 - Preserves optional human-authored context in a separate `docs/experiments/<campaign>/human/<variant>.md` sidecar that report refreshes never overwrite.
-- Runs two primary and two holdout repetitions in parallel for every variant, then scores their unit-level consensus.
+- For target-enabled campaigns, resolves one target-safe primary pack and runs two normal-primary, two holdout, and two target-excluded repetitions concurrently. The normal primary is the comparison control; no duplicate control cohort runs.
 
 ## Prerequisites
 
@@ -38,7 +38,7 @@ npm install
 npm run cli -- serve --port 4173
 ```
 
-Open `http://127.0.0.1:4173` and select **New campaign**. The UI collects and validates the research goal, exact seed revisions, repository paths, environment file, primary ZIP, holdout ZIP, repeat count, search width, and automatic-mode limit.
+Open `http://127.0.0.1:4173` and select **New campaign**. The UI collects and validates the research goal, exact seed revisions, repository paths, environment file, primary ZIP, holdout ZIP, repeat count, search width, and automatic-mode limit. An optional target-excluded workflow freezes protocol V2 at campaign creation and requires exactly two repetitions.
 
 The console uses real History API routes and can be refreshed at any valid deep link:
 
@@ -53,15 +53,15 @@ Initialization copies the environment file and both ZIPs into the ignored campai
 
 Optional diagnosis-time Langfuse reads use `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, and `LANGFUSE_SECRET_KEY` from that frozen campaign environment. Reads are case/run filtered and capped; credentials and authorization headers are never persisted. Missing or failed Langfuse telemetry is recorded as incomplete optional evidence and does not invalidate durable run facts.
 
-All campaign operations after the server starts are available in the UI: create, baseline, retry failed baseline, run a supervised or automatic round, stop, resume, review labels, inspect planner questions and their answers, inspect artifacts, open Langfuse traces, read safely rendered experiment Markdown with a heading-derived section navigator, and promote a candidate.
+All campaign operations after the server starts are available in the UI: create, baseline, retry failed baseline, run a supervised or automatic round, stop, resume, review labels, inspect planner questions and their answers, inspect artifacts, open Langfuse traces, read safely rendered experiment Markdown with a heading-derived section navigator, and promote a candidate. A V2 baseline automatically calibrates its target-excluded guard; later V2 retries rerun only the excluded cohort and reuse archived standard artifacts.
 
-The overview separates live execution from durable experiment results. Each active experiment matrix synthesizes every configured benchmark and replicate slot, then joins persisted execution state and final replicate facts. Completed, current, and pending rows remain visible together; pending measurements use dashes rather than zero. Live decisions are the latest accepted checkpoint and can change after a planner question or successor run.
+The overview separates live execution from durable experiment results. Each active experiment matrix synthesizes every configured benchmark and replicate slot, then joins persisted execution state and final replicate facts. Completed, current, and pending rows remain visible together; pending measurements use dashes rather than zero. V2 target sections show only excluded executions and identify the standard primary rows as the comparison control. Live decisions are the latest accepted checkpoint and can change after a planner question or successor run.
 
 The experiment ledger supports URL-synchronized lifecycle, round, lineage, result, search, and sort controls. The lineage view uses the same lexicographic score ordering as promotion and keeps verified accuracy, provisional accuracy, agreement, holdout state, cohort drift, latency, and planner tokens separate rather than manufacturing a composite score.
 
 Campaign and experiment descriptions are collapsed by default and have copy actions for reuse. Each observed replicate links to the shared staging Langfuse project with its own `case:<caseId>` filter; experiment-level links include every persisted case.
 
-Timing and usage distinguish end-to-end variant elapsed time, Phase 2 elapsed time, per-replicate wall time, and planner model duration. Planner calls, input/output/total tokens, and cost are summed once per primary or holdout replicate from final facts when available, otherwise from live execution state. The displayed total-token value is inclusive of reasoning. Strategist, mutator, and judge usage is not included in planner totals.
+Timing and usage distinguish end-to-end variant elapsed time, Phase 2 elapsed time, per-replicate wall time, and planner model duration. Planner calls, input/output/total tokens, and cost are summed once per standard primary or holdout replicate from final facts when available, otherwise from live execution state. Target-excluded usage is displayed separately and never added to standard totals. The displayed total-token value is inclusive of reasoning. Strategist, mutator, and judge usage is not included in planner totals.
 
 The CLI remains an optional recovery surface:
 
@@ -99,7 +99,7 @@ Decision counts are observations, not fitness.
 
 The blind judge sees the exact frozen workflows checkout and the selected run facts. It does not receive the candidate hypothesis or planner patch.
 
-Blocking requirements questions are resolved once per campaign before evaluation. The harness calls the configured online requirements-agent first. If it raises or cannot answer, a separate GPT-5.6 Sol session inspects the frozen workflows source. The resulting derived evaluation pack, original/resolved hashes, question text, answer, evidence, and per-experiment request/reuse counts are persisted and shown in Markdown.
+Blocking requirements questions are resolved once per campaign before evaluation. The harness calls the configured online requirements-agent first. If it raises or cannot answer, a separate GPT-5.6 Sol session inspects the frozen workflows source. For V2, primary answers are derived only from the target-filtered source and the exact resulting ZIP is used by both normal and excluded cases. The resulting original/resolved hashes, question text, answer, evidence, and per-experiment request/reuse counts are persisted and shown in Markdown.
 
 ## Data Layout
 
@@ -117,7 +117,7 @@ docs/experiments/<id>/           trackable Markdown facts and conclusions
 docs/experiments/history/        hash-pinned historical research materials
 ```
 
-Raw packs, source excerpts, model events, and logs stay in ignored `.data/`. Experiment Markdown contains preregistered assumptions and instructions, hashes, parent metrics, measured aggregates, interpretation provenance, a three-arm summary when configured, a conservative conclusion, and artifact references without copying raw source text. Historical strategist context is enumerated by `docs/experiments/history/manifest.json`; each imported file is verified by SHA-256 before use.
+Raw packs, source excerpts, model events, and logs stay in ignored `.data/`. Experiment Markdown contains preregistered assumptions and instructions, hashes, parent metrics, measured aggregates, interpretation provenance, target protocol and normal-arm binding, a conservative conclusion, and artifact references without copying raw source text. Historical strategist context is enumerated by `docs/experiments/history/manifest.json`; each imported file is verified by SHA-256 before use.
 
 ## Verification
 
@@ -132,6 +132,7 @@ The test suite covers persistence, scoring precedence, cohort drift, command arg
 
 - A stop request prevents the next iteration and automatic promotion, but does not terminate a model call already in flight.
 - Two repetitions are the default. Increase `evaluation.replicates` for confirmation campaigns when decision agreement remains weak.
+- V2 target-enabled campaigns fix the repetition count at two. With one holdout, all three cohorts start together for six planner cases per variant; a three-wide round may therefore sustain up to eighteen concurrent provider operations across isolated stacks.
 - Campaign execution is single-coordinator. Do not run dashboard and mutating CLI commands against the same campaign simultaneously.
 - Node currently labels built-in SQLite as experimental; all state is also represented by raw artifacts and generated Markdown.
 - Live execution projections must be persisted in SQLite. The server does not hydrate missing execution state from archived artifacts.

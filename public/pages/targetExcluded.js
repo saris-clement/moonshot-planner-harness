@@ -60,20 +60,51 @@ function configurePanel(context, campaign, variant) {
   ]);
 }
 
-function questionPanel(context, variant, evaluation) {
-  const questions = (evaluation.executionState?.executions ?? [])
-    .flatMap((execution) => execution.questions ?? [])
-    .filter((question, index, values) =>
-      question.status === 'open' && values.findIndex((candidate) => candidate.id === question.id) === index,
-    );
+function questionPanel(context, campaign, variant, evaluation) {
+  const usesStandardPrimary = campaign.targetExcludedConfig?.protocol === 'standard-primary-v2';
+  const primary = campaign.config.benchmarks.find((benchmark) => benchmark.role === 'primary');
+  const standardExecutions = usesStandardPrimary
+    ? (variant.executionState?.executions ?? []).filter(
+        (execution) => execution.role === 'primary' && execution.benchmark === primary?.name,
+      )
+    : [];
+  const executions = [
+    ...standardExecutions,
+    ...(evaluation.executionState?.executions ?? []),
+  ];
+  const byScope = new Map();
+  for (const execution of executions) {
+    for (const question of execution.questions ?? []) {
+      if (question.status !== 'open') continue;
+      const key = `${execution.benchmark}\u0000${execution.replicate}\u0000${question.id}`;
+      if (!byScope.has(key)) {
+        byScope.set(key, {
+          ...question,
+          benchmark: execution.benchmark,
+          replicate: execution.replicate,
+        });
+      }
+    }
+  }
+  const questions = [...byScope.values()];
   if (!questions.length) return null;
   return element('section', { className: 'counterfactual-questions' }, [
     sectionHeading('Input required', 'Resolve blocked analysis'),
     ...questions.map((question) => {
-      const form = element('form', { className: 'counterfactual-question' });
+      const scopeId = `${encodeURIComponent(question.benchmark)}-${question.replicate}-${encodeURIComponent(question.id)}`;
+      const answerId = `target-answer-${scopeId}`;
+      const optionId = `target-option-${scopeId}`;
+      const form = element('form', {
+        className: 'counterfactual-question',
+        attributes: {
+          'data-question-benchmark': question.benchmark,
+          'data-question-replicate': question.replicate,
+          'data-question-id': question.id,
+        },
+      });
       const answer = element('textarea', {
         attributes: {
-          id: `target-answer-${question.id}`,
+          id: answerId,
           name: 'answer',
           required: true,
           placeholder: 'Record the source-independent answer',
@@ -81,21 +112,25 @@ function questionPanel(context, variant, evaluation) {
       });
       let optionSelect = null;
       if (question.responseKind === 'single_select' && question.options?.length) {
-        optionSelect = element('select', { attributes: { id: `target-option-${question.id}`, name: 'selectedOptionId', required: true } },
+        optionSelect = element('select', { attributes: { id: optionId, name: 'selectedOptionId', required: true } },
           question.options.map((option) =>
             element('option', { text: option.label, attributes: { value: option.id } }),
           ),
         );
       }
       form.append(
+        element('p', {
+          className: 'question-meta',
+          text: `${question.benchmark} · replicate ${question.replicate} · ${question.id}`,
+        }),
         element('p', { text: question.prompt }),
         optionSelect
-          ? element('label', { attributes: { for: `target-option-${question.id}` } }, [
+          ? element('label', { attributes: { for: optionId } }, [
               element('span', { text: 'Select an answer' }),
               optionSelect,
             ])
           : null,
-        element('label', { attributes: { for: `target-answer-${question.id}` } }, [
+        element('label', { attributes: { for: answerId } }, [
           element('span', { text: 'Answer and rationale' }),
           answer,
         ]),
@@ -113,6 +148,8 @@ function questionPanel(context, variant, evaluation) {
           question.id,
           String(values.get('answer') ?? ''),
           optionSelect ? String(values.get('selectedOptionId') ?? '') : undefined,
+          question.benchmark,
+          question.replicate,
         );
       });
       return form;
@@ -124,10 +161,17 @@ function runTable(evaluation) {
   const executions = evaluation.executionState?.executions ?? [];
   if (!executions.length) return element('p', { className: 'muted', text: 'No run telemetry yet.' });
   return element('div', { className: 'table-scroll' }, [
-    element('table', {}, [
-      element('thead', {}, [element('tr', {}, ['Arm', 'Run', 'Status', 'Progress', 'Build'].map((text) => element('th', { text })))]),
+    element('table', { className: 'target-run-table' }, [
+      element('caption', { text: 'Target-excluded guard execution runs' }),
+      element('thead', {}, [element('tr', {}, ['Arm', 'Run', 'Status', 'Progress', 'Build'].map((text) =>
+        element('th', { text, attributes: { scope: 'col' } }),
+      ))]),
       element('tbody', {}, executions.map((execution) => element('tr', {}, [
-        element('td', { text: execution.benchmark }),
+        element('th', {
+          className: 'target-run-row-heading',
+          text: execution.benchmark,
+          attributes: { scope: 'row' },
+        }),
         element('td', { text: `${execution.replicate}/${execution.replicateCount}` }),
         element('td', {}, [statusLabel(execution.status)]),
         element('td', { text: execution.progress ? `${execution.progress.completedUnits}/${execution.progress.totalUnits}` : '—' }),
@@ -139,7 +183,17 @@ function runTable(evaluation) {
 
 export function targetExcludedPanel(context, campaign, variant) {
   const config = campaign.targetExcludedConfig;
+  if (!config && campaign.config.targetExcluded) {
+    return element('section', { className: 'counterfactual-empty' }, [
+      sectionHeading(
+        'Counterfactual guard',
+        'V2 guard frozen for the baseline',
+        `2 excluded replicates · concurrency 2 against ${campaign.config.targetExcluded.targetImplementationWorkflow}. Standard primary is the comparison control. Runtime evidence will appear when baseline execution starts.`,
+      ),
+    ]);
+  }
   if (!config) return configurePanel(context, campaign, variant);
+  const usesStandardPrimary = config.protocol === 'standard-primary-v2';
   const evaluation = (campaign.targetExcludedEvaluations ?? []).find(
     (candidate) => candidate.variantId === variant.id,
   );
@@ -148,7 +202,9 @@ export function targetExcludedPanel(context, campaign, variant) {
       sectionHeading(
         'Counterfactual guard',
         variant.id === config.baselineVariantId ? 'Calibrate the excluded baseline' : 'Run the excluded validation',
-        `Two runs execute in parallel against ${config.targetImplementationWorkflow}.`,
+        usesStandardPrimary
+          ? `2 excluded replicates · concurrency 2 against ${config.targetImplementationWorkflow}. Standard primary is the comparison control.`
+          : `2 paired replicates per arm · concurrency 2 against ${config.targetImplementationWorkflow}.`,
       ),
       element('button', {
         className: 'button button-primary',
@@ -160,7 +216,7 @@ export function targetExcludedPanel(context, campaign, variant) {
   }
   const gate = evaluation.gate;
   const comparisons = evaluation.comparisons ?? [];
-  const pendingQuestions = questionPanel(context, variant, evaluation);
+  const pendingQuestions = questionPanel(context, campaign, variant, evaluation);
   const retry = evaluation.status === 'failed'
       ? element('button', {
         className: 'button button-secondary counterfactual-retry',
@@ -172,10 +228,23 @@ export function targetExcludedPanel(context, campaign, variant) {
   return element('div', { className: 'counterfactual-layout', attributes: { 'aria-live': 'polite' } }, [
     element('section', { className: 'counterfactual-strip' }, [
       element('div', {}, [element('span', { text: 'Target' }), element('strong', { text: config.targetImplementationWorkflow })]),
-      element('div', {}, [element('span', { text: 'Protocol' }), element('strong', { text: '2 runs · concurrency 2' })]),
+      element('div', {}, [
+        element('span', { text: 'Protocol' }),
+        element('strong', {
+          text: usesStandardPrimary
+            ? '2 excluded replicates · concurrency 2'
+            : '2 paired replicates per arm · concurrency 2',
+        }),
+      ]),
       element('div', {}, [element('span', { text: 'Lifecycle' }), statusLabel(evaluation.status)]),
       element('div', {}, [element('span', { text: 'Promotion gate' }), statusLabel(gate?.status ?? 'pending')]),
     ]),
+    element('p', {
+      className: 'counterfactual-protocol-note muted',
+      text: usesStandardPrimary
+        ? 'Standard primary is the comparison control; target-excluded planner usage is separate from standard totals.'
+        : 'Dedicated control is compared with the target-excluded arm; this historical V1 protocol records both arms.',
+    }),
     retry,
     evaluation.error
       ? element('section', { className: 'error-panel' }, [
@@ -184,7 +253,14 @@ export function targetExcludedPanel(context, campaign, variant) {
         ])
       : null,
     pendingQuestions,
-    element('section', {}, [sectionHeading('Execution', 'Control, holdout, and excluded runs'), runTable(evaluation)]),
+    element('section', {}, [
+      sectionHeading(
+        'Execution',
+        usesStandardPrimary ? 'Excluded guard runs' : 'Control, holdout, and excluded runs',
+        usesStandardPrimary ? 'Standard primary run telemetry is the comparison control on the Runs tab.' : '',
+      ),
+      runTable(evaluation),
+    ]),
     element('section', { className: 'counterfactual-results' }, [
       sectionHeading('Excluded facts', 'Disposition profile'),
       decisionRows(evaluation.excludedFacts),

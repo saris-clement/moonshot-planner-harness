@@ -4,7 +4,7 @@
   "plannerRepo": "/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner",
   "workflowsRepo": "/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/workflows",
   "environmentFile": "/absolute/path/to/planner-eval.env",
-  "seedRevision": "a0dac3ec7b416b27dd3b4260717cdfea7dd8232a",
+  "seedRevision": "REPLACE_WITH_EXACT_PLANNER_SHA",
   "workflowsRevision": "REPLACE_WITH_EXACT_WORKFLOWS_SHA",
   "benchmarks": [
     {
@@ -18,6 +18,10 @@
       "zipPath": "/absolute/path/to/unrelated-workflow.zip"
     }
   ],
+  "targetExcluded": {
+    "protocol": "standard-primary-v2",
+    "targetImplementationWorkflow": "client/workflow"
+  },
   "mode": "supervised",
   "evaluation": {
     "replicates": 2,

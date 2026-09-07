@@ -118,15 +118,20 @@ export function replicateMatrix(campaign, variant) {
 }
 
 export function targetExcludedReplicateMatrix(campaign, variant) {
-  const config = campaign.targetExcludedConfig;
+  const config = campaign.targetExcludedConfig ?? (campaign.config.targetExcluded
+    ? { ...campaign.config.targetExcluded, replicates: 2 }
+    : null);
   const primary = campaign.config.benchmarks.find((benchmark) => benchmark.role === 'primary');
-  if (!config || !primary || variant.round === 0) return [];
+  if (!config || !primary || (variant.round === 0 && config.protocol !== 'standard-primary-v2')) {
+    return [];
+  }
   const evaluation = (campaign.targetExcludedEvaluations ?? []).find(
     (candidate) => candidate.variantId === variant.id,
   );
   const executions = evaluation?.executionState?.executions ?? [];
   const rows = [];
-  for (const arm of ['control', 'excluded']) {
+  const arms = config.protocol === 'standard-primary-v2' ? ['excluded'] : ['control', 'excluded'];
+  for (const arm of arms) {
     const benchmark = `${primary.name}:${arm}`;
     const finalFacts = arm === 'control'
       ? evaluation?.controlReplicateFacts ?? []
@@ -275,6 +280,71 @@ export function holdoutState(campaign, variant, variants = campaign.variants ?? 
   return 'pending';
 }
 
+// UI eligibility is advisory; server promotion re-verifies archived artifacts and recomputes the gate.
+function hasValidStandardPrimaryTargetLineage(campaign, variant, config, evaluation) {
+  const primary = campaign.config.benchmarks.find((benchmark) => benchmark.role === 'primary');
+  const binding = evaluation?.normalArmBinding;
+  const resolvedArtifactSha = config.primaryResolvedArtifactSha;
+  if (
+    !primary ||
+    !/^sha256:[a-f0-9]{64}$/.test(resolvedArtifactSha ?? '') ||
+    variant.questionResolutions?.[primary.name]?.resolvedArtifactSha !== resolvedArtifactSha ||
+    evaluation?.questionResolution?.resolvedArtifactSha !== resolvedArtifactSha ||
+    binding?.source !== 'standard_primary' ||
+    binding.benchmark !== primary.name ||
+    binding.resolvedArtifactSha !== resolvedArtifactSha ||
+    !Array.isArray(binding.replicates) ||
+    binding.replicates.length !== 2
+  ) return false;
+
+  const standardExecutions = (variant.executionState?.executions ?? [])
+    .filter((execution) => execution.role === 'primary' && execution.benchmark === primary.name);
+  const excludedExecutions = (evaluation.executionState?.executions ?? [])
+    .filter((execution) => execution.benchmark === `${primary.name}:excluded`);
+  if (standardExecutions.length !== 2 || excludedExecutions.length !== 2) return false;
+
+  for (let index = 0; index < 2; index += 1) {
+    const replicate = index + 1;
+    const bindingEntry = binding.replicates[index];
+    const standardExecution = standardExecutions[index];
+    const excludedExecution = excludedExecutions[index];
+    if (
+      bindingEntry?.replicate !== replicate ||
+      standardExecution?.replicate !== replicate ||
+      standardExecution.replicateCount !== 2 ||
+      standardExecution.status !== 'completed' ||
+      !bindingEntry.caseId ||
+      !bindingEntry.runId ||
+      !standardExecution.caseId ||
+      !standardExecution.runId ||
+      bindingEntry.caseId !== standardExecution.caseId ||
+      bindingEntry.runId !== standardExecution.runId ||
+      excludedExecution?.replicate !== replicate ||
+      excludedExecution.replicateCount !== 2 ||
+      excludedExecution.status !== 'completed' ||
+      !excludedExecution.caseId ||
+      !excludedExecution.runId
+    ) return false;
+  }
+
+  const comparisons = evaluation.comparisons ?? [];
+  if (comparisons.length !== 2) return false;
+  return [1, 2].every((replicate, index) => {
+    const comparison = comparisons.find((candidate) => candidate.replicate === replicate);
+    return Boolean(
+      comparison &&
+      comparison.valid &&
+      Array.isArray(comparison.leakagePaths) &&
+      comparison.leakagePaths.length === 0 &&
+      /^sha256:[a-f0-9]{64}$/.test(comparison.reportHash ?? '') &&
+      comparison.normalCaseId === binding.replicates[index]?.caseId &&
+      comparison.excludedCaseId === excludedExecutions[index]?.caseId &&
+      comparison.normalRunId === binding.replicates[index]?.runId &&
+      comparison.excludedRunId === excludedExecutions[index]?.runId
+    );
+  });
+}
+
 export function isPromotionEligible(campaign, variants, variant) {
   if (
     variant.status !== 'review' ||
@@ -287,35 +357,64 @@ export function isPromotionEligible(campaign, variants, variant) {
     !variant.diagnosisResultHash ||
     variant.score.cohortMismatches.includes('requirement units')
   ) return false;
+  if (
+    campaign.config.targetExcluded?.protocol === 'standard-primary-v2' &&
+    !campaign.targetExcludedConfig
+  ) return false;
   if (campaign.targetExcludedConfig) {
     const targetConfig = campaign.targetExcludedConfig;
+    const usesStandardPrimary = targetConfig.protocol === 'standard-primary-v2';
     const targetEvaluation = (campaign.targetExcludedEvaluations ?? []).find(
       (candidate) => candidate.variantId === variant.id,
     );
-    const comparisonOrdinals = targetEvaluation?.comparisons
-      ?.map((comparison) => comparison.replicate)
-      .sort((left, right) => left - right);
-    const holdoutsComplete = campaign.config.benchmarks
-      .filter((benchmark) => benchmark.role === 'holdout')
-      .every((benchmark) =>
-        targetEvaluation?.holdoutReplicateFacts?.[benchmark.name]?.length === targetConfig.replicates
-      );
-    if (
-      targetEvaluation?.status !== 'completed' ||
-      !targetEvaluation.artifactCollectionComplete ||
-      targetEvaluation.controlReplicateFacts?.length !== targetConfig.replicates ||
-      targetEvaluation.excludedReplicateFacts?.length !== targetConfig.replicates ||
-      !holdoutsComplete ||
-      !targetEvaluation.judgment ||
-      !targetEvaluation.score ||
-      !targetEvaluation.questionResolution ||
-      targetEvaluation.comparisons?.length !== targetConfig.replicates ||
-      JSON.stringify(comparisonOrdinals) !== JSON.stringify([1, 2]) ||
-      targetEvaluation.comparisons.some((comparison) =>
-        !comparison.valid || comparison.leakagePaths.length > 0
-      ) ||
-      !['passed', 'warning'].includes(targetEvaluation.gate?.status)
-    ) return false;
+    if (usesStandardPrimary) {
+      const holdoutsComplete = campaign.config.benchmarks
+        .filter((benchmark) => benchmark.role === 'holdout')
+        .every((benchmark) => variant.holdoutReplicateFacts?.[benchmark.name]?.length === 2);
+      if (
+        targetConfig.replicates !== 2 ||
+        targetEvaluation?.status !== 'completed' ||
+        !targetEvaluation.artifactCollectionComplete ||
+        variant.replicateFacts?.length !== 2 ||
+        targetEvaluation.excludedReplicateFacts?.length !== 2 ||
+        !holdoutsComplete ||
+        !targetEvaluation.judgment ||
+        !targetEvaluation.score ||
+        !targetEvaluation.questionResolution ||
+        !hasValidStandardPrimaryTargetLineage(
+          campaign,
+          variant,
+          targetConfig,
+          targetEvaluation,
+        ) ||
+        !['passed', 'warning'].includes(targetEvaluation.gate?.status)
+      ) return false;
+    } else {
+      const comparisonOrdinals = targetEvaluation?.comparisons
+        ?.map((comparison) => comparison.replicate)
+        .sort((left, right) => left - right);
+      const holdoutsComplete = campaign.config.benchmarks
+        .filter((benchmark) => benchmark.role === 'holdout')
+        .every((benchmark) =>
+          targetEvaluation?.holdoutReplicateFacts?.[benchmark.name]?.length === targetConfig.replicates
+        );
+      if (
+        targetEvaluation?.status !== 'completed' ||
+        !targetEvaluation.artifactCollectionComplete ||
+        targetEvaluation.controlReplicateFacts?.length !== targetConfig.replicates ||
+        targetEvaluation.excludedReplicateFacts?.length !== targetConfig.replicates ||
+        !holdoutsComplete ||
+        !targetEvaluation.judgment ||
+        !targetEvaluation.score ||
+        !targetEvaluation.questionResolution ||
+        targetEvaluation.comparisons?.length !== targetConfig.replicates ||
+        JSON.stringify(comparisonOrdinals) !== JSON.stringify([1, 2]) ||
+        targetEvaluation.comparisons.some((comparison) =>
+          !comparison.valid || comparison.leakagePaths.length > 0
+        ) ||
+        !['passed', 'warning'].includes(targetEvaluation.gate?.status)
+      ) return false;
+    }
   }
   const latestRound = Math.max(...variants.map((candidate) => candidate.round));
   if (variant.round !== latestRound) return false;

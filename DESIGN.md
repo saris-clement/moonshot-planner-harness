@@ -118,9 +118,28 @@ The frontend is native ES modules under `public/`, with no framework or runtime 
 
 The shell uses a compact collapsible desktop sidebar and an accessible mobile drawer. Overview owns campaign operations and active replicate matrices. Experiments owns the filterable ledger. Lineage renders round columns with dependency connectors and an equivalent list. Experiment detail keeps Summary as its default and adds a Markdown tab beside run, question, target-excluded, and artifact views. The server renders GitHub-style Markdown through an allowlisted sanitizer, shifts report headings below the page title, and attaches stable anchors to original Markdown H1-H3 headings. The browser builds a dynamic "On this page" rail from those anchors; deeper headings do not enter the rail. Raw Markdown remains available separately. Human review is a separate route with one central dirty-draft model; navigation, campaign changes, filters, units, and operations all pass through the same guard. SSE refreshes update persisted facts without replacing the draft.
 
-Variant creation writes the initial report before mutation or evaluation starts. The immutable hypothesis record supplies assumptions, selected parent diagnosis findings, instructions, expected impact, and risk. Later refreshes add parent comparisons, standard/control/excluded measurements, human-label coverage, diagnosis status, and a deterministic conclusion. A lower build count or provisional score is never phrased as verified improvement. Optional human notes are read from a separate sidecar and embedded verbatim without becoming scoring truth.
+Variant creation writes the initial report before mutation or evaluation starts. The immutable hypothesis record supplies assumptions, selected parent diagnosis findings, instructions, expected impact, and risk. Later refreshes add parent comparisons, protocol-aware normal/excluded measurements, human-label coverage, diagnosis status, and a deterministic conclusion. A lower build count or provisional score is never phrased as verified improvement. Optional human notes are read from a separate sidecar and embedded verbatim without becoming scoring truth.
 
 Replicate matrices are configured-slot projections, not lists of observed runs. For each benchmark and replicate number, the view left-joins execution state and final `replicateFacts`/`holdoutReplicateFacts`. Final facts take precedence for planner usage, live execution usage fills the current slot, and aggregate consensus usage is never added again. This keeps primary and holdout planner totals once-per-execution and excludes all harness-agent usage.
+
+## Target-Excluded Protocols
+
+Legacy `dedicated-control-v1` campaigns retain their separately resolved and executed control,
+holdout, and excluded artifacts. Missing protocol discriminators always parse as V1, and existing
+rows and sidecars are never rewritten.
+
+New `standard-primary-v2` campaigns freeze the target workflow at campaign creation. The primary
+pack is resolved once using the physically target-filtered source, and its measured ZIP SHA is bound
+to the runtime target configuration. Standard primary and excluded cases use those exact bytes;
+standard primary is the comparison normal arm and is never copied into a second control measurement.
+One normal-arm binding records the two standard case/run identities, and each comparison receipt binds
+those cases to the corresponding excluded cases and hash-verified report.
+
+Baseline execution automatically creates and calibrates V2 after the baseline image and standard
+artifacts are durable. Normal primary, holdouts, and excluded cohorts start concurrently. A failed
+excluded cohort blocks baseline completion or promotion but leaves archived standard facts reusable;
+retry reruns only excluded work. Diagnosis and strategist history include the binding as provenance,
+not as an independent observation.
 
 ## Change History
 
@@ -139,3 +158,10 @@ Replaced the single-page hash dashboard with explicit History API routes, config
 ### 2026-09-06 - Data-backed experiment narratives
 
 Added preregistered assumptions and intervention instructions, parent and three-arm metric summaries, conservative evidence-backed conclusions, hash-verified historical V11-V13c research inputs, preserved human-note sidecars, and an in-page Markdown tab without replacing the existing experiment summary.
+
+### 2026-09-07 - Standard-primary target protocol
+
+Added a versioned target protocol that freezes target identity at campaign creation, reuses one
+target-safe primary pack and standard measurement as the comparison control, runs normal, holdout,
+and excluded cohorts concurrently, binds comparison case identities, and preserves legacy dedicated
+control campaigns without reinterpretation.

@@ -6,6 +6,8 @@ import {
   DiagnosisProvenanceSchema,
   HypothesisSchema,
   TargetExcludedConfigSchema,
+  type TargetExcludedComparison,
+  TargetNormalArmBindingSchema,
 } from '../src/types.js';
 
 test('campaign benchmark names are unique across primary and holdouts', () => {
@@ -26,7 +28,67 @@ test('campaign benchmark names are unique across primary and holdouts', () => {
   assert.equal(result.success, false);
 });
 
-test('target-excluded protocol is fixed to two parallel replicates', () => {
+test('campaign target-excluded v2 declaration requires exactly two evaluation replicates', () => {
+  const input = {
+    id: 'target-excluded-v2',
+    goal: 'Compare target exclusion against the standard primary evaluation arm.',
+    plannerRepo: '/tmp/planner',
+    workflowsRepo: '/tmp/workflows',
+    environmentFile: '/tmp/planner.env',
+    seedRevision: 'seed',
+    workflowsRevision: 'source',
+    benchmarks: [
+      { name: 'primary-pack', role: 'primary' as const, zipPath: '/tmp/primary.zip' },
+      { name: 'holdout-pack', role: 'holdout' as const, zipPath: '/tmp/holdout.zip' },
+    ],
+    targetExcluded: {
+      protocol: 'standard-primary-v2' as const,
+      targetImplementationWorkflow: 'trumark/deceased-accounts',
+    },
+  };
+
+  assert.equal(
+    CampaignConfigSchema.safeParse({
+      ...input,
+      evaluation: { replicates: 3, replicateConcurrency: 2 },
+    }).success,
+    false,
+  );
+  const parsed = CampaignConfigSchema.parse({
+    ...input,
+    evaluation: { replicates: 2, replicateConcurrency: 2 },
+  });
+  assert.equal(parsed.targetExcluded?.protocol, 'standard-primary-v2');
+  assert.equal(
+    CampaignConfigSchema.safeParse({
+      ...input,
+      evaluation: { replicates: 2, replicateConcurrency: 2 },
+      targetExcluded: { ...input.targetExcluded, extra: true },
+    }).success,
+    false,
+  );
+});
+
+test('campaign configs without target-excluded declarations remain valid', () => {
+  const parsed = CampaignConfigSchema.parse({
+    id: 'legacy-campaign',
+    goal: 'Continue accepting existing campaign configuration documents unchanged.',
+    plannerRepo: '/tmp/planner',
+    workflowsRepo: '/tmp/workflows',
+    environmentFile: '/tmp/planner.env',
+    seedRevision: 'seed',
+    workflowsRevision: 'source',
+    benchmarks: [
+      { name: 'primary-pack', role: 'primary', zipPath: '/tmp/primary.zip' },
+      { name: 'holdout-pack', role: 'holdout', zipPath: '/tmp/holdout.zip' },
+    ],
+  });
+
+  assert.equal(parsed.targetExcluded, undefined);
+  assert.equal(parsed.evaluation.replicates, 3);
+});
+
+test('legacy target-excluded config parses as dedicated-control-v1', () => {
   const config = TargetExcludedConfigSchema.parse({
     targetImplementationWorkflow: 'trumark/deceased-accounts',
     baselineVariantId: 'campaign-v007',
@@ -34,6 +96,7 @@ test('target-excluded protocol is fixed to two parallel replicates', () => {
     configuredAt: '2026-09-06T12:00:00.000Z',
   });
 
+  assert.equal(config.protocol, 'dedicated-control-v1');
   assert.equal(config.replicates, 2);
   assert.equal(config.concurrency, 2);
   assert.equal(config.warningBuildDropRatio, 0.08);
@@ -47,6 +110,83 @@ test('target-excluded protocol is fixed to two parallel replicates', () => {
     }).success,
     false,
   );
+});
+
+test('standard-primary-v2 target-excluded runtime config parses with its normal arm source', () => {
+  const config = TargetExcludedConfigSchema.parse({
+    protocol: 'standard-primary-v2',
+    normalArmSource: 'standard_primary',
+    primaryResolvedArtifactSha: `sha256:${'b'.repeat(64)}`,
+    targetImplementationWorkflow: 'trumark/deceased-accounts',
+    baselineVariantId: 'campaign-v007',
+    comparatorImage: `sha256:${'a'.repeat(64)}`,
+    configuredAt: '2026-09-06T12:00:00.000Z',
+  });
+
+  assert.equal(config.protocol, 'standard-primary-v2');
+  if (config.protocol !== 'standard-primary-v2') assert.fail('expected v2 config');
+  assert.equal(config.normalArmSource, 'standard_primary');
+  assert.equal(config.primaryResolvedArtifactSha, `sha256:${'b'.repeat(64)}`);
+  assert.equal(config.replicates, 2);
+});
+
+test('target normal arm binding is strict and fixes replicate ordinals to one then two', () => {
+  const binding = {
+    source: 'standard_primary' as const,
+    benchmark: 'primary-pack',
+    resolvedArtifactSha: `sha256:${'c'.repeat(64)}`,
+    replicates: [
+      { replicate: 1 as const, caseId: 'case-1', runId: 'run-1' },
+      { replicate: 2 as const, caseId: 'case-2', runId: 'run-2' },
+    ],
+  };
+
+  assert.deepEqual(TargetNormalArmBindingSchema.parse(binding), binding);
+  assert.equal(
+    TargetNormalArmBindingSchema.safeParse({
+      ...binding,
+      replicates: [binding.replicates[1], binding.replicates[0]],
+    }).success,
+    false,
+  );
+  assert.equal(
+    TargetNormalArmBindingSchema.safeParse({
+      ...binding,
+      replicates: [{ ...binding.replicates[0], caseId: '' }, binding.replicates[1]],
+    }).success,
+    false,
+  );
+  assert.equal(
+    TargetNormalArmBindingSchema.safeParse({
+      ...binding,
+      replicates: [binding.replicates[0], { ...binding.replicates[1], runId: 'x'.repeat(257) }],
+    }).success,
+    false,
+  );
+  assert.equal(
+    TargetNormalArmBindingSchema.safeParse({ ...binding, resolvedArtifactSha: 'not-a-sha' }).success,
+    false,
+  );
+  assert.equal(TargetNormalArmBindingSchema.safeParse({ ...binding, extra: true }).success, false);
+});
+
+test('persisted target-excluded comparisons permit absent legacy case and run IDs as null', () => {
+  const comparison: TargetExcludedComparison = {
+    replicate: 1,
+    normalCaseId: null,
+    excludedCaseId: null,
+    normalRunId: null,
+    excludedRunId: null,
+    valid: true,
+    mismatches: [],
+    leakagePaths: [],
+    reportHash: null,
+  };
+
+  assert.equal(comparison.normalCaseId, null);
+  assert.equal(comparison.excludedCaseId, null);
+  assert.equal(comparison.normalRunId, null);
+  assert.equal(comparison.excludedRunId, null);
 });
 
 test('diagnosis and strategist handoff schemas are strict and provenance-explicit', () => {

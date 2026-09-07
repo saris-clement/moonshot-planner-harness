@@ -205,13 +205,24 @@ function runTargetExcluded(variantId) {
   );
 }
 
-function answerTargetExcludedQuestion(variantId, questionId, answer, selectedOptionId) {
+function answerTargetExcludedQuestion(
+  variantId,
+  questionId,
+  answer,
+  selectedOptionId,
+  benchmark,
+  replicate,
+) {
   return runAction(
     () => api(
       `/api/campaigns/${encodeURIComponent(state.campaign.id)}/variants/${encodeURIComponent(variantId)}/target-excluded/questions/${encodeURIComponent(questionId)}/answer`,
       {
         method: 'PUT',
-        body: JSON.stringify({ answer, ...(selectedOptionId ? { selectedOptionId } : {}) }),
+        body: JSON.stringify({
+          answer,
+          ...(selectedOptionId ? { selectedOptionId } : {}),
+          ...(benchmark !== undefined && replicate !== undefined ? { benchmark, replicate } : {}),
+        }),
       },
     ),
     'Target-excluded question answered',

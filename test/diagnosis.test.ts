@@ -11,7 +11,13 @@ import {
   verifyDiagnosisResult,
 } from '../src/diagnosis.js';
 import { HarnessDatabase } from '../src/db.js';
-import { CampaignConfigSchema, DiagnosisInputSchema, type RunFacts } from '../src/types.js';
+import {
+  CampaignConfigSchema,
+  DiagnosisInputSchema,
+  TargetExcludedConfigSchema,
+  type RunFacts,
+  type TargetNormalArmBinding,
+} from '../src/types.js';
 
 function stable(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stable);
@@ -101,11 +107,21 @@ function armFacts(
   };
 }
 
-function comparisonReport(replicate: number): Record<string, unknown> {
+function comparisonReport(replicate: number, legacy = false): Record<string, unknown> {
   const value = {
     kind: 'ainative-planner/evidence-visibility-comparison',
     schemaVersion: 1,
     generatedAt: `2026-09-06T00:00:0${replicate}.000Z`,
+    ...(legacy
+      ? {}
+      : {
+          inputs: {
+            normalCaseId: `case-control-${replicate}`,
+            excludedCaseId: `case-excluded-${replicate}`,
+            normalRunId: `run-control-${replicate}`,
+            excludedRunId: `run-excluded-${replicate}`,
+          },
+        }),
     validity: {
       valid: true,
       arms: {
@@ -135,7 +151,10 @@ async function transcriptRef(
   return { objectKey, bytes: Buffer.byteLength(body), mediaType: 'application/json', artifactSha256 };
 }
 
-async function fixture(version: 1 | 2): Promise<{
+async function fixture(
+  version: 1 | 2,
+  targetProtocol: 'none' | 'standard-primary-v2' = 'none',
+): Promise<{
   root: string;
   database: HarnessDatabase;
   campaignId: string;
@@ -156,14 +175,25 @@ async function fixture(version: 1 | 2): Promise<{
 
   const database = new HarnessDatabase(path.join(root, 'harness.sqlite'));
   const config = CampaignConfigSchema.parse({
-    id: `diagnosis-v${version}`,
+    id: `diagnosis-v${version}${targetProtocol === 'standard-primary-v2' ? '-target-v2' : ''}`,
     goal: 'Reconstruct evidence hydration without converting model interpretation into scoring truth.',
     plannerRepo: root,
     workflowsRepo: workflows,
     environmentFile: path.join(root, 'environment.env'),
     seedRevision: 'seed',
     workflowsRevision: 'workflows',
-    evaluation: { replicates: 1, replicateConcurrency: 1 },
+    evaluation:
+      targetProtocol === 'standard-primary-v2'
+        ? { replicates: 2, replicateConcurrency: 2 }
+        : { replicates: 1, replicateConcurrency: 1 },
+    ...(targetProtocol === 'standard-primary-v2'
+      ? {
+          targetExcluded: {
+            protocol: 'standard-primary-v2' as const,
+            targetImplementationWorkflow: 'generic/target',
+          },
+        }
+      : {}),
     benchmarks: [
       { name: 'primary-pack', role: 'primary', zipPath: path.join(root, 'primary.zip') },
       { name: 'holdout-pack', role: 'holdout', zipPath: path.join(root, 'holdout.zip') },
@@ -209,25 +239,27 @@ async function fixture(version: 1 | 2): Promise<{
     status: 'review',
     artifactCollectionComplete: true,
     facts: runFacts,
-    replicateFacts: [runFacts],
+    replicateFacts:
+      targetProtocol === 'standard-primary-v2' ? [runFacts, runFacts] : [runFacts],
     judgment,
     executionState: {
-      executions: [
-        {
+      executions: Array.from(
+        { length: targetProtocol === 'standard-primary-v2' ? 2 : 1 },
+        (_, index) => ({
           benchmark: 'primary-pack',
           role: 'primary',
-          replicate: 1,
-          replicateCount: 1,
-          caseId: 'case-a',
-          runId: 'run-a',
+          replicate: index + 1,
+          replicateCount: targetProtocol === 'standard-primary-v2' ? 2 : 1,
+          caseId: index === 0 ? 'case-a' : `case-standard-${index + 1}`,
+          runId: index === 0 ? 'run-a' : `run-standard-${index + 1}`,
           status: 'completed',
           stage: 'publishing',
           progress: { completedUnits: 1, totalUnits: 1 },
           decisions: runFacts.decisions,
           questions: [],
           updatedAt: '2026-09-06T00:00:00.000Z',
-        },
-      ],
+        }),
+      ),
     },
   });
   database.upsertLabel({
@@ -247,6 +279,16 @@ async function fixture(version: 1 | 2): Promise<{
     status: 'completed',
     facts: runFacts,
   });
+  if (targetProtocol === 'standard-primary-v2') {
+    const secondReplicate = path.join(artifacts, 'primary-pack', 'replicate-2');
+    await writeJson(path.join(secondReplicate, 'facts.json'), runFacts);
+    await writeJson(path.join(secondReplicate, 'result.json'), {
+      caseId: 'case-standard-2',
+      runId: 'run-standard-2',
+      status: 'completed',
+      facts: runFacts,
+    });
+  }
   await writeJson(path.join(replicate, 'analysis.json'), {
     metadata: { caseId: 'case-a', runId: 'run-a', pins: runFacts.pins },
     analysis: {
@@ -550,12 +592,13 @@ test('diagnosis lineage classifies standard and integrated excluded arms with bo
   }
 });
 
-test('diagnosis includes target arm facts, judgment, reports, summary, and backfill lineage', async () => {
+test('dedicated-control-v1 diagnosis preserves separate control and excluded evidence', async () => {
   const value = await fixture(2);
   try {
     const campaign = value.database.getCampaign(value.campaignId);
     const variant = value.database.getVariant(value.variantId);
-    const targetSource = 'src/target.ts';
+    const targetSource = 'src/customers/generic/target/index.ts';
+    await mkdir(path.dirname(path.join(value.workflows, targetSource)), { recursive: true });
     await writeFile(
       path.join(value.workflows, targetSource),
       'export type TargetAccountAlias = string;\n',
@@ -586,7 +629,7 @@ test('diagnosis includes target arm facts, judgment, reports, summary, and backf
         runFacts,
       );
     }
-    const reports = [comparisonReport(1), comparisonReport(2)];
+    const reports = [comparisonReport(1, true), comparisonReport(2, true)];
     const comparisonHashes = reports.map((report) => String(report.hash));
     for (const [index, report] of reports.entries()) {
       await writeJson(
@@ -665,6 +708,10 @@ test('diagnosis includes target arm facts, judgment, reports, summary, and backf
       },
       comparisons: comparisonHashes.map((reportHash, index) => ({
         replicate: index + 1,
+        normalCaseId: null,
+        excludedCaseId: null,
+        normalRunId: null,
+        excludedRunId: null,
         valid: true,
         mismatches: [],
         leakagePaths: [],
@@ -673,6 +720,12 @@ test('diagnosis includes target arm facts, judgment, reports, summary, and backf
       artifactCollectionComplete: false,
       error: 'target archive interrupted',
     });
+    const targetExcludedConfig = TargetExcludedConfigSchema.parse({
+      targetImplementationWorkflow: 'generic/target',
+      baselineVariantId: value.variantId,
+      comparatorImage: `sha256:${'7'.repeat(64)}`,
+      configuredAt: '2026-09-06T00:00:00.000Z',
+    });
 
     const assembled = await assembleDiagnosisInput({
       artifactDirectory: value.artifacts,
@@ -680,6 +733,7 @@ test('diagnosis includes target arm facts, judgment, reports, summary, and backf
       variant,
       labels: value.database.listLabels(value.campaignId),
       targetExcluded,
+      targetExcludedConfig,
       workflowsSource: value.workflows,
       environment: {},
     });
@@ -746,7 +800,253 @@ test('diagnosis includes target arm facts, judgment, reports, summary, and backf
     assert.equal(summaryData?.error, 'target archive interrupted');
     assert.equal(summaryData?.artifactCollectionComplete, false);
     assert.deepEqual(summaryData?.comparisonHashes, comparisonHashes);
+    assert.deepEqual(
+      (summaryData?.comparisons as Array<Record<string, unknown>>).map(
+        ({ normalCaseId, excludedCaseId, normalRunId, excludedRunId }) => ({
+          normalCaseId,
+          excludedCaseId,
+          normalRunId,
+          excludedRunId,
+        }),
+      ),
+      [
+        {
+          normalCaseId: null,
+          excludedCaseId: null,
+          normalRunId: null,
+          excludedRunId: null,
+        },
+        {
+          normalCaseId: null,
+          excludedCaseId: null,
+          normalRunId: null,
+          excludedRunId: null,
+        },
+      ],
+    );
+    assert.deepEqual(
+      (summaryData?.comparisonArtifactHashes as Array<Record<string, unknown>>).map(
+        ({ normalCaseId, excludedCaseId, normalRunId, excludedRunId }) => ({
+          normalCaseId,
+          excludedCaseId,
+          normalRunId,
+          excludedRunId,
+        }),
+      ),
+      [
+        {
+          normalCaseId: null,
+          excludedCaseId: null,
+          normalRunId: null,
+          excludedRunId: null,
+        },
+        {
+          normalCaseId: null,
+          excludedCaseId: null,
+          normalRunId: null,
+          excludedRunId: null,
+        },
+      ],
+    );
+    assert.doesNotMatch(JSON.stringify(summaryData), /undefined/);
     assert.deepEqual(summaryData?.questionResolution, stable(targetExcluded.questionResolution));
+    assert.deepEqual(assembled.input.campaign.targetExcludedProtocol, {
+      protocol: 'dedicated-control-v1',
+      targetImplementationWorkflow: 'generic/target',
+      baselineVariantId: value.variantId,
+      comparatorImage: `sha256:${'7'.repeat(64)}`,
+      replicates: 2,
+      concurrency: 2,
+      warningBuildDropRatio: 0.08,
+      blockBuildDropRatio: 0.15,
+      sourceManifestSha256: null,
+      normalArmBinding: null,
+    });
+
+    const currentProtocol = assembled.input.campaign.targetExcludedProtocol!;
+    const { protocol: _protocol, normalArmBinding: _normalArmBinding, ...legacyProtocol } =
+      currentProtocol;
+    const legacyParsed = DiagnosisInputSchema.parse({
+      ...assembled.input,
+      campaign: {
+        ...assembled.input.campaign,
+        targetExcludedProtocol: legacyProtocol,
+      },
+    });
+    assert.equal(legacyParsed.campaign.targetExcludedProtocol?.protocol, undefined);
+    assert.equal(legacyParsed.campaign.targetExcludedProtocol?.normalArmBinding, undefined);
+  } finally {
+    value.database.close();
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test('standard-primary-v2 diagnosis reuses standard lineage and filters target source identity including relative barrels', async () => {
+  const value = await fixture(2, 'standard-primary-v2');
+  try {
+    const campaign = value.database.getCampaign(value.campaignId);
+    const variant = value.database.getVariant(value.variantId);
+    const targetSource = 'src/customers/generic/target/index.ts';
+    const targetBarrelSource = 'src/shared/target-barrel.ts';
+    const resolvedArtifactSha = `sha256:${'6'.repeat(64)}`;
+    await mkdir(path.dirname(path.join(value.workflows, targetSource)), { recursive: true });
+    await mkdir(path.dirname(path.join(value.workflows, targetBarrelSource)), { recursive: true });
+    await writeFile(
+      path.join(value.workflows, targetSource),
+      'export type TargetAccountAlias = string;\n',
+    );
+    await writeFile(
+      path.join(value.workflows, targetBarrelSource),
+      "export * from '../customers/generic/target/index.js';\n",
+    );
+    const excludedReplicates = [
+      armFacts('solution/target#field-a', 'build', targetSource),
+      armFacts('solution/target#field-a', 'reuse', targetBarrelSource),
+    ];
+    const excludedFacts = armFacts('solution/target#field-a', 'build', targetBarrelSource, 2);
+    for (const [index, runFacts] of excludedReplicates.entries()) {
+      const replicate = index + 1;
+      const directory = path.join(
+        value.artifacts,
+        'target-excluded',
+        'excluded',
+        'primary-pack',
+        `replicate-${replicate}`,
+      );
+      await writeJson(path.join(directory, 'facts.json'), runFacts);
+      await writeJson(path.join(directory, 'result.json'), {
+        caseId: `case-excluded-${replicate}`,
+        runId: `run-excluded-${replicate}`,
+        status: 'completed',
+        facts: runFacts,
+      });
+    }
+    value.database.createTargetExcludedEvaluation(value.campaignId, value.variantId);
+    const normalArmBinding: TargetNormalArmBinding = {
+      source: 'standard_primary',
+      benchmark: 'primary-pack',
+      resolvedArtifactSha,
+      replicates: [
+        { replicate: 1, caseId: 'case-a', runId: 'run-a' },
+        {
+          replicate: 2,
+          caseId: 'case-standard-2',
+          runId: 'run-standard-2',
+        },
+      ],
+    };
+    const targetExcluded = value.database.updateTargetExcludedEvaluation(value.variantId, {
+      status: 'completed',
+      controlFacts: null,
+      controlReplicateFacts: null,
+      holdoutFacts: null,
+      holdoutReplicateFacts: null,
+      excludedFacts,
+      excludedReplicateFacts: excludedReplicates,
+      executionState: {
+        executions: excludedReplicates.map((runFacts, index) => ({
+          benchmark: 'primary-pack:excluded',
+          role: 'primary' as const,
+          replicate: index + 1,
+          replicateCount: 2,
+          caseId: `case-excluded-${index + 1}`,
+          runId: `run-excluded-${index + 1}`,
+          status: 'completed',
+          stage: 'publishing',
+          progress: { completedUnits: 1, totalUnits: 1 },
+          decisions: runFacts.decisions,
+          questions: [],
+          updatedAt: '2026-09-06T00:00:02.000Z',
+        })),
+      },
+      normalArmBinding,
+      artifactCollectionComplete: true,
+    });
+    const targetExcludedConfig = TargetExcludedConfigSchema.parse({
+      protocol: 'standard-primary-v2',
+      normalArmSource: 'standard_primary',
+      primaryResolvedArtifactSha: resolvedArtifactSha,
+      targetImplementationWorkflow: 'generic/target',
+      baselineVariantId: value.variantId,
+      comparatorImage: `sha256:${'7'.repeat(64)}`,
+      configuredAt: '2026-09-06T00:00:00.000Z',
+    });
+
+    const assembled = await assembleDiagnosisInput({
+      artifactDirectory: value.artifacts,
+      campaign,
+      variant,
+      labels: value.database.listLabels(value.campaignId),
+      targetExcluded,
+      targetExcludedConfig,
+      workflowsSource: value.workflows,
+      environment: {},
+    });
+
+    assert.equal(assembled.input.campaign.targetExcludedProtocol?.protocol, 'standard-primary-v2');
+    assert.deepEqual(
+      assembled.input.campaign.targetExcludedProtocol?.normalArmBinding,
+      normalArmBinding,
+    );
+    assert.deepEqual(
+      [...new Set(assembled.input.lineage.map(({ arm }) => arm))].sort(),
+      ['excluded', 'standard'],
+    );
+    assert.equal(assembled.input.lineage.filter(({ arm }) => arm === 'standard').length, 2);
+    assert.equal(assembled.input.lineage.filter(({ arm }) => arm === 'excluded').length, 2);
+    assert.equal(assembled.input.lineage.filter(({ arm }) => arm === 'control').length, 0);
+    assert.equal(
+      assembled.input.completeness.items.filter(
+        ({ component, scope }) => component === 'replicate_facts' && scope.includes('/control/'),
+      ).length,
+      0,
+    );
+    const bindingEvidence = assembled.input.evidence.filter(
+      ({ kind }) => kind === 'target_normal_arm_binding',
+    );
+    assert.equal(bindingEvidence.length, 1);
+    assert.deepEqual(bindingEvidence[0]?.affectedUnitKeys, []);
+    assert.equal(bindingEvidence[0]?.provenance.artifactSha256, resolvedArtifactSha);
+    assert.deepEqual(
+      (bindingEvidence[0]?.data as Record<string, unknown>).normalArmBinding,
+      stable(normalArmBinding),
+    );
+    assert.match(bindingEvidence[0]?.summary ?? '', /reused as the comparison normal arm/);
+    const summary = assembled.input.evidence.find(
+      ({ kind }) => kind === 'target_excluded_summary',
+    );
+    assert.equal(
+      Object.hasOwn(summary?.data as object, 'controlDecisions'),
+      false,
+    );
+    assert.equal(
+      assembled.input.evidence.filter(
+        ({ kind, summary }) => kind === 'replicate_facts' && summary.includes('/control/'),
+      ).length,
+      0,
+    );
+    const frozenSourceEvidence = assembled.input.evidence.filter(
+      ({ kind }) => kind === 'frozen_source_reference',
+    );
+    assert.ok(
+      frozenSourceEvidence.some(({ data }) =>
+        JSON.stringify(data).includes('src/right.ts'),
+      ),
+    );
+    assert.doesNotMatch(JSON.stringify(frozenSourceEvidence), /src\/customers\/generic\/target/);
+    assert.doesNotMatch(JSON.stringify(frozenSourceEvidence), /TargetAccountAlias/);
+    assert.doesNotMatch(JSON.stringify(frozenSourceEvidence), /src\/shared\/target-barrel\.ts/);
+    assert.doesNotMatch(JSON.stringify(frozenSourceEvidence), /\.\.\/customers\/generic\/target/);
+    const frozenSourceCompleteness = assembled.input.completeness.items.find(
+      ({ component, scope }) =>
+        component === 'frozen_source' && scope === 'campaign-workflows',
+    );
+    assert.equal(frozenSourceCompleteness?.status, 'partial');
+    assert.ok(
+      frozenSourceCompleteness?.limitations.includes(
+        'Filtered 2 frozen-source candidates containing the standard-primary-v2 excluded target identity.',
+      ),
+    );
   } finally {
     value.database.close();
     await rm(value.root, { recursive: true, force: true });

@@ -32,12 +32,16 @@ const campaignId = 'ui-e2e';
 const baselineId = 'ui-e2e-v000';
 const liveId = 'ui-e2e-v001';
 const reviewId = 'ui-e2e-v002';
+const legacyCampaignId = 'legacy-ui-e2e';
+const legacyLiveId = 'legacy-ui-e2e-v001';
+const resolvedArtifactSha = `sha256:${'d'.repeat(64)}`;
 
 async function gitFixture(directory: string, remote = false): Promise<string> {
   await mkdir(directory, { recursive: true });
   await writeFile(path.join(directory, 'README.md'), 'fixture\n');
   if (remote) {
     await mkdir(path.join(directory, 'src/shared'), { recursive: true });
+    await mkdir(path.join(directory, 'src/customers/trumark/deceased-accounts'), { recursive: true });
     await writeFile(
       path.join(directory, 'src/shared/account.ts'),
       [
@@ -47,6 +51,10 @@ async function gitFixture(directory: string, remote = false): Promise<string> {
         '}',
         '',
       ].join('\n'),
+    );
+    await writeFile(
+      path.join(directory, 'src/customers/trumark/deceased-accounts/index.ts'),
+      'export const workflow = "deceased-accounts";\n',
     );
   }
   await runCommand('git', ['init'], { cwd: directory });
@@ -142,7 +150,7 @@ function execution(input: {
     benchmark: input.benchmark,
     role: input.role,
     replicate: input.replicate,
-    replicateCount: input.replicateCount ?? 3,
+    replicateCount: input.replicateCount ?? 2,
     caseId: `case-${input.benchmark}-${input.replicate}`,
     runId: `run-${input.benchmark}-${input.replicate}`,
     status: input.status ?? 'completed',
@@ -176,8 +184,12 @@ async function seedCampaign(): Promise<void> {
       { name: 'primary-pack', role: 'primary', zipPath: primaryZip },
       { name: 'holdout-pack', role: 'holdout', zipPath: holdoutZip },
     ],
+    targetExcluded: {
+      protocol: 'standard-primary-v2',
+      targetImplementationWorkflow: 'trumark/deceased-accounts',
+    },
     mode: 'supervised',
-    evaluation: { replicates: 3, replicateConcurrency: 2 },
+    evaluation: { replicates: 2, replicateConcurrency: 2 },
     limits: { concurrency: 3, maxVariants: 9 },
   });
   const judgment: JudgeOutput = {
@@ -203,8 +215,8 @@ async function seedCampaign(): Promise<void> {
     status: 'suggested',
   });
 
-  const primaryReplicates = [runFacts(primaryUsage()), runFacts(primaryUsage()), runFacts(primaryUsage())];
-  const holdoutReplicates = [runFacts(holdoutUsage(), 'reuse'), runFacts(holdoutUsage(), 'reuse'), runFacts(holdoutUsage(), 'reuse')];
+  const primaryReplicates = [runFacts(primaryUsage()), runFacts(primaryUsage())];
+  const holdoutReplicates = [runFacts(holdoutUsage(), 'reuse'), runFacts(holdoutUsage(), 'reuse')];
   const baselineFacts = consensusRunFacts(primaryReplicates);
   const baselineHoldout = consensusRunFacts(holdoutReplicates);
   const baseline = database.createVariant({
@@ -234,6 +246,25 @@ async function seedCampaign(): Promise<void> {
     score: computeScore(baselineFacts, database.listLabels(campaignId, 'primary-pack'), judgment),
     holdoutScores: {
       'holdout-pack': computeScore(baselineHoldout, [], judgment),
+    },
+    questionResolutions: {
+      'primary-pack': {
+        derivationVersion: 2,
+        benchmark: 'primary-pack',
+        originalArtifactSha: `sha256:${'c'.repeat(64)}`,
+        resolvedArtifactSha,
+        blockingQuestions: 0,
+        requirementsAgentRequests: 0,
+        requirementsAgentAnswers: 0,
+        sourceFallbackAnswers: 0,
+        reusedAnswers: 0,
+        plannerQuestions: 0,
+        plannerRequirementsAgentRequests: 0,
+        plannerRequirementsAgentAnswers: 0,
+        plannerSourceFallbackAnswers: 0,
+        plannerReusedAnswers: 0,
+        entries: [],
+      },
     },
     startedAt: '2026-09-06T05:00:00.000Z',
     completedAt: '2026-09-06T05:00:20.000Z',
@@ -265,7 +296,6 @@ async function seedCampaign(): Promise<void> {
           ],
         }),
         execution({ benchmark: 'primary-pack', role: 'primary', replicate: 2 }),
-        execution({ benchmark: 'primary-pack', role: 'primary', replicate: 3 }),
         execution({
           benchmark: 'holdout-pack',
           role: 'holdout',
@@ -288,7 +318,6 @@ async function seedCampaign(): Promise<void> {
           ],
         }),
         execution({ benchmark: 'holdout-pack', role: 'holdout', replicate: 2 }),
-        execution({ benchmark: 'holdout-pack', role: 'holdout', replicate: 3 }),
       ],
     },
   });
@@ -329,6 +358,22 @@ async function seedCampaign(): Promise<void> {
           completedUnits: 2,
           totalUnits: 5,
           decisions: { build: 1, reuse: 1, extend: 0, defer: 0, question: 0 },
+          questions: [
+            {
+              id: 'shared-target-question',
+              type: 'target_scope',
+              ownerRole: 'product',
+              priority: 'blocking',
+              prompt: 'Which policy applies to the standard primary run?',
+              rationale: 'The normal arm requires a scoped product answer.',
+              status: 'open',
+              answer: null,
+              resolution: null,
+              evidence: [],
+              createdAt: '2026-09-06T05:01:00.000Z',
+              updatedAt: '2026-09-06T05:01:00.000Z',
+            },
+          ],
           usage: {
             calls: 2,
             inputTokens: 500,
@@ -360,43 +405,82 @@ async function seedCampaign(): Promise<void> {
   });
   database.updateVariant(review.id, {
     status: 'review',
+    artifactCollectionComplete: true,
     facts: baselineFacts,
     replicateFacts: primaryReplicates,
     holdoutFacts: { 'holdout-pack': baselineHoldout },
     holdoutReplicateFacts: { 'holdout-pack': holdoutReplicates },
+    holdoutJudgments: { 'holdout-pack': judgment },
+    holdoutScores: {
+      'holdout-pack': computeScore(baselineHoldout, [], judgment),
+    },
     judgment,
     score: computeScore(baselineFacts, database.listLabels(campaignId, 'primary-pack'), judgment),
+    questionResolutions: {
+      'primary-pack': {
+        derivationVersion: 2,
+        benchmark: 'primary-pack',
+        originalArtifactSha: `sha256:${'c'.repeat(64)}`,
+        resolvedArtifactSha,
+        blockingQuestions: 0,
+        requirementsAgentRequests: 0,
+        requirementsAgentAnswers: 0,
+        sourceFallbackAnswers: 0,
+        reusedAnswers: 0,
+        plannerQuestions: 0,
+        plannerRequirementsAgentRequests: 0,
+        plannerRequirementsAgentAnswers: 0,
+        plannerSourceFallbackAnswers: 0,
+        plannerReusedAnswers: 0,
+        entries: [],
+      },
+    },
     elapsedMs: 18_000,
     phase2ElapsedMs: 13_000,
-    executionState: baseline.executionState,
+    executionState: database.getVariant(baseline.id).executionState,
   });
 
   database.createTargetExcludedConfig(campaignId, {
+    protocol: 'standard-primary-v2',
     targetImplementationWorkflow: 'trumark/deceased-accounts',
     baselineVariantId: baseline.id,
     comparatorImage: `sha256:${'a'.repeat(64)}`,
     configuredAt: '2026-09-06T05:00:00.000Z',
-    replicates: 2,
-    concurrency: 2,
-    warningBuildDropRatio: 0.08,
-    blockBuildDropRatio: 0.15,
+    normalArmSource: 'standard_primary',
+    primaryResolvedArtifactSha: resolvedArtifactSha,
   });
   const excludedReplicates = [runFacts(primaryUsage()), runFacts(primaryUsage())];
   const excludedFacts = consensusRunFacts(excludedReplicates);
   database.createTargetExcludedEvaluation(campaignId, baseline.id);
   database.updateTargetExcludedEvaluation(baseline.id, {
     status: 'completed',
-    controlFacts: excludedFacts,
-    controlReplicateFacts: excludedReplicates,
-    holdoutFacts: { 'holdout-pack': baselineHoldout },
-    holdoutReplicateFacts: { 'holdout-pack': holdoutReplicates.slice(0, 2) },
     excludedFacts,
     excludedReplicateFacts: excludedReplicates,
     judgment,
     score: computeScore(excludedFacts, [], judgment),
     comparisons: [
-      { replicate: 1, valid: true, mismatches: [], leakagePaths: [], reportHash: `sha256:${'b'.repeat(64)}` },
-      { replicate: 2, valid: true, mismatches: [], leakagePaths: [], reportHash: `sha256:${'c'.repeat(64)}` },
+      {
+        replicate: 1,
+        normalCaseId: 'case-primary-pack-1',
+        excludedCaseId: 'case-primary-pack:excluded-1',
+        normalRunId: 'run-primary-pack-1',
+        excludedRunId: 'run-primary-pack:excluded-1',
+        valid: true,
+        mismatches: [],
+        leakagePaths: [],
+        reportHash: `sha256:${'b'.repeat(64)}`,
+      },
+      {
+        replicate: 2,
+        normalCaseId: 'case-primary-pack-2',
+        excludedCaseId: 'case-primary-pack:excluded-2',
+        normalRunId: 'run-primary-pack-2',
+        excludedRunId: 'run-primary-pack:excluded-2',
+        valid: true,
+        mismatches: [],
+        leakagePaths: [],
+        reportHash: `sha256:${'c'.repeat(64)}`,
+      },
     ],
     gate: {
       status: 'passed',
@@ -406,6 +490,21 @@ async function seedCampaign(): Promise<void> {
       reasons: [],
     },
     artifactCollectionComplete: true,
+    normalArmBinding: {
+      source: 'standard_primary',
+      benchmark: 'primary-pack',
+      resolvedArtifactSha,
+      replicates: [
+        { replicate: 1, caseId: 'case-primary-pack-1', runId: 'run-primary-pack-1' },
+        { replicate: 2, caseId: 'case-primary-pack-2', runId: 'run-primary-pack-2' },
+      ],
+    },
+    executionState: {
+      executions: [
+        execution({ benchmark: 'primary-pack:excluded', role: 'primary', replicate: 1 }),
+        execution({ benchmark: 'primary-pack:excluded', role: 'primary', replicate: 2 }),
+      ],
+    },
     startedAt: '2026-09-06T05:00:00.000Z',
     completedAt: '2026-09-06T05:00:10.000Z',
   });
@@ -415,7 +514,7 @@ async function seedCampaign(): Promise<void> {
     executionState: {
       executions: [
         execution({
-          benchmark: 'primary-pack:control',
+          benchmark: 'primary-pack:excluded',
           role: 'primary',
           replicate: 1,
           replicateCount: 2,
@@ -425,10 +524,103 @@ async function seedCampaign(): Promise<void> {
           completedUnits: 1,
           totalUnits: 5,
           decisions: { build: 1, reuse: 0, extend: 0, defer: 0, question: 0 },
+          questions: [
+            {
+              id: 'shared-target-question',
+              type: 'target_scope',
+              ownerRole: 'product',
+              priority: 'blocking',
+              prompt: 'Which policy applies to the target-excluded run?',
+              rationale: 'The excluded arm requires an independently scoped answer.',
+              status: 'open',
+              answer: null,
+              resolution: null,
+              evidence: [],
+              createdAt: '2026-09-06T05:01:00.000Z',
+              updatedAt: '2026-09-06T05:01:00.000Z',
+            },
+          ],
         }),
       ],
     },
     startedAt: new Date(Date.now() - 5_000).toISOString(),
+  });
+  database.createTargetExcludedEvaluation(campaignId, review.id);
+  database.updateTargetExcludedEvaluation(review.id, {
+    status: 'completed',
+    excludedFacts,
+    excludedReplicateFacts: excludedReplicates,
+    judgment,
+    score: computeScore(excludedFacts, [], judgment),
+    questionResolution: {
+      derivationVersion: 2,
+      benchmark: 'primary-pack',
+      originalArtifactSha: `sha256:${'c'.repeat(64)}`,
+      resolvedArtifactSha,
+      blockingQuestions: 0,
+      requirementsAgentRequests: 0,
+      requirementsAgentAnswers: 0,
+      sourceFallbackAnswers: 0,
+      reusedAnswers: 0,
+      plannerQuestions: 0,
+      plannerRequirementsAgentRequests: 0,
+      plannerRequirementsAgentAnswers: 0,
+      plannerSourceFallbackAnswers: 0,
+      plannerReusedAnswers: 0,
+      entries: [],
+    },
+    comparisons: [
+      {
+        replicate: 1,
+        normalCaseId: 'case-primary-pack-1',
+        excludedCaseId: 'case-primary-pack:excluded-1',
+        normalRunId: 'run-primary-pack-1',
+        excludedRunId: 'run-primary-pack:excluded-1',
+        valid: true,
+        mismatches: [],
+        leakagePaths: [],
+        reportHash: `sha256:${'4'.repeat(64)}`,
+      },
+      {
+        replicate: 2,
+        normalCaseId: 'case-primary-pack-2',
+        excludedCaseId: 'case-primary-pack:excluded-2',
+        normalRunId: 'run-primary-pack-2',
+        excludedRunId: 'run-primary-pack:excluded-2',
+        valid: true,
+        mismatches: [],
+        leakagePaths: [],
+        reportHash: `sha256:${'5'.repeat(64)}`,
+      },
+    ],
+    gate: {
+      status: 'passed',
+      baselineMeanBuildRate: 1,
+      candidateMeanBuildRate: 1,
+      buildDropRatio: 0,
+      reasons: [],
+    },
+    normalArmBinding: {
+      source: 'standard_primary',
+      benchmark: 'primary-pack',
+      resolvedArtifactSha,
+      replicates: [
+        { replicate: 1, caseId: 'case-primary-pack-1', runId: 'run-primary-pack-1' },
+        { replicate: 2, caseId: 'case-primary-pack-2', runId: 'run-primary-pack-2' },
+      ],
+    },
+    executionState: {
+      executions: [
+        execution({ benchmark: 'primary-pack:excluded', role: 'primary', replicate: 1 }),
+        execution({ benchmark: 'primary-pack:excluded', role: 'primary', replicate: 2 }),
+      ],
+    },
+    artifactCollectionComplete: true,
+  });
+  database.updateVariant(review.id, {
+    diagnosisStatus: 'completed',
+    diagnosisInputHash: `sha256:${'8'.repeat(64)}`,
+    diagnosisResultHash: `sha256:${'9'.repeat(64)}`,
   });
   database.updateCampaign(campaign.id, {
     status: 'running_round',
@@ -438,6 +630,62 @@ async function seedCampaign(): Promise<void> {
   await mkdir(artifactRoot, { recursive: true });
   await writeFile(path.join(artifactRoot, 'planner-output.json'), '{"status":"completed"}\n');
   await orchestrator.refreshReports(campaignId);
+}
+
+async function seedLegacyCampaign(): Promise<void> {
+  const campaign = await orchestrator.initializeFromInput({
+    id: legacyCampaignId,
+    goal: 'Preserve the dedicated-control V1 target-excluded campaign display for historical records.',
+    plannerRepo,
+    workflowsRepo,
+    environmentFile,
+    seedRevision: seedSha,
+    workflowsRevision: workflowsSha,
+    benchmarks: [
+      { name: 'legacy-primary', role: 'primary', zipPath: primaryZip },
+      { name: 'legacy-holdout', role: 'holdout', zipPath: holdoutZip },
+    ],
+    mode: 'supervised',
+    evaluation: { replicates: 3, replicateConcurrency: 2 },
+    limits: { concurrency: 3, maxVariants: 9 },
+  });
+  const live = database.createVariant({
+    id: legacyLiveId,
+    campaignId: campaign.id,
+    parentVariantId: null,
+    round: 1,
+    ordinal: 1,
+    hypothesis: {
+      title: 'Legacy target guard',
+      rationale: 'Exercise the archived dedicated-control display.',
+      instructions: 'No changes.',
+      expectedImpact: 'Historical telemetry remains legible.',
+      risk: 'None.',
+      findingIds: [],
+    },
+  });
+  database.updateVariant(live.id, { status: 'running' });
+  database.createTargetExcludedConfig(campaign.id, {
+    targetImplementationWorkflow: 'trumark/deceased-accounts',
+    baselineVariantId: live.id,
+    comparatorImage: `sha256:${'e'.repeat(64)}`,
+    configuredAt: '2026-09-06T05:00:00.000Z',
+  });
+  database.createTargetExcludedEvaluation(campaign.id, live.id);
+  database.updateTargetExcludedEvaluation(live.id, {
+    status: 'running',
+    executionState: {
+      executions: [
+        execution({
+          benchmark: 'legacy-primary:control',
+          role: 'primary',
+          replicate: 1,
+          status: 'running',
+        }),
+      ],
+    },
+  });
+  database.updateCampaign(campaign.id, { status: 'running_round' });
 }
 
 test.beforeAll(async () => {
@@ -469,6 +717,7 @@ test.beforeAll(async () => {
   database = new HarnessDatabase(paths.database);
   orchestrator = new CampaignOrchestrator(paths, database);
   await seedCampaign();
+  await seedLegacyCampaign();
   const frozenWorkflows = path.join(paths.worktrees, campaignId, 'frozen-workflows');
   await mkdir(path.dirname(frozenWorkflows), { recursive: true });
   await runCommand('git', ['worktree', 'add', '--detach', frozenWorkflows, workflowsSha], {
@@ -545,11 +794,147 @@ test('opens review evidence at the cited lines in the frozen workflows source', 
   await expect(plannerEvidence.getByRole('link', { name: 'src/shared/account.ts:2-3' })).toBeVisible();
 });
 
+test('hides V2 promotion while its runtime target config is absent', async ({ page }) => {
+  const response = await page.request.get(`${baseUrl}/api/campaigns/${campaignId}`);
+  const details = await response.json();
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${reviewId}`);
+  await expect(page.getByRole('button', { name: 'Promote experiment' })).toBeVisible();
+  const eligibleWithoutConfig = await page.evaluate(async ({ details, reviewId }) => {
+    const modelsPath = '/models.js';
+    const { isPromotionEligible } = await import(modelsPath);
+    const campaign = {
+      ...details.campaign,
+      variants: details.variants,
+      targetExcludedConfig: null,
+      targetExcludedEvaluations: details.targetExcludedEvaluations,
+    };
+    const variant = details.variants.find(
+      (candidate: { id: string }) => candidate.id === reviewId,
+    );
+    return isPromotionEligible(campaign, details.variants, variant);
+  }, { details, reviewId });
+  expect(eligibleWithoutConfig).toBe(false);
+
+  await page.route(`${baseUrl}/api/campaigns/${campaignId}`, async (route) => {
+    await route.fulfill({
+      json: { ...details, targetExcludedConfig: null },
+    });
+  });
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Promote experiment' })).toHaveCount(0);
+});
+
+test('hides V2 promotion when execution metadata or case lineage does not match', async ({ page }) => {
+  const standardExecutionState = database.getVariant(reviewId).executionState;
+  const evaluation = database.getTargetExcludedEvaluation(reviewId);
+  if (!standardExecutionState || !evaluation?.executionState || !evaluation.comparisons) {
+    throw new Error('eligible V2 fixture is incomplete');
+  }
+  const expectPromotion = async (visible: boolean): Promise<void> => {
+    await page.reload();
+    const promotion = page.getByRole('button', { name: 'Promote experiment' });
+    if (visible) await expect(promotion).toBeVisible();
+    else await expect(promotion).toHaveCount(0);
+  };
+
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${reviewId}`);
+  await expect(page.getByRole('button', { name: 'Promote experiment' })).toBeVisible();
+
+  database.updateVariant(reviewId, {
+    executionState: { executions: [...standardExecutionState.executions].reverse() },
+  });
+  await expectPromotion(false);
+  database.updateVariant(reviewId, { executionState: standardExecutionState });
+  await expectPromotion(true);
+
+  database.updateVariant(reviewId, {
+    executionState: {
+      executions: standardExecutionState.executions.map((execution) =>
+        execution.benchmark === 'primary-pack' && execution.replicate === 1
+          ? { ...execution, replicateCount: 3, status: 'running' }
+          : execution,
+      ),
+    },
+  });
+  await expectPromotion(false);
+  database.updateVariant(reviewId, { executionState: standardExecutionState });
+  await expectPromotion(true);
+
+  database.updateTargetExcludedEvaluation(reviewId, {
+    executionState: { executions: [...evaluation.executionState.executions].reverse() },
+  });
+  await expectPromotion(false);
+  database.updateTargetExcludedEvaluation(reviewId, {
+    executionState: evaluation.executionState,
+  });
+  await expectPromotion(true);
+
+  database.updateTargetExcludedEvaluation(reviewId, {
+    executionState: {
+      executions: evaluation.executionState.executions.map((execution) =>
+        execution.replicate === 1 ? { ...execution, replicateCount: 3 } : execution,
+      ),
+    },
+  });
+  await expectPromotion(false);
+  database.updateTargetExcludedEvaluation(reviewId, {
+    executionState: evaluation.executionState,
+  });
+  await expectPromotion(true);
+
+  database.updateTargetExcludedEvaluation(reviewId, {
+    comparisons: [
+      { ...evaluation.comparisons[0]!, reportHash: 'invalid-report-hash' },
+      evaluation.comparisons[1]!,
+    ],
+  });
+  await expectPromotion(false);
+  database.updateTargetExcludedEvaluation(reviewId, { comparisons: evaluation.comparisons });
+  await expectPromotion(true);
+
+  database.updateTargetExcludedEvaluation(reviewId, {
+    comparisons: [
+      { ...evaluation.comparisons[0]!, normalRunId: 'mismatched-normal-run' },
+      evaluation.comparisons[1]!,
+    ],
+  });
+  await expectPromotion(false);
+  database.updateTargetExcludedEvaluation(reviewId, { comparisons: evaluation.comparisons });
+  await expectPromotion(true);
+
+  database.updateTargetExcludedEvaluation(reviewId, {
+    comparisons: [
+      { ...evaluation.comparisons[0]!, excludedRunId: 'mismatched-excluded-run' },
+      evaluation.comparisons[1]!,
+    ],
+  });
+  await expectPromotion(false);
+  database.updateTargetExcludedEvaluation(reviewId, { comparisons: evaluation.comparisons });
+  await expectPromotion(true);
+
+  database.updateTargetExcludedEvaluation(reviewId, {
+    normalArmBinding: {
+      source: 'standard_primary',
+      benchmark: 'primary-pack',
+      resolvedArtifactSha,
+      replicates: [
+        { replicate: 1, caseId: 'mismatched-normal-case', runId: 'run-primary-pack-1' },
+        { replicate: 2, caseId: 'case-primary-pack-2', runId: 'run-primary-pack-2' },
+      ],
+    },
+  });
+  await expectPromotion(false);
+});
+
 test('shows the immutable two-run target-excluded guard and separate review truth', async ({ page }) => {
   database.updateTargetExcludedEvaluation(baselineId, { status: 'failed' });
   await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${baselineId}?tab=target-excluded`);
   await expect(page.getByText('trumark/deceased-accounts')).toBeVisible();
-  await expect(page.getByText('2 runs · concurrency 2')).toBeVisible();
+  await expect(page.getByText('2 excluded replicates · concurrency 2')).toBeVisible();
+  await expect(page.getByText(/standard primary is the comparison control/i)).toBeVisible();
+  const targetRuns = page.getByRole('table', { name: 'Target-excluded guard execution runs' });
+  await expect(targetRuns.getByRole('columnheader')).toHaveCount(5);
+  await expect(targetRuns.getByRole('rowheader')).toHaveCount(2);
   await expect(page.getByText('Disposition profile')).toBeVisible();
   await expect(page.getByText('Valid', { exact: true })).toBeVisible();
   for (const decision of ['Build', 'Reuse', 'Extend', 'Defer', 'Question']) {
@@ -571,6 +956,56 @@ test('shows the immutable two-run target-excluded guard and separate review trut
   await expect(page.getByText('verified', { exact: true })).toBeVisible();
 });
 
+test('keeps V2 target answers distinct across standard and excluded execution scopes', async ({ page }) => {
+  const payloads: unknown[] = [];
+  await page.route(
+    `**/api/campaigns/${campaignId}/variants/${liveId}/target-excluded/questions/shared-target-question/answer`,
+    async (route) => {
+      payloads.push(route.request().postDataJSON());
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: '{"saved":true}',
+      });
+    },
+  );
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${liveId}?tab=target-excluded`);
+
+  const normal = page.locator(
+    '.counterfactual-question[data-question-benchmark="primary-pack"][data-question-replicate="2"]',
+  );
+  const excluded = page.locator(
+    '.counterfactual-question[data-question-benchmark="primary-pack:excluded"][data-question-replicate="1"]',
+  );
+  await expect(normal).toContainText('primary-pack · replicate 2 · shared-target-question');
+  await expect(excluded).toContainText('primary-pack:excluded · replicate 1 · shared-target-question');
+  await expect(page.locator('.counterfactual-question')).toHaveCount(2);
+  const controlIds = await page.locator('.counterfactual-question textarea').evaluateAll(
+    (controls) => controls.map((control) => control.id),
+  );
+  expect(new Set(controlIds).size).toBe(2);
+
+  await normal.getByLabel('Answer and rationale').fill('Use the standard primary policy.');
+  await normal.getByRole('button', { name: 'Resume analysis' }).click();
+  await expect.poll(() => payloads.length).toBe(1);
+  await expect(excluded.getByRole('button', { name: 'Resume analysis' })).toBeEnabled();
+  await excluded.getByLabel('Answer and rationale').fill('Use the target-excluded policy.');
+  await excluded.getByRole('button', { name: 'Resume analysis' }).click();
+  await expect.poll(() => payloads.length).toBe(2);
+  expect(payloads).toEqual([
+    {
+      answer: 'Use the standard primary policy.',
+      benchmark: 'primary-pack',
+      replicate: 2,
+    },
+    {
+      answer: 'Use the target-excluded policy.',
+      benchmark: 'primary-pack:excluded',
+      replicate: 1,
+    },
+  ]);
+});
+
 test('refreshes a deep-linked overview with completed, live, and pending replicate telemetry', async ({ page }) => {
   await page.goto(`${baseUrl}/campaigns/${campaignId}/overview`);
   await page.reload();
@@ -581,19 +1016,21 @@ test('refreshes a deep-linked overview with completed, live, and pending replica
   await expect(active).toBeVisible();
   await expect(active.locator('[data-replicate-group="standard"][data-replicate-state="completed"]')).toHaveCount(2);
   await expect(active.locator('[data-replicate-group="standard"][data-replicate-state="current"]')).toHaveCount(1);
-  await expect(active.locator('[data-replicate-group="standard"][data-replicate-state="pending"]')).toHaveCount(3);
+  await expect(active.locator('[data-replicate-group="standard"][data-replicate-state="pending"]')).toHaveCount(1);
+  await expect(active.getByTestId(`replicate-${liveId}-primary-pack-1`)).toContainText('comparison control');
 
   const targetGroup = active.getByTestId(`replicate-group-${liveId}-target-excluded`);
   await expect(targetGroup).toContainText('Target-excluded guard');
-  await expect(targetGroup).toContainText('Excluded from totals');
+  await expect(targetGroup).toContainText('Standard primary runs are the control');
+  await expect(targetGroup).toContainText('target-excluded planner usage is excluded from standard totals');
   await expect(targetGroup).toContainText('running');
   const targetRows = active.locator('[data-replicate-group="target-excluded"]');
-  await expect(targetRows).toHaveCount(4);
+  await expect(targetRows).toHaveCount(2);
   await expect(active.locator('[data-replicate-group="target-excluded"][data-replicate-state="current"]')).toHaveCount(1);
-  await expect(active.locator('[data-replicate-group="target-excluded"][data-replicate-state="pending"]')).toHaveCount(3);
-  const targetControl = active.getByTestId(`replicate-${liveId}-primary-pack:control-1`);
-  await expect(targetControl).toContainText('1 / 5');
-  await expect(active.getByTestId(`replicate-${liveId}-primary-pack:excluded-1`)).toContainText('—');
+  await expect(active.locator('[data-replicate-group="target-excluded"][data-replicate-state="pending"]')).toHaveCount(1);
+  await expect(active.locator('[data-testid*="primary-pack:control"]')).toHaveCount(0);
+  await expect(active.getByTestId(`replicate-${liveId}-primary-pack:excluded-1`)).toContainText('1 / 5');
+  await expect(active.getByTestId(`replicate-${liveId}-primary-pack:excluded-2`)).toContainText('—');
 
   const running = page.getByTestId(`replicate-${liveId}-primary-pack-2`);
   await expect(active.locator('th').first()).toHaveCSS('position', 'sticky');
@@ -622,7 +1059,7 @@ test('refreshes a deep-linked overview with completed, live, and pending replica
   await expect(running).toContainText('600');
   await expect(running).toContainText('$0.50');
 
-  const pending = page.getByTestId(`replicate-${liveId}-primary-pack-3`);
+  const pending = page.getByTestId(`replicate-${liveId}-holdout-pack-2`);
   await expect(pending).toContainText('—');
   await expect(pending).not.toContainText('$0.00');
   await expect(active.getByLabel('Experiment timing and planner usage')).toContainText('820 incl. reasoning');
@@ -638,6 +1075,20 @@ test('refreshes a deep-linked overview with completed, live, and pending replica
   expect(new URL((await trace.getAttribute('href'))!).searchParams.get('filter')).toBe(
     'traceTags;arrayOptions;;any of;case%3Acase-primary-pack-2',
   );
+});
+
+test('keeps dedicated-control V1 target rows and historical protocol copy', async ({ page }) => {
+  await page.goto(`${baseUrl}/campaigns/${legacyCampaignId}/overview`);
+  const active = page.getByTestId(`active-variant-${legacyLiveId}`);
+  await expect(active.locator('[data-replicate-group="target-excluded"]')).toHaveCount(4);
+  await expect(active.locator('[data-testid*="legacy-primary:control"]')).toHaveCount(2);
+  await expect(active.locator('[data-testid*="legacy-primary:excluded"]')).toHaveCount(2);
+
+  await page.goto(
+    `${baseUrl}/campaigns/${legacyCampaignId}/experiments/${legacyLiveId}?tab=target-excluded`,
+  );
+  await expect(page.getByText('2 paired replicates per arm · concurrency 2')).toBeVisible();
+  await expect(page.getByText(/dedicated control is compared with the target-excluded arm/i)).toBeVisible();
 });
 
 test('uses History API navigation and URL-synchronized experiment filters', async ({ page }) => {
@@ -744,7 +1195,8 @@ test('isolates duplicate question IDs by benchmark and replicate and serves arti
   await expect(page.getByRole('heading', { name: 'Seed observation' })).toBeVisible();
   await expect(page.getByLabel('Experiment timing and planner usage').first()).toContainText('20 s');
   await expect(page.getByLabel('Experiment timing and planner usage').first()).toContainText('15 s');
-  await expect(page.getByLabel('Experiment timing and planner usage').first()).toContainText('660 incl. reasoning');
+  await expect(page.getByLabel('Experiment timing and planner usage').first()).toContainText('440 incl. reasoning');
+  await expect(page.getByText(/target-excluded guard runs are excluded from totals/i)).toBeVisible();
 
   await page.getByRole('link', { name: /Questions/ }).click();
   await expect(page.locator('[data-question-scope$=":duplicate-question"]')).toHaveCount(2);
@@ -867,10 +1319,35 @@ test('provides a mobile drawer, defaults lineage to list, and preserves campaign
   await page.getByLabel('Workflows revision').fill(workflowsSha);
   await page.getByLabel('Primary requirements ZIP').setInputFiles(primaryZip);
   await page.getByLabel('Holdout requirements ZIP').setInputFiles(holdoutZip);
+  const replicates = page.getByLabel('Replicates per benchmark');
+  const targetWorkflow = page.getByLabel('Target-excluded guard workflow (optional)');
+  await replicates.fill('4');
+  await targetWorkflow.fill('trumark/deceased-accounts');
+  await expect(replicates).toHaveValue('2');
+  await expect(replicates).toHaveAttribute('readonly', '');
+  await targetWorkflow.fill('');
+  await expect(replicates).toHaveValue('4');
+  await expect(replicates).not.toHaveAttribute('readonly');
+  await targetWorkflow.fill('trumark/deceased-accounts');
+  const creationRequestPromise = page.waitForRequest(
+    (request) => request.method() === 'POST' && request.url() === `${baseUrl}/api/campaigns`,
+  );
   await page.getByRole('button', { name: 'Create frozen campaign' }).click();
+  const creationRequest = await creationRequestPromise;
+  expect(creationRequest.postDataJSON()).toMatchObject({
+    evaluation: { replicates: 2 },
+    targetExcluded: {
+      protocol: 'standard-primary-v2',
+      targetImplementationWorkflow: 'trumark/deceased-accounts',
+    },
+  });
   await expect(page).toHaveURL(`${baseUrl}/campaigns/created-in-ui/overview`);
   await expect(page.getByRole('heading', { name: 'created in ui' })).toBeVisible();
-  expect(database.getCampaign('created-in-ui').config.evaluation.replicates).toBe(3);
+  expect(database.getCampaign('created-in-ui').config.evaluation.replicates).toBe(2);
+  expect(database.getCampaign('created-in-ui').config.targetExcluded).toEqual({
+    protocol: 'standard-primary-v2',
+    targetImplementationWorkflow: 'trumark/deceased-accounts',
+  });
   expect(
     (await readFile(database.getCampaign('created-in-ui').config.benchmarks[0]!.zipPath))
       .subarray(4)

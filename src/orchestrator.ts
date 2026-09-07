@@ -1,6 +1,7 @@
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import {
   loadCampaignConfig,
   readEnvironmentFile,
@@ -66,11 +67,15 @@ import type {
   RunFacts,
   TargetExcludedConfig,
   TargetExcludedEvaluationRecord,
+  TargetNormalArmBinding,
   VariantRecord,
 } from './types.js';
 import { TargetExcludedConfigSchema } from './types.js';
 import { resolveBenchmarkQuestions } from './upstreamQuestions.js';
-import { runTargetExcludedComparison } from './targetExcludedComparison.js';
+import {
+  runTargetExcludedComparison,
+  summarizeTargetExcludedComparisonReport,
+} from './targetExcludedComparison.js';
 import {
   containsTargetIdentityLeak,
   createTargetExcludedSourceSnapshot,
@@ -169,30 +174,161 @@ function primaryBenchmark(campaign: CampaignRecord): Benchmark {
   return benchmark;
 }
 
+export function targetExcludedProtocolPlan(
+  campaign: CampaignRecord,
+  config: TargetExcludedConfig | null,
+): {
+  protocol: TargetExcludedConfig['protocol'];
+  targetImplementationWorkflow: string;
+  targetSafePrimary: boolean;
+  integrated: boolean;
+} | null {
+  const declared = campaign.config.targetExcluded;
+  if (declared) {
+    if (config && config.protocol !== 'standard-primary-v2') {
+      throw new Error('campaign-frozen V2 target cannot use a dedicated-control V1 config');
+    }
+    if (config && config.targetImplementationWorkflow !== declared.targetImplementationWorkflow) {
+      throw new Error('target-excluded config differs from the campaign-frozen target identity');
+    }
+    return {
+      protocol: 'standard-primary-v2',
+      targetImplementationWorkflow: declared.targetImplementationWorkflow,
+      targetSafePrimary: true,
+      integrated: true,
+    };
+  }
+  if (!config) return null;
+  if (config.protocol === 'standard-primary-v2') {
+    throw new Error('V2 target-excluded config has no campaign-frozen target identity');
+  }
+  return {
+    protocol: 'dedicated-control-v1',
+    targetImplementationWorkflow: config.targetImplementationWorkflow,
+    targetSafePrimary: false,
+    integrated: true,
+  };
+}
+
+export function targetExcludedComparisonDirectories(
+  variantArtifactRoot: string,
+  primaryName: string,
+  replicate: number,
+  protocol: TargetExcludedConfig['protocol'],
+): { normalArtifactDirectory: string; excludedArtifactDirectory: string } {
+  const targetRoot = path.join(variantArtifactRoot, 'target-excluded');
+  return {
+    normalArtifactDirectory:
+      protocol === 'standard-primary-v2'
+        ? path.join(variantArtifactRoot, primaryName, `replicate-${replicate}`)
+        : path.join(targetRoot, 'control', primaryName, `replicate-${replicate}`),
+    excludedArtifactDirectory: path.join(
+      targetRoot,
+      'excluded',
+      primaryName,
+      `replicate-${replicate}`,
+    ),
+  };
+}
+
+export function targetExcludedLiveStackDirectory(
+  variantArtifactRoot: string,
+  variantStatus: VariantRecord['status'],
+): string {
+  return variantStatus === 'starting' || variantStatus === 'running'
+    ? variantArtifactRoot
+    : path.join(variantArtifactRoot, 'target-excluded');
+}
+
+export function targetExcludedControlHoldoutDirectory(
+  variantArtifactRoot: string,
+  holdoutName: string,
+  integratedStack: boolean,
+): string {
+  return integratedStack
+    ? path.join(variantArtifactRoot, holdoutName)
+    : path.join(variantArtifactRoot, 'target-excluded', 'control', holdoutName);
+}
+
+function normalArmBindingsEqual(
+  left: TargetNormalArmBinding,
+  right: TargetNormalArmBinding,
+): boolean {
+  if (
+    !Array.isArray(left.replicates) ||
+    !Array.isArray(right.replicates) ||
+    left.replicates.length !== 2 ||
+    right.replicates.length !== 2
+  ) {
+    return false;
+  }
+  return (
+    left.source === right.source &&
+    left.benchmark === right.benchmark &&
+    left.resolvedArtifactSha === right.resolvedArtifactSha &&
+    left.replicates.every((replicate, index) => {
+      const candidate = right.replicates[index];
+      if (!replicate || !candidate) return false;
+      return (
+        candidate.replicate === replicate.replicate &&
+        candidate.caseId === replicate.caseId &&
+        candidate.runId === replicate.runId
+      );
+    })
+  );
+}
+
 function nextVariantIdentity(campaign: CampaignRecord, variants: readonly VariantRecord[]): string {
   const ordinal = Math.max(0, ...variants.map((variant) => variant.ordinal)) + 1;
   return `${campaign.id}-v${String(ordinal).padStart(3, '0')}`;
 }
 
-type RuntimeAnswerCache = Map<
-  string,
-  Phase2QuestionAnswer | Promise<Phase2QuestionAnswer>
->;
+interface CachedRuntimeAnswer {
+  value: Phase2QuestionAnswer;
+  selectedOption?: {
+    index: number;
+    label: string;
+    description: string | null;
+    consequences: string | null;
+  };
+}
+
+type RuntimeAnswerCache = Map<string, CachedRuntimeAnswer | Promise<CachedRuntimeAnswer | null>>;
 
 interface BenchmarkRunOptions {
   replicateCount?: number;
   scope?: string;
   executionScope?: string;
-  targetWorkflow?: string;
+  answerSourceTargetWorkflow?: string;
+  excludedTargetWorkflow?: string;
+  answerCache?: RuntimeAnswerCache;
   persistToTargetEvaluation?: boolean;
+}
+
+interface BenchmarkReplicateResult {
+  facts: RunFacts;
+  replicates: RunFacts[];
+  questions: Phase2QuestionAudit[];
 }
 
 interface PendingTargetAnswer {
   campaignId: string;
+  variantId: string;
+  benchmark: string;
+  replicate: number;
   targetWorkflow: string;
   question: PlannerQuestionRecord;
   resolve: (answer: Phase2QuestionAnswer) => void;
   reject: (error: Error) => void;
+}
+
+function pendingTargetAnswerKey(
+  variantId: string,
+  benchmark: string,
+  replicate: number,
+  questionId: string,
+): string {
+  return JSON.stringify([variantId, benchmark, replicate, questionId]);
 }
 
 export function withRuntimeQuestions(
@@ -241,17 +377,7 @@ export class CampaignOrchestrator {
   constructor(
     readonly paths: HarnessPaths,
     readonly database: HarnessDatabase,
-  ) {
-    for (const campaign of database.listCampaigns()) {
-      for (const evaluation of database.listTargetExcludedEvaluations(campaign.id)) {
-        if (evaluation.status === 'completed' || evaluation.status === 'failed') continue;
-        database.updateTargetExcludedEvaluation(evaluation.variantId, {
-          status: 'failed',
-          error: 'target-excluded evaluation was interrupted; retry the complete two-run attempt',
-        });
-      }
-    }
-  }
+  ) {}
 
   async initialize(configPath: string): Promise<CampaignRecord> {
     const resolved = await loadCampaignConfig(configPath);
@@ -270,6 +396,9 @@ export class CampaignOrchestrator {
   ): Promise<TargetExcludedConfig> {
     return await this.withCampaignLock(campaignId, async () => {
       const campaign = this.database.getCampaign(campaignId);
+      if (campaign.config.targetExcluded) {
+        throw new Error('campaign-frozen V2 target exclusion is configured automatically at baseline');
+      }
       const baseline = this.database.getVariant(baselineVariantId);
       if (
         baseline.campaignId !== campaignId ||
@@ -305,6 +434,7 @@ export class CampaignOrchestrator {
         throw new Error('baseline comparator image did not resolve to an immutable image ID');
       }
       const config = TargetExcludedConfigSchema.parse({
+        protocol: 'dedicated-control-v1',
         targetImplementationWorkflow,
         baselineVariantId,
         comparatorImage,
@@ -361,18 +491,34 @@ export class CampaignOrchestrator {
       if (existing.status === 'completed' && existing.artifactCollectionComplete) {
         return existing;
       }
-      const artifactDirectory = path.join(
-        variantArtifactDirectory(this.paths, campaign.id, variant.id),
-        'target-excluded',
-      );
-      const stack = await reattachVariantStack(
-        campaign,
-        variant,
-        artifactDirectory,
-        await this.ensureFrozenPlannerSource(campaign),
-      );
-      const token = stack.environment.PLANNER_EVAL_API_TOKEN || stack.environment.PLANNER_API_TOKEN;
-      const primary = primaryBenchmark(campaign);
+      const variantArtifacts = variantArtifactDirectory(this.paths, campaign.id, variant.id);
+      const artifactDirectory = path.join(variantArtifacts, 'target-excluded');
+      let stack: StackHandle | null = null;
+      let evaluation = existing;
+      let failure: unknown;
+      let integratedStack = false;
+      try {
+        const preferredStackDirectory = targetExcludedLiveStackDirectory(
+          variantArtifacts,
+          variant.status,
+        );
+        const alternateStackDirectory = preferredStackDirectory === variantArtifacts
+          ? artifactDirectory
+          : variantArtifacts;
+        const stackDirectory = (await stat(path.join(preferredStackDirectory, 'stack.env')).catch(
+          () => null,
+        ))?.isFile()
+          ? preferredStackDirectory
+          : alternateStackDirectory;
+        integratedStack = stackDirectory === variantArtifacts;
+        stack = await reattachVariantStack(
+          campaign,
+          variant,
+          stackDirectory,
+          await this.ensureFrozenPlannerSource(campaign),
+        );
+        const token = stack.environment.PLANNER_EVAL_API_TOKEN || stack.environment.PLANNER_API_TOKEN;
+        const primary = primaryBenchmark(campaign);
       const excludedExecutions = existing.executionState?.executions
         .filter((execution) => execution.benchmark === `${primary.name}:excluded`)
         .sort((left, right) => left.replicate - right.replicate) ?? [];
@@ -472,76 +618,105 @@ export class CampaignOrchestrator {
         writeFile(path.join(excludedRoot, 'facts.json'), `${JSON.stringify(excludedFacts, null, 2)}\n`),
         writeFile(path.join(excludedRoot, 'replicates.json'), `${JSON.stringify(excludedReplicates, null, 2)}\n`),
       ]);
-      const controlFacts = JSON.parse(
-        await readFile(path.join(artifactDirectory, 'control', primary.name, 'facts.json'), 'utf8'),
-      ) as RunFacts;
-      const controlReplicates = JSON.parse(
-        await readFile(path.join(artifactDirectory, 'control', primary.name, 'replicates.json'), 'utf8'),
-      ) as RunFacts[];
-      const controlQuestions = (
-        await Promise.all(
-          Array.from({ length: config.replicates }, async (_, index) =>
-            JSON.parse(
-              await readFile(
-                path.join(
-                  artifactDirectory,
-                  'control',
-                  primary.name,
-                  `replicate-${index + 1}`,
-                  'result.json',
-                ),
-                'utf8',
-              ),
-            ) as Phase2Result,
-          ),
-        )
-      ).flatMap(({ questions }) => questions);
-      const holdoutFacts: Record<string, RunFacts> = {};
-      const holdoutReplicateFacts: Record<string, RunFacts[]> = {};
-      for (const holdout of campaign.config.benchmarks.filter(({ role }) => role === 'holdout')) {
-        holdoutFacts[holdout.name] = JSON.parse(
-          await readFile(path.join(artifactDirectory, 'control', holdout.name, 'facts.json'), 'utf8'),
-        ) as RunFacts;
-        holdoutReplicateFacts[holdout.name] = JSON.parse(
-          await readFile(path.join(artifactDirectory, 'control', holdout.name, 'replicates.json'), 'utf8'),
-        ) as RunFacts[];
-      }
       const comparisonDirectory = path.join(artifactDirectory, 'comparisons');
       await mkdir(comparisonDirectory, { recursive: true });
       const comparisons = await Promise.all(
-        Array.from({ length: config.replicates }, (_, index) =>
-          runTargetExcludedComparison({
-            normalArtifactDirectory: path.join(
-              artifactDirectory,
-              'control',
+        Array.from({ length: config.replicates }, (_, index) => {
+          const replicate = index + 1;
+          return runTargetExcludedComparison({
+            ...targetExcludedComparisonDirectories(
+              variantArtifacts,
               primary.name,
-              `replicate-${index + 1}`,
+              replicate,
+              config.protocol,
             ),
-            excludedArtifactDirectory: path.join(
-              artifactDirectory,
-              'excluded',
-              primary.name,
-              `replicate-${index + 1}`,
-            ),
-            outputPath: path.join(comparisonDirectory, `replicate-${index + 1}.json`),
+            outputPath: path.join(comparisonDirectory, `replicate-${replicate}.json`),
             imageTag: config.comparatorImage,
-            replicate: index + 1,
-          }),
-        ),
+            replicate,
+          });
+        }),
       );
-      const summaryPath = path.join(
-        campaignDirectory(this.paths, campaign.id),
-        'target-excluded-resolved-packs',
-        `${primary.name}.questions.json`,
-      );
-      const summary = JSON.parse(await readFile(summaryPath, 'utf8')) as NonNullable<
-        VariantRecord['questionResolutions']
-      >[string];
-      const questionResolution = withRuntimeQuestions(
-        withRuntimeQuestions(summary, controlQuestions, 'control'),
-        results.flatMap(({ questions }) => questions),
-        'excluded',
-      );
+      let controlFacts: RunFacts | null = null;
+      let controlReplicates: RunFacts[] | null = null;
+      let holdoutFacts: Record<string, RunFacts> | null = null;
+      let holdoutReplicateFacts: Record<string, RunFacts[]> | null = null;
+      let normalArmBinding: TargetNormalArmBinding | null = null;
+      let questionResolution: NonNullable<VariantRecord['questionResolutions']>[string];
+      if (config.protocol === 'standard-primary-v2') {
+        const summary = variant.questionResolutions?.[primary.name];
+        if (!summary || summary.resolvedArtifactSha !== config.primaryResolvedArtifactSha) {
+          throw new Error('V2 standard primary question resolution is unavailable or stale');
+        }
+        normalArmBinding = this.buildTargetNormalArmBinding(
+          variant.id,
+          primary,
+          config.primaryResolvedArtifactSha,
+        );
+        if (
+          existing.normalArmBinding &&
+          !normalArmBindingsEqual(existing.normalArmBinding, normalArmBinding)
+        ) {
+          throw new Error('persisted V2 normal-arm binding differs from standard execution');
+        }
+        questionResolution = withRuntimeQuestions(
+          summary,
+          results.flatMap(({ questions }) => questions),
+          'excluded',
+        );
+      } else {
+        controlFacts = JSON.parse(
+          await readFile(path.join(artifactDirectory, 'control', primary.name, 'facts.json'), 'utf8'),
+        ) as RunFacts;
+        controlReplicates = JSON.parse(
+          await readFile(path.join(artifactDirectory, 'control', primary.name, 'replicates.json'), 'utf8'),
+        ) as RunFacts[];
+        const controlQuestions = (
+          await Promise.all(
+            Array.from({ length: config.replicates }, async (_, index) =>
+              JSON.parse(
+                await readFile(
+                  path.join(
+                    artifactDirectory,
+                    'control',
+                    primary.name,
+                    `replicate-${index + 1}`,
+                    'result.json',
+                  ),
+                  'utf8',
+                ),
+              ) as Phase2Result,
+            ),
+          )
+        ).flatMap(({ questions }) => questions);
+        holdoutFacts = {};
+        holdoutReplicateFacts = {};
+        for (const holdout of campaign.config.benchmarks.filter(({ role }) => role === 'holdout')) {
+          const holdoutDirectory = targetExcludedControlHoldoutDirectory(
+            variantArtifacts,
+            holdout.name,
+            integratedStack,
+          );
+          holdoutFacts[holdout.name] = JSON.parse(
+            await readFile(path.join(holdoutDirectory, 'facts.json'), 'utf8'),
+          ) as RunFacts;
+          holdoutReplicateFacts[holdout.name] = JSON.parse(
+            await readFile(path.join(holdoutDirectory, 'replicates.json'), 'utf8'),
+          ) as RunFacts[];
+        }
+        const summaryPath = path.join(
+          campaignDirectory(this.paths, campaign.id),
+          'target-excluded-resolved-packs',
+          `${primary.name}.questions.json`,
+        );
+        const summary = JSON.parse(await readFile(summaryPath, 'utf8')) as NonNullable<
+          VariantRecord['questionResolutions']
+        >[string];
+        questionResolution = withRuntimeQuestions(
+          withRuntimeQuestions(summary, controlQuestions, 'control'),
+          results.flatMap(({ questions }) => questions),
+          'excluded',
+        );
+      }
       this.database.updateTargetExcludedEvaluation(variant.id, {
         status: 'judging',
         controlFacts,
@@ -552,6 +727,7 @@ export class CampaignOrchestrator {
         excludedReplicateFacts: excludedReplicates,
         questionResolution,
         comparisons,
+        normalArmBinding,
       });
       const judged = await this.judgeTargetExcluded(
         campaign,
@@ -564,7 +740,9 @@ export class CampaignOrchestrator {
       const comparisonValid = comparisons.length === config.replicates &&
         comparisons.every(({ valid }) => valid);
       const leakageDetected = comparisons.some(({ leakagePaths }) => leakagePaths.length > 0) ||
-        containsTargetIdentityLeak(judged.judgment, config.targetImplementationWorkflow);
+        containsTargetIdentityLeak(judged.judgment, config.targetImplementationWorkflow) ||
+        (config.protocol === 'standard-primary-v2' &&
+          containsTargetIdentityLeak(questionResolution, config.targetImplementationWorkflow));
       const baseline = this.database.getTargetExcludedEvaluation(config.baselineVariantId);
       const baselineRuns = variant.id === config.baselineVariantId
         ? excludedReplicates
@@ -577,33 +755,80 @@ export class CampaignOrchestrator {
         config.warningBuildDropRatio,
         config.blockBuildDropRatio,
       );
-      this.database.updateTargetExcludedEvaluation(variant.id, {
+      evaluation = this.database.updateTargetExcludedEvaluation(variant.id, {
         status: 'completed',
         judgment: judged.judgment,
         score: judged.score,
         gate,
         completedAt: new Date().toISOString(),
       });
-      let collectionComplete = true;
-      try {
-        await collectStackArtifacts(stack);
       } catch (error) {
-        collectionComplete = false;
-        this.database.addEvent(campaign.id, variant.id, 'target_excluded.artifacts_failed', {
-          error: errorMessage(error),
+        failure = error;
+        evaluation = this.database.updateTargetExcludedEvaluation(variant.id, {
+          status: 'failed',
+          error: errorMessage(error).slice(0, 20_000),
         });
+      } finally {
+        let collectionComplete = false;
+        if (stack) {
+          collectionComplete = true;
+          try {
+            await collectStackArtifacts(stack);
+          } catch (error) {
+            collectionComplete = false;
+            this.database.addEvent(campaign.id, variant.id, 'target_excluded.artifacts_failed', {
+              error: errorMessage(error),
+            });
+          }
+          try {
+            await stopVariantStack(stack, collectionComplete);
+          } catch (error) {
+            collectionComplete = false;
+            this.database.addEvent(campaign.id, variant.id, 'target_excluded.teardown_failed', {
+              error: errorMessage(error),
+            });
+          }
+        }
+        const current = this.database.getTargetExcludedEvaluation(variant.id) ?? evaluation;
+        evaluation = this.database.updateTargetExcludedEvaluation(variant.id, {
+          artifactCollectionComplete: collectionComplete,
+          completedAt: new Date().toISOString(),
+          ...(!collectionComplete
+            ? {
+                status: 'failed',
+                error:
+                  current.error ?? 'required target-excluded artifacts were not completely archived',
+              }
+            : {}),
+        });
+        if (stack && integratedStack) {
+          const currentVariant = this.database.getVariant(variant.id);
+          this.database.updateVariant(variant.id, {
+            artifactCollectionComplete: collectionComplete,
+            ...(!collectionComplete
+              ? {
+                  status: 'failed',
+                  error:
+                    currentVariant.error ?? 'required stack artifacts were not completely archived',
+                }
+              : {}),
+          });
+        }
       }
-      await stopVariantStack(stack, collectionComplete);
-      const evaluation = this.database.updateTargetExcludedEvaluation(variant.id, {
-        artifactCollectionComplete: collectionComplete,
-        ...(collectionComplete
-          ? {}
-          : { status: 'failed', error: 'required target-excluded artifacts were not completely archived' }),
-      });
+      if (failure) {
+        try {
+          await this.refreshReports(campaign.id);
+        } catch (reportError) {
+          this.database.addEvent(campaign.id, variant.id, 'target_excluded.report_failed', {
+            error: errorMessage(reportError),
+          });
+        }
+        throw failure;
+      }
       await this.runDiagnosis(
         campaign,
         this.database.getVariant(variant.id),
-        variantArtifactDirectory(this.paths, campaign.id, variant.id),
+        variantArtifacts,
       );
       await this.refreshReports(campaign.id);
       return evaluation;
@@ -616,9 +841,30 @@ export class CampaignOrchestrator {
     questionId: string,
     answer: string,
     selectedOptionId?: string,
+    benchmark?: string,
+    replicate?: number,
   ): void {
-    const pending = this.pendingTargetAnswers.get(`${variantId}:${questionId}`);
-    if (!pending) throw new Error('target-excluded question is not waiting for an answer');
+    if ((benchmark === undefined) !== (replicate === undefined)) {
+      throw new Error('target-excluded answer scope requires both benchmark and replicate');
+    }
+    const matches = [...this.pendingTargetAnswers.entries()].filter(
+      ([, pending]) => pending.variantId === variantId && pending.question.id === questionId,
+    );
+    let selected: [string, PendingTargetAnswer] | undefined;
+    if (benchmark !== undefined && replicate !== undefined) {
+      const key = pendingTargetAnswerKey(variantId, benchmark, replicate, questionId);
+      const pending = this.pendingTargetAnswers.get(key);
+      if (pending) selected = [key, pending];
+    } else {
+      if (matches.length > 1) {
+        throw new Error(
+          'ambiguous target-excluded question; benchmark and replicate are required',
+        );
+      }
+      selected = matches[0];
+    }
+    if (!selected) throw new Error('target-excluded question is not waiting for an answer');
+    const [key, pending] = selected;
     if (
       pending.campaignId !== campaignId ||
       this.database.getVariant(variantId).campaignId !== campaignId
@@ -635,7 +881,7 @@ export class CampaignOrchestrator {
     } else if (selectedOptionId) {
       throw new Error('selectedOptionId is only valid for single-select questions');
     }
-    this.pendingTargetAnswers.delete(`${variantId}:${questionId}`);
+    this.pendingTargetAnswers.delete(key);
     pending.resolve({
       answer,
       ...(selectedOptionId ? { selectedOptionId } : {}),
@@ -643,7 +889,9 @@ export class CampaignOrchestrator {
       evidence: ['human operator answer'],
       requirementsAgentRequests: 0,
     });
-    const stillWaiting = [...this.pendingTargetAnswers.keys()].some((key) => key.startsWith(`${variantId}:`));
+    const stillWaiting = [...this.pendingTargetAnswers.values()].some(
+      (candidate) => candidate.variantId === variantId,
+    );
     this.database.updateTargetExcludedEvaluation(variantId, {
       status: stillWaiting ? 'waiting_for_input' : 'running',
     });
@@ -671,6 +919,36 @@ export class CampaignOrchestrator {
   private async initializeResolved(
     resolved: Awaited<ReturnType<typeof resolveCampaignConfig>>,
   ): Promise<CampaignRecord> {
+    const measuredBenchmarks = await Promise.all(
+      resolved.config.benchmarks.map(async (benchmark) => {
+        const bytes = await readFile(benchmark.zipPath);
+        const measuredSha = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+        if (benchmark.sha256 !== measuredSha) {
+          throw new Error(
+            `${benchmark.name} SHA mismatch during frozen copy: expected ${benchmark.sha256 ?? '<missing>'}, got ${measuredSha}`,
+          );
+        }
+        return { benchmark, bytes };
+      }),
+    );
+    if (resolved.config.targetExcluded) {
+      const targetIndex = [
+        'src',
+        'customers',
+        ...resolved.config.targetExcluded.targetImplementationWorkflow.split('/'),
+        'index.ts',
+      ].join('/');
+      const objectType = await runCommand(
+        'git',
+        ['cat-file', '-t', `${resolved.workflowsSha}:${targetIndex}`],
+        { cwd: resolved.config.workflowsRepo },
+      ).catch(() => null);
+      if (objectType?.stdout.trim() !== 'blob') {
+        throw new Error(
+          `target implementation is not present at the pinned workflows revision: ${resolved.config.targetExcluded.targetImplementationWorkflow}`,
+        );
+      }
+    }
     await ensureHarnessPaths(this.paths);
     const directory = campaignDirectory(this.paths, resolved.config.id);
     const reportDirectory = campaignReportDirectory(this.paths, resolved.config.id);
@@ -701,9 +979,9 @@ export class CampaignOrchestrator {
     const packsDirectory = path.join(directory, 'packs');
     await mkdir(packsDirectory, { recursive: true });
     const benchmarks = await Promise.all(
-      resolved.config.benchmarks.map(async (benchmark) => {
+      measuredBenchmarks.map(async ({ benchmark, bytes }) => {
         const frozenPath = path.join(packsDirectory, `${benchmark.name}.zip`);
-        await writeFile(frozenPath, await readFile(benchmark.zipPath), { flag: 'wx', mode: 0o600 });
+        await writeFile(frozenPath, bytes, { flag: 'wx', mode: 0o600 });
         return { ...benchmark, zipPath: frozenPath };
       }),
     );
@@ -735,12 +1013,109 @@ export class CampaignOrchestrator {
   async runBaseline(campaignId: string): Promise<VariantRecord> {
     return await this.withCampaignLock(campaignId, async () => {
       const campaign = this.database.getCampaign(campaignId);
+      if (campaign.status.startsWith('stopped')) throw new Error(`campaign is stopped: ${campaign.status}`);
+      let existingVariants = this.database.listVariants(campaignId);
+      let targetConfig = campaign.config.targetExcluded
+        ? await this.recoverAutomaticV2Config(campaign)
+        : this.database.getTargetExcludedConfig(campaignId);
+      if (campaign.config.targetExcluded) {
+        let interrupted: VariantRecord | null = null;
+        for (const candidate of [...existingVariants].reverse()) {
+          if (
+            candidate.round === 0 &&
+            !candidate.artifactCollectionComplete &&
+            (await stat(
+              path.join(
+                variantArtifactDirectory(this.paths, campaign.id, candidate.id),
+                'stack.env',
+              ),
+            ).catch(() => null))?.isFile()
+          ) {
+            interrupted = candidate;
+            break;
+          }
+        }
+        if (interrupted) {
+          this.database.updateCampaign(campaignId, { status: 'recovering_baseline_stack' });
+          const archived = await this.archiveInterruptedIntegratedStack(campaign, interrupted, {
+            allowIncomplete: !targetConfig,
+          });
+          const standardComplete = Boolean(
+            archived.facts &&
+            archived.questionResolutions &&
+            (await this.hasCompleteEvaluationArtifacts(campaign, archived)),
+          );
+          if (!standardComplete) {
+            this.database.updateVariant(archived.id, {
+              status: 'failed',
+              error:
+                archived.error ??
+                'interrupted baseline stack was archived without complete standard facts',
+            });
+          }
+          existingVariants = this.database.listVariants(campaignId);
+        }
+        let bound = targetConfig
+          ? this.database.getVariant(targetConfig.baselineVariantId)
+          : null;
+        if (!bound) {
+          for (const candidate of [...existingVariants].reverse()) {
+            if (
+              candidate.round === 0 &&
+              candidate.artifactCollectionComplete &&
+              candidate.facts &&
+              candidate.questionResolutions &&
+              (await this.hasCompleteEvaluationArtifacts(campaign, candidate))
+            ) {
+              bound = candidate;
+              break;
+            }
+          }
+        }
+        if (bound) {
+          if (targetConfig && !bound.artifactCollectionComplete) {
+            bound = await this.archiveInterruptedIntegratedStack(campaign, bound);
+          }
+          if (!(await this.hasCompleteEvaluationArtifacts(campaign, bound))) {
+            if (targetConfig) {
+              throw new Error('config-bound V2 baseline does not have recoverable standard artifacts');
+            }
+          } else {
+            this.database.updateCampaign(campaignId, { status: 'recovering_baseline_target' });
+            if (bound.status !== 'review' && bound.status !== 'completed') {
+              bound = await this.recoverEvaluation(campaign, bound);
+            }
+            if (bound.status === 'review' || bound.status === 'completed') {
+              if (!targetConfig) {
+                const summary = bound.questionResolutions?.[primaryBenchmark(campaign).name];
+                if (!bound.imageTag || !summary) {
+                  throw new Error('recoverable V2 baseline is missing its image or primary resolution');
+                }
+                targetConfig = await this.prepareAutomaticV2Config(
+                  campaign,
+                  bound,
+                  `${bound.imageTag}-test`,
+                  summary,
+                );
+                targetConfig = await this.persistAutomaticV2Config(campaign, targetConfig);
+              }
+              const evaluation = this.database.getTargetExcludedEvaluation(bound.id);
+              if (!this.targetExcludedEvaluationReady(campaign, targetConfig, evaluation, true)) {
+                await this.runTargetExcludedBackfill(campaign, bound, targetConfig);
+              }
+              return await this.finalizeBaseline(
+                campaignId,
+                this.database.getVariant(bound.id),
+              );
+            }
+            return await this.finalizeBaseline(campaignId, bound);
+          }
+        }
+      }
       const existing = this.database
         .listVariants(campaignId)
         .find((variant) => variant.round === 0 && variant.status === 'completed');
       if (existing) throw new Error(`baseline already exists: ${existing.id}`);
-      if (campaign.status.startsWith('stopped')) throw new Error(`campaign is stopped: ${campaign.status}`);
-      const existingVariants = this.database.listVariants(campaignId);
       const recoverable = existingVariants.findLast(
         (variant) =>
           variant.round === 0 &&
@@ -781,6 +1156,73 @@ export class CampaignOrchestrator {
     });
   }
 
+  private async archiveInterruptedIntegratedStack(
+    campaign: CampaignRecord,
+    variant: VariantRecord,
+    options: {
+      allowIncomplete?: boolean;
+      reattach?: typeof reattachVariantStack;
+      collect?: typeof collectStackArtifacts;
+      stop?: typeof stopVariantStack;
+    } = {},
+  ): Promise<VariantRecord> {
+    const artifactDirectory = variantArtifactDirectory(this.paths, campaign.id, variant.id);
+    let stack: StackHandle | null = null;
+    let collectionComplete = false;
+    let reattachFailure: unknown;
+    let collectionFailure: unknown;
+    let stopFailure: unknown;
+    try {
+      stack = await (options.reattach ?? reattachVariantStack)(
+        campaign,
+        variant,
+        artifactDirectory,
+        await this.ensureFrozenPlannerSource(campaign),
+      );
+    } catch (error) {
+      reattachFailure = error;
+    }
+    if (stack) {
+      try {
+        await (options.collect ?? collectStackArtifacts)(stack);
+        collectionComplete = true;
+      } catch (error) {
+        collectionFailure = error;
+      }
+      try {
+        await (options.stop ?? stopVariantStack)(stack, collectionComplete);
+      } catch (error) {
+        collectionComplete = false;
+        stopFailure = error;
+      }
+    }
+    const abandoned = Boolean(
+      options.allowIncomplete && stack && collectionFailure && !stopFailure,
+    );
+    const failure = stopFailure ?? reattachFailure ?? collectionFailure;
+    const current = this.database.getVariant(variant.id);
+    this.database.updateVariant(variant.id, {
+      artifactCollectionComplete: collectionComplete,
+      ...(!collectionComplete
+        ? {
+            status: 'failed',
+            error: abandoned
+              ? `incomplete integrated stack archive abandoned after stop: ${errorMessage(collectionFailure)}`
+              : current.error ?? 'interrupted integrated stack artifacts could not be archived',
+          }
+        : {}),
+    });
+    if (this.database.getTargetExcludedEvaluation(variant.id)) {
+      this.database.updateTargetExcludedEvaluation(variant.id, {
+        artifactCollectionComplete: collectionComplete,
+      });
+    }
+    if (!abandoned && (failure || !collectionComplete)) {
+      throw failure ?? new Error('interrupted integrated stack artifacts could not be archived');
+    }
+    return this.database.getVariant(variant.id);
+  }
+
   async diagnoseVariant(campaignId: string, variantId: string): Promise<VariantRecord> {
     return await this.withCampaignLock(campaignId, async () => {
       const campaign = this.database.getCampaign(campaignId);
@@ -797,10 +1239,35 @@ export class CampaignOrchestrator {
   }
 
   private async finalizeBaseline(campaignId: string, result: VariantRecord): Promise<VariantRecord> {
-      if (this.database.getCampaign(campaignId).status === 'stopped_by_user') return result;
-      if (result.status !== 'review' || !result.facts || !result.artifactCollectionComplete) {
+      const campaign = this.database.getCampaign(campaignId);
+      if (campaign.status === 'stopped_by_user') return result;
+      if (
+        (result.status !== 'review' && result.status !== 'completed') ||
+        !result.facts ||
+        !result.artifactCollectionComplete
+      ) {
         this.database.updateCampaign(campaignId, { status: 'baseline_failed' });
         return result;
+      }
+      if (campaign.config.targetExcluded) {
+        const config = this.database.getTargetExcludedConfig(campaignId);
+        const evaluation = config && config.baselineVariantId === result.id
+          ? this.database.getTargetExcludedEvaluation(result.id)
+          : null;
+        if (!config || !this.targetExcludedEvaluationReady(campaign, config, evaluation, true)) {
+          this.database.updateCampaign(campaignId, {
+            status: 'baseline_target_failed',
+            currentParentVariantId: null,
+          });
+          await this.refreshReports(campaignId);
+          return result;
+        }
+        await this.verifyArchivedTargetExcludedComparisonsForAction(
+          campaign,
+          result.id,
+          config,
+          evaluation,
+        );
       }
       const completed = this.database.updateVariant(result.id, { status: 'completed' });
       this.database.updateCampaign(campaignId, {
@@ -946,7 +1413,12 @@ export class CampaignOrchestrator {
     if (campaign.status !== 'ready') {
       throw new Error(`campaign cannot start a round from status=${campaign.status}`);
     }
-    const targetConfig = this.database.getTargetExcludedConfig(campaignId);
+    const targetConfig = campaign.config.targetExcluded
+      ? await this.recoverAutomaticV2Config(campaign)
+      : this.database.getTargetExcludedConfig(campaignId);
+    if (campaign.config.targetExcluded && !targetConfig) {
+      throw new Error('campaign-declared V2 runtime config is missing');
+    }
     if (targetConfig) {
       const baselineEvaluation = this.database.getTargetExcludedEvaluation(
         targetConfig.baselineVariantId,
@@ -954,6 +1426,12 @@ export class CampaignOrchestrator {
       if (!this.targetExcludedEvaluationReady(campaign, targetConfig, baselineEvaluation, true)) {
         throw new Error('run a valid target-excluded baseline calibration before starting a round');
       }
+      await this.verifyArchivedTargetExcludedComparisonsForAction(
+        campaign,
+        targetConfig.baselineVariantId,
+        targetConfig,
+        baselineEvaluation,
+      );
     }
     const diagnosisAvailable = await this.requireCurrentParentDiagnosis(campaign);
     const variants = this.database.listVariants(campaignId);
@@ -1089,7 +1567,25 @@ export class CampaignOrchestrator {
 
   private async promoteUnlocked(campaignId: string, variantId: string): Promise<VariantRecord> {
     const campaign = this.database.getCampaign(campaignId);
+    const targetConfig = campaign.config.targetExcluded
+      ? await this.recoverAutomaticV2Config(campaign)
+      : this.database.getTargetExcludedConfig(campaignId);
+    if (campaign.config.targetExcluded && !targetConfig) {
+      throw new Error('campaign-declared V2 runtime config is missing');
+    }
     let variant = this.database.getVariant(variantId);
+    if (targetConfig) {
+      const targetEvaluation = this.database.getTargetExcludedEvaluation(variant.id);
+      if (!this.targetExcludedEvaluationReady(campaign, targetConfig, targetEvaluation, false)) {
+        throw new Error('variant is missing a completed target-excluded evaluation');
+      }
+      await this.verifyArchivedTargetExcludedComparisonsForAction(
+        campaign,
+        variant.id,
+        targetConfig,
+        targetEvaluation,
+      );
+    }
     if (
       variant.campaignId !== campaignId ||
       variant.status !== 'review' ||
@@ -1119,13 +1615,6 @@ export class CampaignOrchestrator {
     );
     if (JSON.stringify(verifiedDiagnosis) !== JSON.stringify(variant.diagnosis)) {
       throw new Error('persisted diagnosis result differs from the verified artifact');
-    }
-    const targetConfig = this.database.getTargetExcludedConfig(campaignId);
-    if (targetConfig) {
-      const targetEvaluation = this.database.getTargetExcludedEvaluation(variant.id);
-      if (!this.targetExcludedEvaluationReady(campaign, targetConfig, targetEvaluation, false)) {
-        throw new Error('variant is missing a completed target-excluded evaluation');
-      }
     }
     const requiredHoldouts = campaign.config.benchmarks
       .filter((benchmark) => benchmark.role === 'holdout')
@@ -1188,6 +1677,125 @@ export class CampaignOrchestrator {
     return variant;
   }
 
+  private buildTargetNormalArmBinding(
+    variantId: string,
+    benchmark: Benchmark,
+    resolvedArtifactSha: string,
+  ): TargetNormalArmBinding {
+    const variant = this.database.getVariant(variantId);
+    if (variant.questionResolutions?.[benchmark.name]?.resolvedArtifactSha !== resolvedArtifactSha) {
+      throw new Error('standard primary question resolution differs from the V2 config');
+    }
+    const executions = (variant.executionState?.executions ?? [])
+      .filter(
+        (execution) => execution.benchmark === benchmark.name && execution.role === 'primary',
+      )
+      .sort((left, right) => left.replicate - right.replicate);
+    if (executions.length !== 2) {
+      throw new Error('V2 standard primary must have exactly two execution records');
+    }
+    const first = executions[0]!;
+    const second = executions[1]!;
+    if (
+      first.replicate !== 1 ||
+      second.replicate !== 2 ||
+      first.replicateCount !== 2 ||
+      second.replicateCount !== 2 ||
+      first.status !== 'completed' ||
+      second.status !== 'completed' ||
+      !first.caseId ||
+      !first.runId ||
+      !second.caseId ||
+      !second.runId
+    ) {
+      throw new Error('V2 standard primary execution lineage is incomplete');
+    }
+    return {
+      source: 'standard_primary',
+      benchmark: benchmark.name,
+      resolvedArtifactSha,
+      replicates: [
+        { replicate: 1, caseId: first.caseId, runId: first.runId },
+        { replicate: 2, caseId: second.caseId, runId: second.runId },
+      ],
+    };
+  }
+
+  private async verifyArchivedTargetExcludedComparisons(
+    campaign: CampaignRecord,
+    variantId: string,
+    config: TargetExcludedConfig,
+    evaluation: TargetExcludedEvaluationRecord,
+  ): Promise<void> {
+    if (evaluation.variantId !== variantId || evaluation.campaignId !== campaign.id) {
+      throw new Error('target-excluded comparison evaluation lineage is invalid');
+    }
+    const persisted = evaluation.comparisons ?? [];
+    if (persisted.length !== config.replicates) {
+      throw new Error('persisted target-excluded comparison set is incomplete');
+    }
+    const comparisonDirectory = path.join(
+      variantArtifactDirectory(this.paths, campaign.id, variantId),
+      'target-excluded',
+      'comparisons',
+    );
+    for (let replicate = 1; replicate <= config.replicates; replicate += 1) {
+      const matches = persisted.filter((comparison) => comparison.replicate === replicate);
+      if (matches.length !== 1) {
+        throw new Error(`persisted target-excluded comparison replicate ${replicate} is invalid`);
+      }
+      const report = JSON.parse(
+        await readFile(path.join(comparisonDirectory, `replicate-${replicate}.json`), 'utf8'),
+      ) as unknown;
+      const archived = summarizeTargetExcludedComparisonReport(replicate, report);
+      const expected = matches[0]!;
+      const comparable = config.protocol === 'dedicated-control-v1'
+        ? {
+            ...expected,
+            normalCaseId: expected.normalCaseId ?? archived.normalCaseId,
+            excludedCaseId: expected.excludedCaseId ?? archived.excludedCaseId,
+            normalRunId: expected.normalRunId ?? archived.normalRunId,
+            excludedRunId: expected.excludedRunId ?? archived.excludedRunId,
+          }
+        : expected;
+      if (!isDeepStrictEqual(archived, comparable)) {
+        throw new Error(
+          `archived target-excluded comparison differs from persisted summary: replicate ${replicate}`,
+        );
+      }
+    }
+  }
+
+  private async verifyArchivedTargetExcludedComparisonsForAction(
+    campaign: CampaignRecord,
+    variantId: string,
+    config: TargetExcludedConfig,
+    evaluation: TargetExcludedEvaluationRecord,
+  ): Promise<void> {
+    try {
+      await this.verifyArchivedTargetExcludedComparisons(
+        campaign,
+        variantId,
+        config,
+        evaluation,
+      );
+    } catch (error) {
+      if (evaluation.campaignId === campaign.id && evaluation.variantId === variantId) {
+        const current = this.database.getTargetExcludedEvaluation(variantId);
+        if (current?.campaignId === campaign.id && current.variantId === variantId) {
+          this.database.updateTargetExcludedEvaluation(variantId, {
+            status: 'failed',
+            error: `target-excluded comparison integrity failure: ${errorMessage(error)}`.slice(
+              0,
+              20_000,
+            ),
+          });
+        }
+      }
+      throw error;
+    }
+  }
+
   private targetExcludedEvaluationReady(
     campaign: CampaignRecord,
     config: TargetExcludedConfig,
@@ -1195,6 +1803,116 @@ export class CampaignOrchestrator {
     baseline: boolean,
   ): evaluation is TargetExcludedEvaluationRecord {
     if (!evaluation) return false;
+    if (config.protocol === 'standard-primary-v2') {
+      const variant = this.database.getVariant(evaluation.variantId);
+      const declared = campaign.config.targetExcluded;
+      const primary = primaryBenchmark(campaign);
+      const binding = evaluation.normalArmBinding;
+      const requiredHoldouts = campaign.config.benchmarks.filter(({ role }) => role === 'holdout');
+      let expectedBinding: TargetNormalArmBinding | null = null;
+      try {
+        expectedBinding = this.buildTargetNormalArmBinding(
+          variant.id,
+          primary,
+          config.primaryResolvedArtifactSha,
+        );
+      } catch {
+        return false;
+      }
+      const excludedExecutions = (evaluation.executionState?.executions ?? [])
+        .filter((execution) => execution.benchmark === `${primary.name}:excluded`)
+        .sort((left, right) => left.replicate - right.replicate);
+      const excludedExecutionComplete = excludedExecutions.length === config.replicates &&
+        excludedExecutions.every(
+          (execution, index) =>
+            execution.replicate === index + 1 &&
+            execution.replicateCount === config.replicates &&
+            execution.status === 'completed' &&
+            Boolean(execution.caseId) &&
+            Boolean(execution.runId),
+        );
+      const normalCaseIds = new Map<number, string>(
+        binding?.replicates.map(({ replicate, caseId }) => [replicate, caseId] as const) ?? [],
+      );
+      const excludedCaseIds = new Map<number, string | null>(
+        excludedExecutions.map(({ replicate, caseId }) => [replicate, caseId] as const),
+      );
+      const normalRunIds = new Map<number, string>(
+        binding?.replicates.map(({ replicate, runId }) => [replicate, runId] as const) ?? [],
+      );
+      const excludedRunIds = new Map<number, string | null>(
+        excludedExecutions.map(({ replicate, runId }) => [replicate, runId] as const),
+      );
+      const comparisonOrdinals = evaluation.comparisons
+        ?.map(({ replicate }) => replicate)
+        .sort((left, right) => left - right) ?? [];
+      const baselineRuns = baseline
+        ? evaluation.excludedReplicateFacts ?? []
+        : this.database.getTargetExcludedEvaluation(config.baselineVariantId)
+            ?.excludedReplicateFacts ?? [];
+      const comparisonsValid = evaluation.comparisons?.length === config.replicates &&
+        evaluation.comparisons.every(
+          (comparison) =>
+            comparison.valid &&
+            comparison.leakagePaths.length === 0 &&
+            comparison.normalCaseId === normalCaseIds.get(comparison.replicate) &&
+            comparison.excludedCaseId === excludedCaseIds.get(comparison.replicate) &&
+            comparison.normalRunId === normalRunIds.get(comparison.replicate) &&
+            comparison.excludedRunId === excludedRunIds.get(comparison.replicate) &&
+            Boolean(comparison.reportHash?.match(/^sha256:[a-f0-9]{64}$/)),
+        );
+      const leakageDetected =
+        (evaluation.comparisons?.some(({ leakagePaths }) => leakagePaths.length > 0) ?? false) ||
+        containsTargetIdentityLeak(evaluation.judgment, config.targetImplementationWorkflow) ||
+        containsTargetIdentityLeak(evaluation.questionResolution, config.targetImplementationWorkflow);
+      const expectedGate = computeTargetExcludedGate(
+        baselineRuns,
+        evaluation.excludedReplicateFacts ?? [],
+        comparisonsValid ?? false,
+        leakageDetected,
+        config.warningBuildDropRatio,
+        config.blockBuildDropRatio,
+      );
+      return Boolean(
+          declared?.protocol === 'standard-primary-v2' &&
+          declared.targetImplementationWorkflow === config.targetImplementationWorkflow &&
+          (!baseline || variant.id === config.baselineVariantId) &&
+          evaluation.campaignId === campaign.id &&
+          config.normalArmSource === 'standard_primary' &&
+          variant.campaignId === campaign.id &&
+          variant.artifactCollectionComplete &&
+          variant.facts &&
+          variant.replicateFacts?.length === config.replicates &&
+          requiredHoldouts.every(
+            ({ name }) =>
+              Boolean(variant.holdoutFacts?.[name]) &&
+              variant.holdoutReplicateFacts?.[name]?.length === config.replicates,
+          ) &&
+          variant.questionResolutions?.[primary.name]?.resolvedArtifactSha ===
+            config.primaryResolvedArtifactSha &&
+          binding &&
+          normalArmBindingsEqual(binding, expectedBinding) &&
+          evaluation.controlFacts === null &&
+          evaluation.controlReplicateFacts === null &&
+          evaluation.holdoutFacts === null &&
+          evaluation.holdoutReplicateFacts === null &&
+          evaluation.status === 'completed' &&
+          evaluation.artifactCollectionComplete &&
+          evaluation.excludedFacts &&
+          evaluation.excludedReplicateFacts?.length === config.replicates &&
+          excludedExecutionComplete &&
+          comparisonsValid &&
+          JSON.stringify(comparisonOrdinals) === JSON.stringify([1, 2]) &&
+          evaluation.judgment &&
+          evaluation.score &&
+          evaluation.questionResolution?.resolvedArtifactSha === config.primaryResolvedArtifactSha &&
+          evaluation.gate &&
+          JSON.stringify(evaluation.gate) === JSON.stringify(expectedGate) &&
+          (baseline
+            ? evaluation.gate.status === 'passed'
+            : evaluation.gate.status === 'passed' || evaluation.gate.status === 'warning'),
+      );
+    }
     const comparisonOrdinals = evaluation.comparisons?.map(({ replicate }) => replicate).sort() ?? [];
     const holdoutsComplete = campaign.config.benchmarks
       .filter(({ role }) => role === 'holdout')
@@ -1241,9 +1959,8 @@ export class CampaignOrchestrator {
       if (pending.campaignId !== campaignId) continue;
       this.pendingTargetAnswers.delete(key);
       pending.reject(new Error('target-excluded question wait was stopped by the user'));
-      const variantId = key.slice(0, key.lastIndexOf(':'));
-      if (this.database.getTargetExcludedEvaluation(variantId)) {
-        this.database.updateTargetExcludedEvaluation(variantId, {
+      if (this.database.getTargetExcludedEvaluation(pending.variantId)) {
+        this.database.updateTargetExcludedEvaluation(pending.variantId, {
           status: 'failed',
           error: 'target-excluded question wait was stopped by the user',
         });
@@ -1316,6 +2033,65 @@ export class CampaignOrchestrator {
     await this.refreshReports(input.campaignId);
   }
 
+  private persistV2StandardOutcomes(
+    variantId: string,
+    primary: Benchmark,
+    holdouts: readonly Benchmark[],
+    questionResolutions: NonNullable<VariantRecord['questionResolutions']>,
+    outcomes: readonly PromiseSettledResult<BenchmarkReplicateResult>[],
+  ): {
+    primaryRuns: BenchmarkReplicateResult | null;
+    holdoutFacts: Record<string, RunFacts>;
+    holdoutReplicateFacts: Record<string, RunFacts[]>;
+    failures: unknown[];
+  } {
+    const current = this.database.getVariant(variantId);
+    const nextHoldoutFacts = { ...(current.holdoutFacts ?? {}) };
+    const nextHoldoutReplicateFacts = { ...(current.holdoutReplicateFacts ?? {}) };
+    const failures: unknown[] = [];
+    const primaryOutcome = outcomes[0];
+    const primaryRuns = primaryOutcome?.status === 'fulfilled' ? primaryOutcome.value : null;
+    if (primaryOutcome?.status === 'rejected') failures.push(primaryOutcome.reason);
+    if (!primaryOutcome) failures.push(new Error('standard primary outcome is missing'));
+    if (primaryRuns) {
+      questionResolutions[primary.name] = withRuntimeQuestions(
+        questionResolutions[primary.name]!,
+        primaryRuns.questions,
+      );
+    }
+    for (const [index, benchmark] of holdouts.entries()) {
+      const outcome = outcomes[index + 1];
+      if (!outcome) {
+        failures.push(new Error(`${benchmark.name} outcome is missing`));
+        continue;
+      }
+      if (outcome.status === 'rejected') {
+        failures.push(outcome.reason);
+        continue;
+      }
+      nextHoldoutFacts[benchmark.name] = outcome.value.facts;
+      nextHoldoutReplicateFacts[benchmark.name] = outcome.value.replicates;
+      questionResolutions[benchmark.name] = withRuntimeQuestions(
+        questionResolutions[benchmark.name]!,
+        outcome.value.questions,
+      );
+    }
+    this.database.updateVariant(variantId, {
+      facts: primaryRuns?.facts ?? current.facts,
+      replicateFacts: primaryRuns?.replicates ?? current.replicateFacts,
+      holdoutFacts: Object.keys(nextHoldoutFacts).length > 0 ? nextHoldoutFacts : null,
+      holdoutReplicateFacts:
+        Object.keys(nextHoldoutReplicateFacts).length > 0 ? nextHoldoutReplicateFacts : null,
+      questionResolutions,
+    });
+    return {
+      primaryRuns,
+      holdoutFacts: nextHoldoutFacts,
+      holdoutReplicateFacts: nextHoldoutReplicateFacts,
+      failures,
+    };
+  }
+
   private async runVariant(
     campaign: CampaignRecord,
     initialVariant: VariantRecord,
@@ -1332,6 +2108,8 @@ export class CampaignOrchestrator {
     });
     let stack: StackHandle | null = null;
     let artifactDirectory = '';
+    let automaticV2Config: TargetExcludedConfig | null = null;
+    let standardCohortsComplete = false;
     try {
       artifactDirectory = await ensureVariantArtifactDirectory(
         this.paths,
@@ -1409,23 +2187,32 @@ export class CampaignOrchestrator {
       variant = this.database.updateVariant(variant.id, { patchPath });
 
       const workflowsSource = await this.ensureFrozenWorkflowsSource(campaign);
-      const targetConfig = this.database.getTargetExcludedConfig(campaign.id);
+      let targetConfig = this.database.getTargetExcludedConfig(campaign.id);
+      let protocolPlan = targetExcludedProtocolPlan(campaign, targetConfig);
       const resolvedBenchmarks: Benchmark[] = [];
       const questionResolutions: NonNullable<VariantRecord['questionResolutions']> = {};
       for (const benchmark of campaign.config.benchmarks) {
-        const resolved = await resolveBenchmarkQuestions({
-          campaign,
-          benchmark,
-          workflowsSource,
-          sharedDirectory: path.join(campaignDirectory(this.paths, campaign.id), 'resolved-packs'),
-          artifactDirectory: path.join(artifactDirectory, benchmark.name, 'questions'),
-        });
+        const resolved =
+          benchmark.role === 'primary' && protocolPlan?.targetSafePrimary
+            ? await this.resolveV2PrimaryBenchmark(
+                campaign,
+                benchmark,
+                protocolPlan.targetImplementationWorkflow,
+                path.join(artifactDirectory, benchmark.name, 'questions'),
+              )
+            : await resolveBenchmarkQuestions({
+                campaign,
+                benchmark,
+                workflowsSource,
+                sharedDirectory: path.join(campaignDirectory(this.paths, campaign.id), 'resolved-packs'),
+                artifactDirectory: path.join(artifactDirectory, benchmark.name, 'questions'),
+              });
         resolvedBenchmarks.push(resolved.benchmark);
         questionResolutions[benchmark.name] = resolved.summary;
       }
       const standardPrimary = resolvedBenchmarks.find((benchmark) => benchmark.role === 'primary');
       if (!standardPrimary) throw new Error('resolved benchmark set omitted the primary pack');
-      const targetPair = targetConfig
+      const targetPair = targetConfig?.protocol === 'dedicated-control-v1'
         ? await this.resolveTargetPairBenchmark(
             campaign,
             primaryBenchmark(campaign),
@@ -1445,6 +2232,27 @@ export class CampaignOrchestrator {
         trustedPlanner,
       );
       variant = this.database.updateVariant(variant.id, { imageTag: built.imageTag, status: 'gating' });
+      if (variant.round === 0 && protocolPlan?.protocol === 'standard-primary-v2') {
+        targetConfig = await this.prepareAutomaticV2Config(
+          campaign,
+          variant,
+          built.testImageTag,
+          questionResolutions[standardPrimary.name]!,
+        );
+        automaticV2Config = targetConfig;
+        protocolPlan = targetExcludedProtocolPlan(campaign, targetConfig);
+      }
+      if (protocolPlan?.protocol === 'standard-primary-v2' && !targetConfig) {
+        throw new Error('V2 target-excluded config was not established by the campaign baseline');
+      }
+      if (
+        targetConfig?.protocol === 'standard-primary-v2' &&
+        (standardPrimary.sha256 !== targetConfig.primaryResolvedArtifactSha ||
+          questionResolutions[standardPrimary.name]?.resolvedArtifactSha !==
+            targetConfig.primaryResolvedArtifactSha)
+      ) {
+        throw new Error('V2 standard primary differs from the campaign-frozen resolved artifact');
+      }
       await runVariantGates(
         campaign,
         built.testImageTag,
@@ -1490,118 +2298,240 @@ export class CampaignOrchestrator {
         facts: RunFacts;
         replicates: RunFacts[];
         questions: Phase2QuestionAudit[];
-      };
+      } | null = null;
       const holdoutFacts: Record<string, RunFacts> = {};
       const holdoutReplicateFacts: Record<string, RunFacts[]> = {};
       let targetControlRuns: Awaited<ReturnType<CampaignOrchestrator['runBenchmarkReplicates']>> | null = null;
       let targetExcludedRuns: Awaited<ReturnType<CampaignOrchestrator['runBenchmarkReplicates']>> | null = null;
       let targetComparisons: Awaited<ReturnType<typeof runTargetExcludedComparison>>[] = [];
       try {
-        primaryRuns = await this.runBenchmarkReplicates(
-          campaign,
-          variant,
-          stack,
-          primary,
-          token,
-          targetConfig ? { replicateCount: targetConfig.replicates } : {},
-        );
-        questionResolutions[primary.name] = withRuntimeQuestions(
-          questionResolutions[primary.name]!,
-          primaryRuns.questions,
-        );
-        for (const benchmark of resolvedBenchmarks.filter((item) => item.role === 'holdout')) {
-          const holdout = await this.runBenchmarkReplicates(
+        if (targetConfig?.protocol === 'standard-primary-v2') {
+          const v2Config = targetConfig;
+          const holdouts = resolvedBenchmarks.filter((item) => item.role === 'holdout');
+          const sharedAnswerCache: RuntimeAnswerCache = new Map();
+          const standardPromises = [
+            this.runBenchmarkReplicates(campaign, variant, stack, primary, token, {
+              replicateCount: v2Config.replicates,
+              answerSourceTargetWorkflow: v2Config.targetImplementationWorkflow,
+              answerCache: sharedAnswerCache,
+            }),
+            ...holdouts.map((benchmark) =>
+              this.runBenchmarkReplicates(campaign, variant, stack!, benchmark, token, {
+                replicateCount: v2Config.replicates,
+              }),
+            ),
+          ];
+          const excludedSettled = Promise.allSettled([
+            this.runBenchmarkReplicates(campaign, variant, stack, primary, token, {
+              replicateCount: v2Config.replicates,
+              scope: 'target-excluded/excluded',
+              executionScope: 'excluded',
+              answerSourceTargetWorkflow: v2Config.targetImplementationWorkflow,
+              excludedTargetWorkflow: v2Config.targetImplementationWorkflow,
+              answerCache: sharedAnswerCache,
+              persistToTargetEvaluation: true,
+            }),
+          ]);
+          const standardOutcomes = await Promise.allSettled(standardPromises);
+          const standard = this.persistV2StandardOutcomes(
+            variant.id,
+            primary,
+            holdouts,
+            questionResolutions,
+            standardOutcomes,
+          );
+          primaryRuns = standard.primaryRuns;
+          Object.assign(holdoutFacts, standard.holdoutFacts);
+          Object.assign(holdoutReplicateFacts, standard.holdoutReplicateFacts);
+          standardCohortsComplete =
+            standard.failures.length === 0 &&
+            primaryRuns !== null &&
+            holdouts.every(({ name }) => Boolean(holdoutFacts[name]));
+          const excludedOutcome = (await excludedSettled)[0]!;
+          let normalArmBinding: TargetNormalArmBinding | null = null;
+          if (primaryRuns) {
+            normalArmBinding = this.buildTargetNormalArmBinding(
+              variant.id,
+              primary,
+              v2Config.primaryResolvedArtifactSha,
+            );
+            this.database.updateTargetExcludedEvaluation(variant.id, {
+              controlFacts: null,
+              controlReplicateFacts: null,
+              holdoutFacts: null,
+              holdoutReplicateFacts: null,
+              normalArmBinding,
+            });
+          }
+          if (excludedOutcome.status === 'fulfilled') {
+            targetExcludedRuns = excludedOutcome.value;
+            try {
+              if (!normalArmBinding) {
+                throw new Error('standard primary did not produce a normal-arm binding');
+              }
+              const comparisonDirectory = path.join(
+                artifactDirectory,
+                'target-excluded',
+                'comparisons',
+              );
+              await mkdir(comparisonDirectory, { recursive: true });
+              targetComparisons = await Promise.all(
+                Array.from({ length: v2Config.replicates }, (_, index) => {
+                  const replicate = index + 1;
+                  const directories = targetExcludedComparisonDirectories(
+                    artifactDirectory,
+                    primary.name,
+                    replicate,
+                    v2Config.protocol,
+                  );
+                  return runTargetExcludedComparison({
+                    ...directories,
+                    outputPath: path.join(comparisonDirectory, `replicate-${replicate}.json`),
+                    imageTag: v2Config.comparatorImage,
+                    replicate,
+                  });
+                }),
+              );
+              this.database.updateTargetExcludedEvaluation(variant.id, {
+                controlFacts: null,
+                controlReplicateFacts: null,
+                holdoutFacts: null,
+                holdoutReplicateFacts: null,
+                excludedFacts: targetExcludedRuns.facts,
+                excludedReplicateFacts: targetExcludedRuns.replicates,
+                questionResolution: withRuntimeQuestions(
+                  questionResolutions[primary.name]!,
+                  targetExcludedRuns.questions,
+                  'excluded',
+                ),
+                comparisons: targetComparisons,
+                normalArmBinding,
+                status: 'judging',
+              });
+            } catch (error) {
+              targetExcludedRuns = null;
+              targetComparisons = [];
+              this.database.updateTargetExcludedEvaluation(variant.id, {
+                status: 'failed',
+                error: errorMessage(error).slice(0, 20_000),
+              });
+            }
+          } else {
+            this.database.updateTargetExcludedEvaluation(variant.id, {
+              status: 'failed',
+              error: errorMessage(excludedOutcome.reason).slice(0, 20_000),
+            });
+          }
+          if (standard.failures.length > 0) {
+            const failure = standard.failures[0];
+            this.database.updateTargetExcludedEvaluation(variant.id, {
+              status: 'failed',
+              error: `standard evaluation failed: ${errorMessage(failure)}`.slice(0, 20_000),
+            });
+            throw failure;
+          }
+        } else {
+          primaryRuns = await this.runBenchmarkReplicates(
             campaign,
             variant,
             stack,
-            benchmark,
+            primary,
             token,
             targetConfig ? { replicateCount: targetConfig.replicates } : {},
           );
-          holdoutFacts[benchmark.name] = holdout.facts;
-          holdoutReplicateFacts[benchmark.name] = holdout.replicates;
-          questionResolutions[benchmark.name] = withRuntimeQuestions(
-            questionResolutions[benchmark.name]!,
-            holdout.questions,
+          questionResolutions[primary.name] = withRuntimeQuestions(
+            questionResolutions[primary.name]!,
+            primaryRuns.questions,
           );
-        }
-        if (targetConfig && targetPair) {
-          try {
-            targetControlRuns = await this.runBenchmarkReplicates(
+          for (const benchmark of resolvedBenchmarks.filter((item) => item.role === 'holdout')) {
+            const holdout = await this.runBenchmarkReplicates(
               campaign,
               variant,
               stack,
-              targetPair.benchmark,
+              benchmark,
               token,
-              {
-                replicateCount: targetConfig.replicates,
-                scope: 'target-excluded/control',
-                executionScope: 'control',
-                persistToTargetEvaluation: true,
-              },
+              targetConfig ? { replicateCount: targetConfig.replicates } : {},
             );
-            targetExcludedRuns = await this.runBenchmarkReplicates(
-              campaign,
-              variant,
-              stack,
-              targetPair.benchmark,
-              token,
-              {
-                replicateCount: targetConfig.replicates,
-                scope: 'target-excluded/excluded',
-                executionScope: 'excluded',
-                targetWorkflow: targetConfig.targetImplementationWorkflow,
-                persistToTargetEvaluation: true,
-              },
+            holdoutFacts[benchmark.name] = holdout.facts;
+            holdoutReplicateFacts[benchmark.name] = holdout.replicates;
+            questionResolutions[benchmark.name] = withRuntimeQuestions(
+              questionResolutions[benchmark.name]!,
+              holdout.questions,
             );
-            const comparisonDirectory = path.join(artifactDirectory, 'target-excluded', 'comparisons');
-            await mkdir(comparisonDirectory, { recursive: true });
-            targetComparisons = await Promise.all(
-              Array.from({ length: targetConfig.replicates }, (_, index) =>
-                runTargetExcludedComparison({
-                  normalArtifactDirectory: path.join(
+          }
+          if (targetConfig && targetPair) {
+            try {
+              targetControlRuns = await this.runBenchmarkReplicates(
+                campaign,
+                variant,
+                stack,
+                targetPair.benchmark,
+                token,
+                {
+                  replicateCount: targetConfig.replicates,
+                  scope: 'target-excluded/control',
+                  executionScope: 'control',
+                  persistToTargetEvaluation: true,
+                },
+              );
+              targetExcludedRuns = await this.runBenchmarkReplicates(
+                campaign,
+                variant,
+                stack,
+                targetPair.benchmark,
+                token,
+                {
+                  replicateCount: targetConfig.replicates,
+                  scope: 'target-excluded/excluded',
+                  executionScope: 'excluded',
+                  answerSourceTargetWorkflow: targetConfig.targetImplementationWorkflow,
+                  excludedTargetWorkflow: targetConfig.targetImplementationWorkflow,
+                  persistToTargetEvaluation: true,
+                },
+              );
+              const comparisonDirectory = path.join(artifactDirectory, 'target-excluded', 'comparisons');
+              await mkdir(comparisonDirectory, { recursive: true });
+              targetComparisons = await Promise.all(
+                Array.from({ length: targetConfig.replicates }, (_, index) => {
+                  const replicate = index + 1;
+                  const directories = targetExcludedComparisonDirectories(
                     artifactDirectory,
-                    'target-excluded',
-                    'control',
                     targetPair.benchmark.name,
-                    `replicate-${index + 1}`,
-                  ),
-                  excludedArtifactDirectory: path.join(
-                    artifactDirectory,
-                    'target-excluded',
-                    'excluded',
-                    targetPair.benchmark.name,
-                    `replicate-${index + 1}`,
-                  ),
-                  outputPath: path.join(comparisonDirectory, `replicate-${index + 1}.json`),
-                  imageTag: targetConfig.comparatorImage,
-                  replicate: index + 1,
+                    replicate,
+                    targetConfig.protocol,
+                  );
+                  return runTargetExcludedComparison({
+                    ...directories,
+                    outputPath: path.join(comparisonDirectory, `replicate-${replicate}.json`),
+                    imageTag: targetConfig.comparatorImage,
+                    replicate,
+                  });
                 }),
-              ),
-            );
-            this.database.updateTargetExcludedEvaluation(variant.id, {
-              controlFacts: targetControlRuns.facts,
-              controlReplicateFacts: targetControlRuns.replicates,
-              holdoutFacts,
-              holdoutReplicateFacts,
-              excludedFacts: targetExcludedRuns.facts,
-              excludedReplicateFacts: targetExcludedRuns.replicates,
-              questionResolution: withRuntimeQuestions(
-                withRuntimeQuestions(targetPair.summary, targetControlRuns.questions, 'control'),
-                targetExcludedRuns.questions,
-                'excluded',
-              ),
-              comparisons: targetComparisons,
-              status: 'judging',
-            });
-          } catch (error) {
-            targetControlRuns = null;
-            targetExcludedRuns = null;
-            targetComparisons = [];
-            this.database.updateTargetExcludedEvaluation(variant.id, {
-              status: 'failed',
-              error: errorMessage(error).slice(0, 20_000),
-            });
+              );
+              this.database.updateTargetExcludedEvaluation(variant.id, {
+                controlFacts: targetControlRuns.facts,
+                controlReplicateFacts: targetControlRuns.replicates,
+                holdoutFacts,
+                holdoutReplicateFacts,
+                excludedFacts: targetExcludedRuns.facts,
+                excludedReplicateFacts: targetExcludedRuns.replicates,
+                questionResolution: withRuntimeQuestions(
+                  withRuntimeQuestions(targetPair.summary, targetControlRuns.questions, 'control'),
+                  targetExcludedRuns.questions,
+                  'excluded',
+                ),
+                comparisons: targetComparisons,
+                status: 'judging',
+              });
+            } catch (error) {
+              targetControlRuns = null;
+              targetExcludedRuns = null;
+              targetComparisons = [];
+              this.database.updateTargetExcludedEvaluation(variant.id, {
+                status: 'failed',
+                error: errorMessage(error).slice(0, 20_000),
+              });
+            }
           }
         }
       } finally {
@@ -1611,6 +2541,7 @@ export class CampaignOrchestrator {
           phase2ElapsedMs: phase2CompletedAtMs - phase2StartedAtMs,
         });
       }
+      if (!primaryRuns) throw new Error('standard primary evaluation did not complete');
       const facts = primaryRuns.facts;
       variant = this.database.updateVariant(variant.id, { questionResolutions });
 
@@ -1652,13 +2583,20 @@ export class CampaignOrchestrator {
           const baselineEvaluation = this.database.getTargetExcludedEvaluation(
             targetConfig.baselineVariantId,
           );
-          const baselineRuns = baselineEvaluation?.excludedReplicateFacts ?? [];
+          const baselineRuns = variant.id === targetConfig.baselineVariantId
+            ? targetExcludedRuns.replicates
+            : baselineEvaluation?.excludedReplicateFacts ?? [];
           const comparisonValid =
             targetComparisons.length === targetConfig.replicates &&
             targetComparisons.every((comparison) => comparison.valid);
           const leakageDetected =
             targetComparisons.some((comparison) => comparison.leakagePaths.length > 0) ||
-            containsTargetIdentityLeak(judged.judgment, targetConfig.targetImplementationWorkflow);
+            containsTargetIdentityLeak(judged.judgment, targetConfig.targetImplementationWorkflow) ||
+            (targetConfig.protocol === 'standard-primary-v2' &&
+              containsTargetIdentityLeak(
+                this.database.getTargetExcludedEvaluation(variant.id)?.questionResolution,
+                targetConfig.targetImplementationWorkflow,
+              ));
           const gate = computeTargetExcludedGate(
             baselineRuns,
             targetExcludedRuns.replicates,
@@ -1752,6 +2690,27 @@ export class CampaignOrchestrator {
         }
       }
       variant = this.database.getVariant(variant.id);
+      if (
+        automaticV2Config &&
+        standardCohortsComplete &&
+        variant.artifactCollectionComplete
+      ) {
+        try {
+          await this.persistAutomaticV2Config(campaign, automaticV2Config);
+        } catch (error) {
+          variant = this.database.updateVariant(variant.id, {
+            status: 'failed',
+            error: `V2 config persistence failed: ${errorMessage(error)}`.slice(0, 20_000),
+          });
+          const targetEvaluation = this.database.getTargetExcludedEvaluation(variant.id);
+          if (targetEvaluation) {
+            this.database.updateTargetExcludedEvaluation(variant.id, {
+              status: 'failed',
+              error: `V2 config persistence failed: ${errorMessage(error)}`.slice(0, 20_000),
+            });
+          }
+        }
+      }
       if (artifactDirectory && variant.facts && variant.judgment) {
         await this.runDiagnosis(campaign, variant, artifactDirectory);
         variant = this.database.getVariant(variant.id);
@@ -1779,6 +2738,11 @@ export class CampaignOrchestrator {
   ): Promise<Phase2Result> {
     const startedAtMs = Date.now();
     const startedAt = new Date(startedAtMs).toISOString();
+    const executionBenchmark = options.executionScope
+      ? `${benchmark.name}:${options.executionScope}`
+      : options.scope
+        ? `${benchmark.name}:${options.scope}`
+        : benchmark.name;
     let latestSnapshot: Phase2RunSnapshot = {
       caseId: null,
       runId: null,
@@ -1795,11 +2759,7 @@ export class CampaignOrchestrator {
     };
     const persistSnapshot = (snapshot: Phase2RunSnapshot): void => {
       const input = {
-        benchmark: options.executionScope
-          ? `${benchmark.name}:${options.executionScope}`
-          : options.scope
-            ? `${benchmark.name}:${options.scope}`
-            : benchmark.name,
+        benchmark: executionBenchmark,
         role: benchmark.role,
         replicate,
         replicateCount: options.replicateCount ?? campaign.config.evaluation.replicates,
@@ -1835,8 +2795,13 @@ export class CampaignOrchestrator {
             workflowsSource,
             path.join(directory, 'questions'),
             answerCache,
-            options.targetWorkflow
-              ? { targetWorkflow: options.targetWorkflow, variantId: variant.id }
+            options.answerSourceTargetWorkflow
+              ? {
+                  targetWorkflow: options.answerSourceTargetWorkflow,
+                  variantId: variant.id,
+                  benchmark: executionBenchmark,
+                  replicate,
+                }
               : undefined,
           ),
         async (snapshot) => {
@@ -1849,8 +2814,8 @@ export class CampaignOrchestrator {
           };
           persistSnapshot(latestSnapshot);
         },
-        options.targetWorkflow
-          ? { targetImplementationWorkflow: options.targetWorkflow }
+        options.excludedTargetWorkflow
+          ? { targetImplementationWorkflow: options.excludedTargetWorkflow }
           : undefined,
       );
       await writeFile(path.join(directory, 'result.json'), `${JSON.stringify(result, null, 2)}\n`);
@@ -1884,10 +2849,10 @@ export class CampaignOrchestrator {
     const replicateResults: Array<Phase2Result | undefined> = new Array(
       replicateCount,
     );
-    const workflowsSource = options.targetWorkflow
-      ? await this.ensureTargetExcludedWorkflowsSource(campaign, options.targetWorkflow)
+    const workflowsSource = options.answerSourceTargetWorkflow
+      ? await this.ensureTargetExcludedWorkflowsSource(campaign, options.answerSourceTargetWorkflow)
       : await this.ensureFrozenWorkflowsSource(campaign);
-    const answerCache: RuntimeAnswerCache = new Map();
+    const answerCache = options.answerCache ?? new Map();
     let nextReplicate = 1;
     let workerFailure: unknown;
     const worker = async (): Promise<void> => {
@@ -1947,7 +2912,12 @@ export class CampaignOrchestrator {
     workflowsSource: string,
     artifactDirectory: string,
     answerCache: RuntimeAnswerCache,
-    targetContext?: { targetWorkflow: string; variantId: string },
+    targetContext?: {
+      targetWorkflow: string;
+      variantId: string;
+      benchmark: string;
+      replicate: number;
+    },
   ): Promise<Phase2QuestionAnswer> {
     await mkdir(artifactDirectory, { recursive: true });
     const consultationRecords = matchQuestionConsultations(consultations, question);
@@ -1959,30 +2929,121 @@ export class CampaignOrchestrator {
       coverageIds: question.coverageIds,
       options: question.options?.map(({ label, description, consequences }) => ({
         label,
-        description: description ?? consequences ?? '',
+        description: description ?? null,
+        consequences: consequences ?? null,
       })),
     });
+    const cacheAnswer = (value: Phase2QuestionAnswer): CachedRuntimeAnswer => {
+      const selectedOptionIndex = value.selectedOptionId
+        ? question.options?.findIndex(({ id }) => id === value.selectedOptionId) ?? -1
+        : -1;
+      const selectedOption =
+        selectedOptionIndex >= 0 ? question.options?.[selectedOptionIndex] : undefined;
+      return {
+        value,
+        ...(selectedOption
+          ? {
+              selectedOption: {
+                index: selectedOptionIndex,
+                label: selectedOption.label,
+                description: selectedOption.description ?? null,
+                consequences: selectedOption.consequences ?? null,
+              },
+            }
+          : {}),
+      };
+    };
+    const answerForCurrentQuestion = (
+      cached: CachedRuntimeAnswer,
+    ): Phase2QuestionAnswer | null => {
+      const currentOption = cached.selectedOption
+        ? question.options?.[cached.selectedOption.index]
+        : undefined;
+      const selectedOptionMatches = Boolean(
+        cached.selectedOption &&
+          currentOption &&
+          currentOption.label === cached.selectedOption.label &&
+          (currentOption.description ?? null) === cached.selectedOption.description &&
+          (currentOption.consequences ?? null) === cached.selectedOption.consequences,
+      );
+      const selectedOptionId = cached.selectedOption
+        ? selectedOptionMatches
+          ? selectedOptionIdForAnswer(
+              question,
+              cached.selectedOption.label,
+              currentOption!.id,
+            )
+          : undefined
+        : selectedOptionIdForAnswer(
+            question,
+            cached.value.answer,
+            cached.value.selectedOptionId,
+          );
+      if (question.responseKind === 'single_select' && !selectedOptionId) return null;
+      return {
+        ...cached.value,
+        ...(selectedOptionId ? { selectedOptionId } : {}),
+      };
+    };
+    const waitForHumanAnswer = async (): Promise<Phase2QuestionAnswer> => {
+      if (!targetContext) {
+        throw new Error(`planner question ${question.id} remains unresolved`);
+      }
+      return await this.waitForTargetExcludedAnswer(
+        targetContext.variantId,
+        targetContext.targetWorkflow,
+        targetContext.benchmark,
+        targetContext.replicate,
+        question,
+      );
+    };
+    const waitForSharedHumanAnswer = async (
+      automatedCacheValue: CachedRuntimeAnswer | Promise<CachedRuntimeAnswer | null>,
+    ): Promise<Phase2QuestionAnswer> => {
+      const forCurrentQuestion = (shared: CachedRuntimeAnswer): Phase2QuestionAnswer => {
+        const answer = answerForCurrentQuestion(shared);
+        if (!answer) {
+          throw new Error(`shared human answer did not select an option for ${question.id}`);
+        }
+        return answer;
+      };
+      const current = answerCache.get(cacheKey);
+      if (current && current !== automatedCacheValue) {
+        const shared = await current;
+        if (shared) return forCurrentQuestion(shared);
+      }
+      const humanPromise = waitForHumanAnswer().then(cacheAnswer);
+      answerCache.set(cacheKey, humanPromise);
+      try {
+        const humanAnswer = await humanPromise;
+        if (answerCache.get(cacheKey) === humanPromise) {
+          answerCache.set(cacheKey, humanAnswer);
+        }
+        return forCurrentQuestion(humanAnswer);
+      } catch (error) {
+        if (answerCache.get(cacheKey) === humanPromise) answerCache.delete(cacheKey);
+        throw error;
+      }
+    };
     const cachedValue = answerCache.get(cacheKey);
     if (cachedValue) {
       const cached = await cachedValue;
-      const selectedOptionId = selectedOptionIdForAnswer(
-        question,
-        cached.answer,
-        cached.selectedOptionId,
-      );
+      if (!cached) {
+        return await waitForSharedHumanAnswer(cachedValue);
+      }
+      const answer = answerForCurrentQuestion(cached);
       if (
-        (question.responseKind !== 'single_select' || selectedOptionId) &&
-        (!targetContext || !containsTargetIdentityLeak(cached, targetContext.targetWorkflow))
+        answer &&
+        (!targetContext || !containsTargetIdentityLeak(answer, targetContext.targetWorkflow))
       ) {
         return {
-          ...cached,
-          ...(selectedOptionId ? { selectedOptionId } : {}),
+          ...answer,
           resolution: 'reused_source_answer',
           requirementsAgentRequests: consultationRecords.length,
         };
       }
     }
-    const resolutionPromise = (async (): Promise<Phase2QuestionAnswer> => {
+    const resolutionPromise = (async (): Promise<CachedRuntimeAnswer | null> => {
       const answeredConsultation = consultationRecords.find((record) => {
       const outcome = record.outcome;
       return (
@@ -1998,7 +3059,11 @@ export class CampaignOrchestrator {
         ? outcome.citations.map(citationEvidence)
         : ['requirements-agent returned a grounded answer'];
       const answerText = String(outcome.answer);
-      const selectedOptionId = selectedOptionIdForAnswer(question, answerText);
+      const selectedOptionId = selectedOptionIdForAnswer(
+        question,
+        answerText,
+        typeof outcome.selectedOptionId === 'string' ? outcome.selectedOptionId : undefined,
+      );
        if (
          (question.responseKind !== 'single_select' || selectedOptionId) &&
          (!targetContext ||
@@ -2014,7 +3079,7 @@ export class CampaignOrchestrator {
           evidence: citations,
           requirementsAgentRequests: consultationRecords.length,
         };
-        return answer;
+         return cacheAnswer(answer);
       }
     }
       const source = await new AgentRunner(campaign).answerUpstreamQuestion(
@@ -2038,11 +3103,7 @@ export class CampaignOrchestrator {
         if (!targetContext) {
           throw new Error(`planner question ${question.id} remains unresolved: ${source.reason}`);
         }
-        return await this.waitForTargetExcludedAnswer(
-          targetContext.variantId,
-          targetContext.targetWorkflow,
-          question,
-        );
+        return null;
       }
       const selectedOptionId = selectedOptionIdForAnswer(
       question,
@@ -2058,21 +3119,24 @@ export class CampaignOrchestrator {
       resolution: 'source_fallback',
       evidence: source.evidence,
       requirementsAgentRequests: consultationRecords.length,
-    };
+      };
       if (targetContext && containsTargetIdentityLeak(answer, targetContext.targetWorkflow)) {
-        return await this.waitForTargetExcludedAnswer(
-          targetContext.variantId,
-          targetContext.targetWorkflow,
-          question,
-        );
+        return null;
       }
-      return answer;
+      return cacheAnswer(answer);
     })();
     answerCache.set(cacheKey, resolutionPromise);
     try {
       const answer = await resolutionPromise;
+      if (!answer) {
+        return await waitForSharedHumanAnswer(resolutionPromise);
+      }
       answerCache.set(cacheKey, answer);
-      return answer;
+      const currentAnswer = answerForCurrentQuestion(answer);
+      if (!currentAnswer) {
+        throw new Error(`cached answer did not select an option for ${question.id}`);
+      }
+      return currentAnswer;
     } catch (error) {
       if (answerCache.get(cacheKey) === resolutionPromise) answerCache.delete(cacheKey);
       throw error;
@@ -2082,9 +3146,11 @@ export class CampaignOrchestrator {
   private async waitForTargetExcludedAnswer(
     variantId: string,
     targetWorkflow: string,
+    benchmark: string,
+    replicate: number,
     question: PlannerQuestionRecord,
   ): Promise<Phase2QuestionAnswer> {
-    const key = `${variantId}:${question.id}`;
+    const key = pendingTargetAnswerKey(variantId, benchmark, replicate, question.id);
     if (this.pendingTargetAnswers.has(key)) {
       throw new Error(`target-excluded question is already waiting: ${question.id}`);
     }
@@ -2095,6 +3161,8 @@ export class CampaignOrchestrator {
       'target_excluded.question_waiting',
       {
         id: question.id,
+        benchmark,
+        replicate,
         prompt: question.prompt,
         responseKind: question.responseKind,
         options: question.options ?? [],
@@ -2103,6 +3171,9 @@ export class CampaignOrchestrator {
     return await new Promise<Phase2QuestionAnswer>((resolve, reject) => {
       this.pendingTargetAnswers.set(key, {
         campaignId: this.database.getVariant(variantId).campaignId,
+        variantId,
+        benchmark,
+        replicate,
         targetWorkflow,
         question,
         resolve,
@@ -2117,12 +3188,37 @@ export class CampaignOrchestrator {
     config: TargetExcludedConfig,
   ): Promise<TargetExcludedEvaluationRecord> {
     const existing = this.database.getTargetExcludedEvaluation(variant.id);
-    if (
-      existing?.status === 'completed' &&
-      existing.artifactCollectionComplete &&
-      (existing.gate?.status === 'passed' || existing.gate?.status === 'warning')
-    ) {
-      throw new Error(`target-excluded evaluation already exists: ${variant.id}`);
+    const existingComplete =
+      config.protocol === 'standard-primary-v2'
+        ? this.targetExcludedEvaluationReady(
+            campaign,
+            config,
+            existing,
+            variant.id === config.baselineVariantId,
+          )
+        : existing?.status === 'completed' &&
+          existing.artifactCollectionComplete &&
+          (existing.gate?.status === 'passed' || existing.gate?.status === 'warning');
+    if (existingComplete && existing) {
+      let archiveValid = false;
+      try {
+        await this.verifyArchivedTargetExcludedComparisons(
+          campaign,
+          variant.id,
+          config,
+          existing,
+        );
+        archiveValid = true;
+      } catch (error) {
+        this.database.updateTargetExcludedEvaluation(variant.id, {
+          status: 'failed',
+          error: `invalid archived target attempt: ${errorMessage(error)}`.slice(0, 20_000),
+        });
+        this.database.addEvent(campaign.id, variant.id, 'target_excluded.invalid_attempt', {
+          error: errorMessage(error),
+        });
+      }
+      if (archiveValid) throw new Error(`target-excluded evaluation already exists: ${variant.id}`);
     }
     if (!variant.worktreePath || !variant.imageTag || !variant.artifactCollectionComplete) {
       throw new Error('variant worktree, image, and archived artifacts are required');
@@ -2156,6 +3252,8 @@ export class CampaignOrchestrator {
       executionState: null,
       comparisons: null,
       gate: null,
+      normalArmBinding:
+        config.protocol === 'standard-primary-v2' ? existing?.normalArmBinding ?? null : null,
       startedAt: new Date().toISOString(),
       completedAt: null,
       artifactCollectionComplete: false,
@@ -2171,23 +3269,55 @@ export class CampaignOrchestrator {
       );
       const resolvedBenchmarks: Benchmark[] = [];
       const resolutions: Record<string, NonNullable<VariantRecord['questionResolutions']>[string]> = {};
-      for (const benchmark of campaign.config.benchmarks) {
-        const resolved = benchmark.role === 'primary'
-          ? await this.resolveTargetPairBenchmark(
-              campaign,
-              benchmark,
-              config,
-              path.join(artifactDirectory, 'pack-questions', benchmark.name),
+      if (config.protocol === 'standard-primary-v2') {
+        const campaignPrimary = primaryBenchmark(campaign);
+        const summary = variant.questionResolutions?.[campaignPrimary.name];
+        const canonicalPackPath = path.join(
+          campaignDirectory(this.paths, campaign.id),
+          'resolved-packs',
+          `${campaignPrimary.name}.zip`,
+        );
+        if (
+          !summary ||
+          summary.resolvedArtifactSha !== config.primaryResolvedArtifactSha ||
+          (await sha256File(canonicalPackPath)) !== config.primaryResolvedArtifactSha ||
+          !variant.facts ||
+          variant.replicateFacts?.length !== config.replicates ||
+          campaign.config.benchmarks
+            .filter(({ role }) => role === 'holdout')
+            .some(
+              ({ name }) =>
+                !variant.holdoutFacts?.[name] ||
+                variant.holdoutReplicateFacts?.[name]?.length !== config.replicates,
             )
-          : await resolveBenchmarkQuestions({
-              campaign,
-              benchmark,
-              workflowsSource,
-              sharedDirectory: path.join(campaignDirectory(this.paths, campaign.id), 'resolved-packs'),
-              artifactDirectory: path.join(artifactDirectory, 'pack-questions', benchmark.name),
-            });
-        resolvedBenchmarks.push(resolved.benchmark);
-        resolutions[benchmark.name] = resolved.summary;
+        ) {
+          throw new Error('V2 backfill requires complete archived standard facts and resolved primary');
+        }
+        resolvedBenchmarks.push({
+          ...campaignPrimary,
+          zipPath: canonicalPackPath,
+          sha256: config.primaryResolvedArtifactSha,
+        });
+        resolutions[campaignPrimary.name] = summary;
+      } else {
+        for (const benchmark of campaign.config.benchmarks) {
+          const resolved = benchmark.role === 'primary'
+            ? await this.resolveTargetPairBenchmark(
+                campaign,
+                benchmark,
+                config,
+                path.join(artifactDirectory, 'pack-questions', benchmark.name),
+              )
+            : await resolveBenchmarkQuestions({
+                campaign,
+                benchmark,
+                workflowsSource,
+                sharedDirectory: path.join(campaignDirectory(this.paths, campaign.id), 'resolved-packs'),
+                artifactDirectory: path.join(artifactDirectory, 'pack-questions', benchmark.name),
+              });
+          resolvedBenchmarks.push(resolved.benchmark);
+          resolutions[benchmark.name] = resolved.summary;
+        }
       }
       const environment = await loadCampaignEnvironment(campaign);
       stack = await startVariantStack(
@@ -2205,65 +3335,91 @@ export class CampaignOrchestrator {
       const token = stack.environment.PLANNER_EVAL_API_TOKEN || stack.environment.PLANNER_API_TOKEN;
       const primary = resolvedBenchmarks.find((benchmark) => benchmark.role === 'primary');
       if (!primary) throw new Error('resolved benchmark set omitted the primary pack');
-      const control = await this.runBenchmarkReplicates(campaign, variant, stack, primary, token, {
-        replicateCount: config.replicates,
-        scope: 'control',
-        persistToTargetEvaluation: true,
-      });
-      const holdoutFacts: Record<string, RunFacts> = {};
-      const holdoutReplicateFacts: Record<string, RunFacts[]> = {};
-      for (const holdout of resolvedBenchmarks.filter((benchmark) => benchmark.role === 'holdout')) {
-        const result = await this.runBenchmarkReplicates(campaign, variant, stack, holdout, token, {
+      let control: Awaited<ReturnType<CampaignOrchestrator['runBenchmarkReplicates']>> | null = null;
+      let holdoutFacts: Record<string, RunFacts> | null = null;
+      let holdoutReplicateFacts: Record<string, RunFacts[]> | null = null;
+      let normalArmBinding: TargetNormalArmBinding | null = null;
+      if (config.protocol === 'standard-primary-v2') {
+        normalArmBinding = this.buildTargetNormalArmBinding(
+          variant.id,
+          primary,
+          config.primaryResolvedArtifactSha,
+        );
+        if (
+          existing?.normalArmBinding &&
+          !normalArmBindingsEqual(existing.normalArmBinding, normalArmBinding)
+        ) {
+          throw new Error('persisted V2 normal-arm binding differs from archived standard execution');
+        }
+        evaluation = this.database.updateTargetExcludedEvaluation(variant.id, {
+          normalArmBinding,
+          controlFacts: null,
+          controlReplicateFacts: null,
+          holdoutFacts: null,
+          holdoutReplicateFacts: null,
+        });
+      } else {
+        control = await this.runBenchmarkReplicates(campaign, variant, stack, primary, token, {
           replicateCount: config.replicates,
           scope: 'control',
           persistToTargetEvaluation: true,
         });
-        holdoutFacts[holdout.name] = result.facts;
-        holdoutReplicateFacts[holdout.name] = result.replicates;
+        holdoutFacts = {};
+        holdoutReplicateFacts = {};
+        for (const holdout of resolvedBenchmarks.filter((benchmark) => benchmark.role === 'holdout')) {
+          const result = await this.runBenchmarkReplicates(campaign, variant, stack, holdout, token, {
+            replicateCount: config.replicates,
+            scope: 'control',
+            persistToTargetEvaluation: true,
+          });
+          holdoutFacts[holdout.name] = result.facts;
+          holdoutReplicateFacts[holdout.name] = result.replicates;
+        }
       }
       const excluded = await this.runBenchmarkReplicates(campaign, variant, stack, primary, token, {
         replicateCount: config.replicates,
         scope: 'excluded',
-        targetWorkflow: config.targetImplementationWorkflow,
+        executionScope: 'excluded',
+        answerSourceTargetWorkflow: config.targetImplementationWorkflow,
+        excludedTargetWorkflow: config.targetImplementationWorkflow,
         persistToTargetEvaluation: true,
       });
       const comparisonDirectory = path.join(artifactDirectory, 'comparisons');
       await mkdir(comparisonDirectory, { recursive: true });
       const comparisons = await Promise.all(
-        Array.from({ length: config.replicates }, (_, index) =>
-          runTargetExcludedComparison({
-            normalArtifactDirectory: path.join(
-              artifactDirectory,
-              'control',
+        Array.from({ length: config.replicates }, (_, index) => {
+          const replicate = index + 1;
+          return runTargetExcludedComparison({
+            ...targetExcludedComparisonDirectories(
+              variantArtifacts,
               primary.name,
-              `replicate-${index + 1}`,
+              replicate,
+              config.protocol,
             ),
-            excludedArtifactDirectory: path.join(
-              artifactDirectory,
-              'excluded',
-              primary.name,
-              `replicate-${index + 1}`,
-            ),
-            outputPath: path.join(comparisonDirectory, `replicate-${index + 1}.json`),
+            outputPath: path.join(comparisonDirectory, `replicate-${replicate}.json`),
             imageTag: config.comparatorImage,
-            replicate: index + 1,
-          }),
-        ),
+            replicate,
+          });
+        }),
       );
       evaluation = this.database.updateTargetExcludedEvaluation(variant.id, {
         status: 'judging',
-        controlFacts: control.facts,
-        controlReplicateFacts: control.replicates,
+        controlFacts: control?.facts ?? null,
+        controlReplicateFacts: control?.replicates ?? null,
         holdoutFacts,
         holdoutReplicateFacts,
         excludedFacts: excluded.facts,
         excludedReplicateFacts: excluded.replicates,
-        questionResolution: withRuntimeQuestions(
-          withRuntimeQuestions(resolutions[primary.name]!, control.questions, 'control'),
-          excluded.questions,
-          'excluded',
-        ),
+        questionResolution:
+          config.protocol === 'standard-primary-v2'
+            ? withRuntimeQuestions(resolutions[primary.name]!, excluded.questions, 'excluded')
+            : withRuntimeQuestions(
+                withRuntimeQuestions(resolutions[primary.name]!, control!.questions, 'control'),
+                excluded.questions,
+                'excluded',
+              ),
         comparisons,
+        normalArmBinding,
       });
       const judged = await this.judgeTargetExcluded(
         campaign,
@@ -2278,7 +3434,9 @@ export class CampaignOrchestrator {
         comparisons.every((comparison) => comparison.valid);
       const leakageDetected =
         comparisons.some((comparison) => comparison.leakagePaths.length > 0) ||
-        containsTargetIdentityLeak(judged.judgment, config.targetImplementationWorkflow);
+        containsTargetIdentityLeak(judged.judgment, config.targetImplementationWorkflow) ||
+        (config.protocol === 'standard-primary-v2' &&
+          containsTargetIdentityLeak(evaluation.questionResolution, config.targetImplementationWorkflow));
       const baselineEvaluation = this.database.getTargetExcludedEvaluation(config.baselineVariantId);
       const baselineRuns =
         variant.id === config.baselineVariantId
@@ -2543,6 +3701,16 @@ export class CampaignOrchestrator {
     campaign: CampaignRecord,
     targetWorkflow: string,
   ): Promise<string> {
+    const protocolPlan = targetExcludedProtocolPlan(
+      campaign,
+      this.database.getTargetExcludedConfig(campaign.id),
+    );
+    if (!protocolPlan) throw new Error('target-excluded source protocol is not configured');
+    if (protocolPlan.targetImplementationWorkflow !== targetWorkflow) {
+      throw new Error('target-excluded source target differs from the configured protocol');
+    }
+    const policyVersion = protocolPlan.protocol === 'standard-primary-v2' ? 2 : 1;
+    const sourceRoot = await this.ensureFrozenWorkflowsSource(campaign);
     const destination = path.join(
       this.paths.worktrees,
       campaign.id,
@@ -2556,31 +3724,280 @@ export class CampaignOrchestrator {
       stat(destination).catch(() => null),
       stat(manifestPath).catch(() => null),
     ]);
-    if (destinationState?.isDirectory() && manifestState?.isFile()) {
+    if (destinationState && manifestState) {
+      if (!destinationState.isDirectory() || !manifestState.isFile()) {
+        throw new Error('target-excluded source snapshot pair is invalid');
+      }
       const expectedManifest = JSON.parse(await readFile(manifestPath, 'utf8')) as Parameters<
         typeof verifyTargetExcludedSourceSnapshot
       >[0]['expectedManifest'];
       await verifyTargetExcludedSourceSnapshot({
+        sourceRoot,
         snapshotRoot: destination,
         targetWorkflow,
+        policyVersion,
         expectedManifest,
       });
       return destination;
     }
     if (destinationState || manifestState) {
-      throw new Error('target-excluded source snapshot is incomplete');
+      await Promise.all([
+        rm(destination, { recursive: true, force: true }),
+        rm(manifestPath, { force: true }),
+      ]);
     }
-    const sourceRoot = await this.ensureFrozenWorkflowsSource(campaign);
     const manifest = await createTargetExcludedSourceSnapshot({
       sourceRoot,
       snapshotRoot: destination,
       targetWorkflow,
+      policyVersion,
     });
     await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, {
       flag: 'wx',
       mode: 0o600,
     });
     return destination;
+  }
+
+  private async readAutomaticV2Sidecar(
+    campaign: CampaignRecord,
+  ): Promise<TargetExcludedConfig | null> {
+    const sidecarPath = path.join(campaignDirectory(this.paths, campaign.id), 'target-excluded.json');
+    try {
+      return TargetExcludedConfigSchema.parse(
+        JSON.parse(await readFile(sidecarPath, 'utf8')) as unknown,
+      );
+    } catch (error) {
+      if (isRecord(error) && error.code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
+  private validateAutomaticV2Config(
+    campaign: CampaignRecord,
+    config: TargetExcludedConfig,
+  ): asserts config is TargetExcludedConfig & { protocol: 'standard-primary-v2' } {
+    const declared = campaign.config.targetExcluded;
+    if (
+      !declared ||
+      config.protocol !== 'standard-primary-v2' ||
+      config.targetImplementationWorkflow !== declared.targetImplementationWorkflow ||
+      config.normalArmSource !== 'standard_primary'
+    ) {
+      throw new Error('automatic V2 config differs from the campaign-frozen target identity');
+    }
+  }
+
+  private automaticV2ConfigsEqual(
+    left: TargetExcludedConfig,
+    right: TargetExcludedConfig,
+  ): boolean {
+    if (left.protocol !== 'standard-primary-v2' || right.protocol !== 'standard-primary-v2') {
+      return false;
+    }
+    return (
+      left.targetImplementationWorkflow === right.targetImplementationWorkflow &&
+      left.baselineVariantId === right.baselineVariantId &&
+      left.comparatorImage === right.comparatorImage &&
+      left.configuredAt === right.configuredAt &&
+      left.replicates === right.replicates &&
+      left.concurrency === right.concurrency &&
+      left.warningBuildDropRatio === right.warningBuildDropRatio &&
+      left.blockBuildDropRatio === right.blockBuildDropRatio &&
+      left.normalArmSource === right.normalArmSource &&
+      left.primaryResolvedArtifactSha === right.primaryResolvedArtifactSha
+    );
+  }
+
+  private async standardBaselineDurable(
+    campaign: CampaignRecord,
+    config: TargetExcludedConfig,
+  ): Promise<boolean> {
+    if (config.protocol !== 'standard-primary-v2') return false;
+    let baseline: VariantRecord;
+    try {
+      baseline = this.database.getVariant(config.baselineVariantId);
+    } catch {
+      return false;
+    }
+    const primary = primaryBenchmark(campaign);
+    if (
+      baseline.campaignId !== campaign.id ||
+      baseline.round !== 0 ||
+      !baseline.worktreePath ||
+      !baseline.imageTag ||
+      !baseline.facts ||
+      baseline.replicateFacts?.length !== config.replicates ||
+      baseline.questionResolutions?.[primary.name]?.resolvedArtifactSha !==
+        config.primaryResolvedArtifactSha ||
+      campaign.config.benchmarks.some(
+        ({ name, role }) =>
+          !baseline.questionResolutions?.[name] ||
+          (role === 'holdout' &&
+            (!baseline.holdoutFacts?.[name] ||
+              baseline.holdoutReplicateFacts?.[name]?.length !== config.replicates)),
+      ) ||
+      !(await this.hasCompleteEvaluationArtifacts(campaign, baseline))
+    ) {
+      return false;
+    }
+    const canonicalPack = path.join(
+      campaignDirectory(this.paths, campaign.id),
+      'resolved-packs',
+      `${primary.name}.zip`,
+    );
+    return (await sha256File(canonicalPack).catch(() => null)) === config.primaryResolvedArtifactSha;
+  }
+
+  private async prepareAutomaticV2Config(
+    campaign: CampaignRecord,
+    baseline: VariantRecord,
+    testImageTag: string,
+    primarySummary: NonNullable<VariantRecord['questionResolutions']>[string],
+  ): Promise<TargetExcludedConfig> {
+    const declared = campaign.config.targetExcluded;
+    if (!declared) throw new Error('V2 target identity is not frozen in the campaign');
+    if (primarySummary.benchmark !== primaryBenchmark(campaign).name) {
+      throw new Error('V2 primary resolution summary names a different benchmark');
+    }
+    const comparatorImage = (
+      await runCommand('docker', ['image', 'inspect', '--format', '{{.Id}}', testImageTag], {
+        timeoutMs: 120_000,
+      })
+    ).stdout.trim();
+    if (!/^sha256:[a-f0-9]{64}$/.test(comparatorImage)) {
+      throw new Error('baseline comparator image did not resolve to an immutable image ID');
+    }
+    const sidecar = await this.readAutomaticV2Sidecar(campaign);
+    const persisted = this.database.getTargetExcludedConfig(campaign.id);
+    const validate = (config: TargetExcludedConfig): void => {
+      this.validateAutomaticV2Config(campaign, config);
+      if (
+        config.baselineVariantId !== baseline.id ||
+        config.comparatorImage !== comparatorImage ||
+        config.primaryResolvedArtifactSha !== primarySummary.resolvedArtifactSha ||
+        config.replicates !== 2 ||
+        config.concurrency !== 2 ||
+        config.warningBuildDropRatio !== 0.08 ||
+        config.blockBuildDropRatio !== 0.15
+      ) {
+        throw new Error('immutable V2 target-excluded config differs from the baseline inputs');
+      }
+    };
+    if (persisted) validate(persisted);
+    if (sidecar) validate(sidecar);
+    if (persisted && sidecar && persisted.configuredAt !== sidecar.configuredAt) {
+      throw new Error('target-excluded sidecar differs from the persisted immutable config');
+    }
+    return persisted ?? sidecar ?? TargetExcludedConfigSchema.parse({
+      protocol: 'standard-primary-v2',
+      targetImplementationWorkflow: declared.targetImplementationWorkflow,
+      baselineVariantId: baseline.id,
+      comparatorImage,
+      configuredAt: new Date().toISOString(),
+      replicates: 2,
+      concurrency: 2,
+      warningBuildDropRatio: 0.08,
+      blockBuildDropRatio: 0.15,
+      normalArmSource: 'standard_primary',
+      primaryResolvedArtifactSha: primarySummary.resolvedArtifactSha,
+    });
+  }
+
+  private async persistAutomaticV2Config(
+    campaign: CampaignRecord,
+    config: TargetExcludedConfig,
+  ): Promise<TargetExcludedConfig> {
+    this.validateAutomaticV2Config(campaign, config);
+    if (!(await this.standardBaselineDurable(campaign, config))) {
+      throw new Error('standard baseline facts and artifacts are not durable');
+    }
+    const persisted = this.database.getTargetExcludedConfig(campaign.id);
+    const sidecar = await this.readAutomaticV2Sidecar(campaign);
+    if (persisted && !this.automaticV2ConfigsEqual(persisted, config)) {
+      throw new Error('persisted immutable V2 config differs from the durable baseline');
+    }
+    if (sidecar && !this.automaticV2ConfigsEqual(sidecar, config)) {
+      throw new Error('target-excluded sidecar differs from the durable baseline');
+    }
+    if (!sidecar) {
+      const sidecarPath = path.join(campaignDirectory(this.paths, campaign.id), 'target-excluded.json');
+      const temporaryPath = `${sidecarPath}.tmp-${process.pid}-${randomUUID()}`;
+      try {
+        await writeFile(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, {
+          flag: 'wx',
+          mode: 0o600,
+        });
+        await rename(temporaryPath, sidecarPath);
+      } finally {
+        await rm(temporaryPath, { force: true });
+      }
+    }
+    return persisted ?? this.database.createTargetExcludedConfig(campaign.id, config);
+  }
+
+  private async recoverAutomaticV2Config(
+    campaign: CampaignRecord,
+    dependencies: { runCommand?: typeof runCommand } = {},
+  ): Promise<TargetExcludedConfig | null> {
+    if (!campaign.config.targetExcluded) return this.database.getTargetExcludedConfig(campaign.id);
+    const persisted = this.database.getTargetExcludedConfig(campaign.id);
+    const sidecar = await this.readAutomaticV2Sidecar(campaign);
+    const config = persisted ?? sidecar;
+    if (!config) return null;
+    this.validateAutomaticV2Config(campaign, config);
+    if (persisted && sidecar && !this.automaticV2ConfigsEqual(persisted, sidecar)) {
+      throw new Error('target-excluded sidecar differs from the persisted immutable config');
+    }
+    await this.verifyAutomaticV2ComparatorImage(
+      campaign,
+      config,
+      dependencies.runCommand ?? runCommand,
+    );
+    return await this.persistAutomaticV2Config(campaign, config);
+  }
+
+  private async verifyAutomaticV2ComparatorImage(
+    campaign: CampaignRecord,
+    config: TargetExcludedConfig,
+    commandRunner: typeof runCommand,
+  ): Promise<void> {
+    this.validateAutomaticV2Config(campaign, config);
+    const baseline = this.database.getVariant(config.baselineVariantId);
+    if (!baseline.imageTag) {
+      throw new Error('bound V2 baseline is missing its image tag');
+    }
+    const comparatorImage = (
+      await commandRunner(
+        'docker',
+        ['image', 'inspect', '--format', '{{.Id}}', `${baseline.imageTag}-test`],
+        { timeoutMs: 120_000 },
+      )
+    ).stdout.trim();
+    if (!/^sha256:[a-f0-9]{64}$/.test(comparatorImage)) {
+      throw new Error('bound baseline comparator did not resolve to an immutable image ID');
+    }
+    if (comparatorImage !== config.comparatorImage) {
+      throw new Error('comparator image differs from the bound baseline test image');
+    }
+  }
+
+  private async resolveV2PrimaryBenchmark(
+    campaign: CampaignRecord,
+    benchmark: Benchmark,
+    targetWorkflow: string,
+    artifactDirectory: string,
+  ): Promise<Awaited<ReturnType<typeof resolveBenchmarkQuestions>>> {
+    const workflowsSource = await this.ensureTargetExcludedWorkflowsSource(campaign, targetWorkflow);
+    return await resolveBenchmarkQuestions({
+      campaign,
+      benchmark,
+      workflowsSource,
+      sharedDirectory: path.join(campaignDirectory(this.paths, campaign.id), 'resolved-packs'),
+      artifactDirectory,
+      answerAllowed: ({ answer, evidence }) =>
+        !containsTargetIdentityLeak({ answer, evidence }, targetWorkflow),
+    });
   }
 
   private async resolveTargetPairBenchmark(

@@ -8,7 +8,7 @@ import { pipeline } from 'node:stream/promises';
 import { z } from 'zod';
 import type { HarnessDatabase } from './db.js';
 import type { CampaignOrchestrator } from './orchestrator.js';
-import { DecisionSchema } from './types.js';
+import { DecisionSchema, TargetExcludedAnswerInputSchema } from './types.js';
 import { campaignReportDirectory, variantArtifactDirectory } from './paths.js';
 import { renderMarkdown } from './renderMarkdown.js';
 import { parseSourceLineRanges, readFrozenSourceFile, renderSourceViewer } from './sourceViewer.js';
@@ -31,11 +31,6 @@ const TargetExcludedConfigInputSchema = z.object({
 });
 
 const TargetExcludedLabelInputSchema = LabelInputSchema.omit({ benchmark: true });
-
-const TargetExcludedAnswerInputSchema = z.object({
-  answer: z.string().min(1).max(20_000),
-  selectedOptionId: z.string().min(1).max(256).optional(),
-});
 
 const REQUIREMENTS_ZIP_MAX_BYTES = 512 * 1_024 * 1_024;
 
@@ -516,6 +511,8 @@ export function startDashboard(input: {
             segments[7],
             answer.answer,
             answer.selectedOptionId,
+            answer.benchmark,
+            answer.replicate,
           );
           sendJson(response, 200, { saved: true });
           return;

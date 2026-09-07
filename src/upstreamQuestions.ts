@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { strFromU8, strToU8, unzipSync, zipSync } from 'fflate';
 import { parse, stringify } from 'yaml';
 import { AgentRunner } from './agents.js';
@@ -22,7 +23,13 @@ type RawQuestion = {
   severity: string;
   status: string;
   options: Array<{ id: string; label: string; description: string; outcome?: string }>;
-  answer?: unknown;
+  answer?: {
+    selected?: unknown;
+    value?: unknown;
+    freeText?: unknown;
+    by?: unknown;
+    at?: unknown;
+  };
 };
 
 type AdvisorResolution =
@@ -48,11 +55,178 @@ interface ResolvedAnswerCandidate {
 const digest = (bytes: Uint8Array): string =>
   `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 
-function questionFiles(files: Record<string, Uint8Array>): Array<[string, RawQuestion]> {
+function parsedQuestionFiles(files: Record<string, Uint8Array>): Array<[string, RawQuestion]> {
   return Object.entries(files)
     .filter(([name]) => name.startsWith('questions/') && name.endsWith('.yaml'))
-    .map(([name, bytes]) => [name, parse(strFromU8(bytes)) as RawQuestion] as [string, RawQuestion])
+    .map(([name, bytes]) => [name, parse(strFromU8(bytes)) as RawQuestion] as [string, RawQuestion]);
+}
+
+function questionFiles(files: Record<string, Uint8Array>): Array<[string, RawQuestion]> {
+  return parsedQuestionFiles(files)
     .filter(([, question]) => question.status === 'open' && question.severity === 'blocking');
+}
+
+function reconstructExpectedResolvedPack(
+  original: Uint8Array,
+  originalFiles: Record<string, Uint8Array>,
+  resolvedFiles: Record<string, Uint8Array>,
+  persisted: BenchmarkQuestionResolution,
+  benchmarkName: string,
+): Uint8Array {
+  const expectedFiles = { ...originalFiles };
+  const originalById = new Map<string, Array<[string, RawQuestion]>>();
+  const resolvedById = new Map<string, Array<[string, RawQuestion]>>();
+  for (const questionFile of parsedQuestionFiles(originalFiles)) {
+    const matches = originalById.get(questionFile[1].id) ?? [];
+    matches.push(questionFile);
+    originalById.set(questionFile[1].id, matches);
+  }
+  for (const questionFile of parsedQuestionFiles(resolvedFiles)) {
+    const matches = resolvedById.get(questionFile[1].id) ?? [];
+    matches.push(questionFile);
+    resolvedById.set(questionFile[1].id, matches);
+  }
+  for (const [id, matches] of originalById) {
+    if (matches.length !== 1) {
+      throw new Error(
+        `resolved pack cache content mismatch for ${benchmarkName}: duplicate original question ${id}`,
+      );
+    }
+  }
+  const entriesById = new Map<string, QuestionResolutionEntry>();
+  for (const entry of persisted.entries) {
+    if (entriesById.has(entry.id)) {
+      throw new Error(
+        `resolved pack cache content mismatch for ${benchmarkName}: duplicate summary entry ${entry.id}`,
+      );
+    }
+    entriesById.set(entry.id, entry);
+  }
+  let answeredAt: string | undefined;
+
+  for (const [id, originalMatches] of originalById) {
+    const [originalPath, originalQuestion] = originalMatches[0]!;
+    const resolvedMatches = resolvedById.get(id) ?? [];
+    const isBlockingTransition =
+      originalQuestion.status === 'open' && originalQuestion.severity === 'blocking';
+    if (!isBlockingTransition) {
+      const unchanged =
+        resolvedMatches.length === 1 &&
+        resolvedMatches[0]![0] === originalPath &&
+        isDeepStrictEqual(resolvedMatches[0]![1], originalQuestion);
+      if (!unchanged) {
+        throw new Error(
+          `resolved pack cache content mismatch for ${benchmarkName}: unrelated question ${id} changed`,
+        );
+      }
+      if (entriesById.has(id)) {
+        throw new Error(
+          `resolved pack cache content mismatch for ${benchmarkName}: summary entry ${id} is not an open blocking transition`,
+        );
+      }
+      continue;
+    }
+
+    const answeredMatches = resolvedMatches.filter(([, question]) => question.status === 'answered');
+    if (answeredMatches.length !== 1 || resolvedMatches.length !== 1) {
+      throw new Error(
+        `resolved pack cache content mismatch for ${benchmarkName}: expected one answered question ${id}, found ${answeredMatches.length}`,
+      );
+    }
+    const entry = entriesById.get(id);
+    if (!entry) {
+      throw new Error(
+        `resolved pack cache content mismatch for ${benchmarkName}: missing summary entry for ${id}`,
+      );
+    }
+    const [resolvedPath, question] = answeredMatches[0]!;
+    const originalDefinition = { ...originalQuestion } as Record<string, unknown>;
+    const resolvedDefinition = { ...question } as Record<string, unknown>;
+    delete originalDefinition.status;
+    delete originalDefinition.answer;
+    delete resolvedDefinition.status;
+    delete resolvedDefinition.answer;
+    if (
+      resolvedPath !== originalPath ||
+      !isDeepStrictEqual(resolvedDefinition, originalDefinition) ||
+      entry.question !== originalQuestion.question
+    ) {
+      throw new Error(
+        `resolved pack cache content mismatch for ${benchmarkName}: transitioned question ${id} changed`,
+      );
+    }
+    const materializedAnswer =
+      question.type === 'data_request' ? question.answer?.value : question.answer?.freeText;
+    if (materializedAnswer !== entry.answer) {
+      throw new Error(
+        `resolved pack cache content mismatch for ${benchmarkName}: answer for ${entry.id}`,
+      );
+    }
+    if (
+      entry.selectedOptionId !== undefined &&
+      !originalQuestion.options.some((option) => option.id === entry.selectedOptionId)
+    ) {
+      throw new Error(
+        `resolved pack cache content mismatch for ${benchmarkName}: unknown selected option ${entry.selectedOptionId} for ${entry.id}`,
+      );
+    }
+    const selectedOptionIds = entry.selectedOptionId
+      ? [entry.selectedOptionId]
+      : selectedOption(originalQuestion);
+    if (!isDeepStrictEqual(question.answer?.selected, selectedOptionIds)) {
+      throw new Error(
+        `resolved pack cache content mismatch for ${benchmarkName}: selected options for ${entry.id}`,
+      );
+    }
+    if (question.answer?.by !== `planner-eval-harness/${entry.resolution}`) {
+      throw new Error(
+        `resolved pack cache content mismatch for ${benchmarkName}: provenance for ${entry.id}`,
+      );
+    }
+    const materializedAt = question.answer?.at;
+    if (
+      typeof materializedAt !== 'string' ||
+      Number.isNaN(new Date(materializedAt).getTime()) ||
+      (answeredAt !== undefined && materializedAt !== answeredAt)
+    ) {
+      throw new Error(
+        `resolved pack cache content mismatch for ${benchmarkName}: timestamp for ${entry.id}`,
+      );
+    }
+    answeredAt = materializedAt;
+    expectedFiles[originalPath] = strToU8(
+      stringify(
+        applyAnswer(
+          originalQuestion,
+          entry.answer,
+          selectedOptionIds,
+          `planner-eval-harness/${entry.resolution}`,
+          materializedAt,
+        ),
+      ),
+    );
+  }
+
+  for (const id of resolvedById.keys()) {
+    if (!originalById.has(id)) {
+      throw new Error(
+        `resolved pack cache content mismatch for ${benchmarkName}: unexpected resolved question ${id}`,
+      );
+    }
+  }
+  for (const id of entriesById.keys()) {
+    if (!originalById.has(id)) {
+      throw new Error(
+        `resolved pack cache content mismatch for ${benchmarkName}: unexpected summary entry ${id}`,
+      );
+    }
+  }
+  if (persisted.entries.length === 0) return original;
+  if (!answeredAt) {
+    throw new Error(`resolved pack cache content mismatch for ${benchmarkName}: missing timestamp`);
+  }
+  updatePackBindings(expectedFiles, persisted.entries.length);
+  return zipSync(expectedFiles, { level: 6, mtime: new Date(answeredAt) });
 }
 
 async function askRequirementsAgent(
@@ -109,12 +283,18 @@ function selectedOption(question: RawQuestion): string[] {
   return option ? [option.id] : [];
 }
 
-function applyAnswer(question: RawQuestion, answer: string, by: string, at: string): RawQuestion {
+function applyAnswer(
+  question: RawQuestion,
+  answer: string,
+  selected: string[],
+  by: string,
+  at: string,
+): RawQuestion {
   return {
     ...question,
     status: 'answered',
     answer: {
-      selected: selectedOption(question),
+      selected,
       ...(question.type === 'data_request' ? { value: answer } : { freeText: answer }),
       by,
       at,
@@ -164,16 +344,27 @@ export async function resolveBenchmarkQuestions(input: {
   answerAllowed?: (candidate: ResolvedAnswerCandidate) => boolean;
   agent?: Pick<AgentRunner, 'answerUpstreamQuestion'>;
 }): Promise<ResolvedBenchmarkPack> {
+  const original = new Uint8Array(await readFile(input.benchmark.zipPath));
+  const originalArtifactSha = digest(original);
+  if (input.benchmark.sha256 && input.benchmark.sha256 !== originalArtifactSha) {
+    throw new Error(
+      `benchmark input SHA mismatch for ${input.benchmark.name}: expected ${input.benchmark.sha256}, measured ${originalArtifactSha}`,
+    );
+  }
+  const originalFiles = unzipSync(original);
   await Promise.all([
     mkdir(input.sharedDirectory, { recursive: true }),
     mkdir(input.artifactDirectory, { recursive: true }),
   ]);
   const sharedPackPath = path.join(input.sharedDirectory, `${input.benchmark.name}.zip`);
   const sharedSummaryPath = path.join(input.sharedDirectory, `${input.benchmark.name}.questions.json`);
-  if (
-    (await stat(sharedPackPath).catch(() => null))?.isFile() &&
-    (await stat(sharedSummaryPath).catch(() => null))?.isFile()
-  ) {
+  const [sharedPackExists, sharedSummaryExists] = await Promise.all([
+    stat(sharedPackPath).then((entry) => entry.isFile()).catch(() => false),
+    stat(sharedSummaryPath).then((entry) => entry.isFile()).catch(() => false),
+  ]);
+  if (sharedPackExists !== sharedSummaryExists) {
+    await Promise.all([rm(sharedPackPath, { force: true }), rm(sharedSummaryPath, { force: true })]);
+  } else if (sharedPackExists && sharedSummaryExists) {
     const persisted = JSON.parse(await readFile(sharedSummaryPath, 'utf8')) as BenchmarkQuestionResolution;
     if (persisted.derivationVersion === 2) {
       if (
@@ -190,6 +381,31 @@ export async function resolveBenchmarkQuestions(input: {
         )
       ) {
         throw new Error(`persisted resolved pack contains a disallowed answer: ${input.benchmark.name}`);
+      }
+      const cachedBytes = await readFile(sharedPackPath);
+      if (digest(cachedBytes) !== persisted.resolvedArtifactSha) {
+        throw new Error(
+          `resolved pack cache integrity mismatch for ${input.benchmark.name}: resolved artifact SHA`,
+        );
+      }
+      if (persisted.originalArtifactSha !== originalArtifactSha) {
+        throw new Error(
+          `resolved pack cache integrity mismatch for ${input.benchmark.name}: original artifact SHA`,
+        );
+      }
+      const reconstructedBytes = reconstructExpectedResolvedPack(
+        original,
+        originalFiles,
+        unzipSync(cachedBytes),
+        persisted,
+        input.benchmark.name,
+      );
+      if (
+        digest(reconstructedBytes) !== persisted.resolvedArtifactSha ||
+        reconstructedBytes.length !== cachedBytes.length ||
+        !reconstructedBytes.every((byte, index) => byte === cachedBytes[index])
+      ) {
+        throw new Error(`resolved pack cache reconstruction mismatch for ${input.benchmark.name}`);
       }
       const summary = {
         ...persisted,
@@ -220,8 +436,7 @@ export async function resolveBenchmarkQuestions(input: {
     await Promise.all([rm(sharedPackPath, { force: true }), rm(sharedSummaryPath, { force: true })]);
   }
 
-  const original = new Uint8Array(await readFile(input.benchmark.zipPath));
-  const files = unzipSync(original);
+  const files = originalFiles;
   const openQuestions = questionFiles(files);
   const entries: QuestionResolutionEntry[] = [];
   let advisorAnswers = 0;
@@ -234,6 +449,7 @@ export async function resolveBenchmarkQuestions(input: {
     let answer: string | undefined;
     let evidence: string[] | undefined;
     let resolution: QuestionResolutionEntry['resolution'] | undefined;
+    let selectedOptionId: string | undefined;
     if (advisor.resolution === 'answered' && typeof advisor.answer === 'string') {
       const advisorAnswer = advisor.answer.trim();
       const citations = Array.isArray(advisor.citations)
@@ -252,6 +468,7 @@ export async function resolveBenchmarkQuestions(input: {
         answer = candidate.answer;
         evidence = candidate.evidence;
         resolution = candidate.resolution;
+        selectedOptionId = selectedOption(question)[0];
         advisorAnswers += 1;
       }
     }
@@ -271,9 +488,18 @@ export async function resolveBenchmarkQuestions(input: {
       if (source.resolution !== 'answered') {
         throw new Error(`blocking question ${question.id} remains unresolved: ${source.reason}`);
       }
+      if (
+        source.selectedOptionId !== undefined &&
+        !question.options.some((option) => option.id === source.selectedOptionId)
+      ) {
+        throw new Error(
+          `blocking question ${question.id} selected unknown option ${source.selectedOptionId}`,
+        );
+      }
       answer = source.answer.trim();
       evidence = source.evidence;
       resolution = 'source_fallback';
+      selectedOptionId = source.selectedOptionId ?? selectedOption(question)[0];
       if (input.answerAllowed && !input.answerAllowed({ answer, evidence, resolution })) {
         throw new Error(`blocking question ${question.id} produced a disallowed source answer`);
       }
@@ -283,19 +509,37 @@ export async function resolveBenchmarkQuestions(input: {
       throw new Error(`blocking question ${question.id} did not produce a complete answer`);
     }
     files[fileName] = strToU8(
-      stringify(applyAnswer(question, answer, `planner-eval-harness/${resolution}`, answeredAt)),
+      stringify(
+        applyAnswer(
+          question,
+          answer,
+          selectedOptionId ? [selectedOptionId] : [],
+          `planner-eval-harness/${resolution}`,
+          answeredAt,
+        ),
+      ),
     );
-    entries.push({ id: question.id, question: question.question, resolution, answer, evidence });
+    entries.push({
+      id: question.id,
+      question: question.question,
+      resolution,
+      answer,
+      ...(selectedOptionId ? { selectedOptionId } : {}),
+      evidence,
+    });
   }
 
   updatePackBindings(files, entries.length);
-  const resolvedBytes = openQuestions.length === 0 ? original : zipSync(files, { level: 6 });
+  const resolvedBytes =
+    openQuestions.length === 0
+      ? original
+      : zipSync(files, { level: 6, mtime: new Date(answeredAt) });
   const resolvedArtifactSha = digest(resolvedBytes);
   await writeFile(sharedPackPath, resolvedBytes, { flag: 'wx', mode: 0o600 });
   const summary: BenchmarkQuestionResolution = {
     derivationVersion: 2,
     benchmark: input.benchmark.name,
-    originalArtifactSha: input.benchmark.sha256 ?? digest(original),
+    originalArtifactSha,
     resolvedArtifactSha,
     blockingQuestions: openQuestions.length,
     requirementsAgentRequests: openQuestions.length,

@@ -21,6 +21,29 @@ function section(label) {
 }
 
 export function newCampaignPage(context) {
+  const targetWorkflowField = field(
+    'Target-excluded guard workflow (optional)',
+    'targetImplementationWorkflow',
+    {
+      pattern: '[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)+',
+      placeholder: 'client/workflow',
+      autocomplete: 'off',
+      'aria-describedby': 'campaign-target-excluded-help',
+    },
+    'wide',
+  );
+  targetWorkflowField.append(element('small', {
+    className: 'field-help',
+    text: 'When set, protocol V2 uses 2 standard primary control replicates and 2 target-excluded guard replicates at concurrency 2.',
+    attributes: { id: 'campaign-target-excluded-help' },
+  }));
+  const replicatesField = field('Replicates per benchmark', 'replicates', {
+    required: true,
+    type: 'number',
+    min: 1,
+    max: 10,
+    value: 3,
+  });
   const form = element('form', { className: 'campaign-form', attributes: { id: 'campaign-form' } }, [
     section('Identity'),
     field('Campaign ID', 'id', {
@@ -46,8 +69,10 @@ export function newCampaignPage(context) {
     field('Primary requirements ZIP', 'primaryFile', { required: true, type: 'file', accept: '.zip,application/zip' }),
     field('Holdout benchmark name', 'holdoutName', { required: true, value: 'unrelated-holdout' }),
     field('Holdout requirements ZIP', 'holdoutFile', { required: true, type: 'file', accept: '.zip,application/zip' }),
+    section('Target-excluded guard'),
+    targetWorkflowField,
     section('Execution limits'),
-    field('Replicates per benchmark', 'replicates', { required: true, type: 'number', min: 1, max: 10, value: 3 }),
+    replicatesField,
     field('Concurrent replicates', 'replicateConcurrency', { required: true, type: 'number', min: 1, max: 3, value: 2 }),
     field('Parallel variants', 'concurrency', { required: true, type: 'number', min: 1, max: 3, value: 3 }),
     field('Maximum variants', 'maxVariants', { required: true, type: 'number', min: 1, max: 50, value: 9 }),
@@ -56,6 +81,17 @@ export function newCampaignPage(context) {
       text('Allow unattended OpenCode tools'),
     ]),
   ]);
+  const targetWorkflowInput = form.elements.namedItem('targetImplementationWorkflow');
+  const replicatesInput = form.elements.namedItem('replicates');
+  let standardReplicates = replicatesInput.value;
+  let targetEnabled = false;
+  targetWorkflowInput.addEventListener('input', () => {
+    const enabled = Boolean(targetWorkflowInput.value.trim());
+    if (enabled && !targetEnabled) standardReplicates = replicatesInput.value;
+    replicatesInput.readOnly = enabled;
+    replicatesInput.value = enabled ? '2' : standardReplicates;
+    targetEnabled = enabled;
+  });
   const submit = element('button', {
     className: 'button button-primary',
     text: 'Create frozen campaign',
@@ -81,6 +117,9 @@ export function newCampaignPage(context) {
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     const values = new FormData(form);
+    const targetImplementationWorkflow = String(
+      values.get('targetImplementationWorkflow') ?? '',
+    ).trim();
     const primaryFile = values.get('primaryFile');
     const holdoutFile = values.get('holdoutFile');
     if (!(primaryFile instanceof File) || !(holdoutFile instanceof File)) {
@@ -105,13 +144,21 @@ export function newCampaignPage(context) {
           environmentFile: values.get('environmentFile'),
           seedRevision: values.get('seedRevision'),
           workflowsRevision: values.get('workflowsRevision'),
+          ...(targetImplementationWorkflow
+            ? {
+                targetExcluded: {
+                  protocol: 'standard-primary-v2',
+                  targetImplementationWorkflow,
+                },
+              }
+            : {}),
           benchmarks: [
             { name: values.get('primaryName'), role: 'primary', zipPath: primaryUpload.path, sha256: primaryUpload.sha256 },
             { name: values.get('holdoutName'), role: 'holdout', zipPath: holdoutUpload.path, sha256: holdoutUpload.sha256 },
           ],
           mode: values.get('mode'),
           evaluation: {
-            replicates: Number(values.get('replicates')),
+            replicates: targetImplementationWorkflow ? 2 : Number(values.get('replicates')),
             replicateConcurrency: Number(values.get('replicateConcurrency')),
           },
           limits: {
