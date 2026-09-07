@@ -237,19 +237,22 @@ export function summarizeTargetExcludedComparisonReport(
   }
   const validity = record(report.validity, '$.validity');
   const valid = booleanValue(validity.valid, '$.validity.valid');
-  const arms = record(validity.arms, '$.validity.arms');
-  const normal = record(arms.normal, '$.validity.arms.normal');
-  const excluded = record(arms.excluded, '$.validity.arms.excluded');
+  const reportArms = record(report.arms, '$.arms');
+  const normalReport = record(reportArms.normal, '$.arms.normal');
+  const excludedReport = record(reportArms.excluded, '$.arms.excluded');
+  const validityArms = record(validity.arms, '$.validity.arms');
+  const normal = record(validityArms.normal, '$.validity.arms.normal');
+  const excluded = record(validityArms.excluded, '$.validity.arms.excluded');
   const pair = record(validity.pair, '$.validity.pair');
-  const normalAnalysis = record(normal.analysis, '$.validity.arms.normal.analysis');
-  const excludedAnalysis = record(excluded.analysis, '$.validity.arms.excluded.analysis');
+  const normalAnalysis = record(normalReport.analysis, '$.arms.normal.analysis');
+  const excludedAnalysis = record(excludedReport.analysis, '$.arms.excluded.analysis');
   const normalRunId = nonEmptyString(
     normalAnalysis.runId,
-    '$.validity.arms.normal.analysis.runId',
+    '$.arms.normal.analysis.runId',
   );
   const excludedRunId = nonEmptyString(
     excludedAnalysis.runId,
-    '$.validity.arms.excluded.analysis.runId',
+    '$.arms.excluded.analysis.runId',
   );
   if (normalRunId === excludedRunId) {
     throw new Error('comparison report run IDs must be different');

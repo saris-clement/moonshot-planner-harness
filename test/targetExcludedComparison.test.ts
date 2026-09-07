@@ -15,13 +15,11 @@ const digest = `planner-eval@sha256:${'a'.repeat(64)}`;
 const generatedAt = '2026-09-06T12:00:00.000Z';
 
 function comparisonArm(
-  arm: 'normal' | 'excluded',
   overrides: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
     valid: true,
     errors: [],
-    analysis: { runId: `${arm}-run-1` },
     ...overrides,
   };
 }
@@ -34,11 +32,15 @@ function report(overrides: Record<string, unknown> = {}): Record<string, unknown
       normalCaseId: 'normal-case-1',
       excludedCaseId: 'excluded-case-1',
     },
+    arms: {
+      normal: { analysis: { runId: 'normal-run-1' } },
+      excluded: { analysis: { runId: 'excluded-run-1' } },
+    },
     validity: {
       valid: true,
       arms: {
-        normal: comparisonArm('normal'),
-        excluded: comparisonArm('excluded'),
+        normal: comparisonArm(),
+        excluded: comparisonArm(),
       },
       pair: { valid: true, mismatches: [] },
     },
@@ -159,11 +161,11 @@ test('summarizeTargetExcludedComparisonReport describes arm and pair mismatches'
     validity: {
       valid: false,
       arms: {
-        normal: comparisonArm('normal', {
+        normal: comparisonArm({
           valid: false,
           errors: [{ code: 'CURRENT_ANALYSIS_INCOMPLETE', path: '$.analysis' }],
         }),
-        excluded: comparisonArm('excluded', {
+        excluded: comparisonArm({
           valid: false,
           errors: [{ code: 'CASE_ID_MISMATCH', path: '$.case.id' }],
         }),
@@ -208,24 +210,24 @@ test('summarizeTargetExcludedComparisonReport requires component validity boolea
     {
       valid: true,
       arms: {
-        normal: comparisonArm('normal', { valid: undefined }),
-        excluded: comparisonArm('excluded'),
+        normal: comparisonArm({ valid: undefined }),
+        excluded: comparisonArm(),
       },
       pair: { valid: true, mismatches: [] },
     },
     {
       valid: true,
       arms: {
-        normal: comparisonArm('normal'),
-        excluded: comparisonArm('excluded', { valid: 'yes' }),
+        normal: comparisonArm(),
+        excluded: comparisonArm({ valid: 'yes' }),
       },
       pair: { valid: true, mismatches: [] },
     },
     {
       valid: true,
       arms: {
-        normal: comparisonArm('normal'),
-        excluded: comparisonArm('excluded'),
+        normal: comparisonArm(),
+        excluded: comparisonArm(),
       },
       pair: { mismatches: [] },
     },
@@ -244,64 +246,64 @@ test('summarizeTargetExcludedComparisonReport rejects contradictory validity', (
     {
       valid: false,
       arms: {
-        normal: comparisonArm('normal', { errors: [error] }),
-        excluded: comparisonArm('excluded'),
+        normal: comparisonArm({ errors: [error] }),
+        excluded: comparisonArm(),
       },
       pair: { valid: true, mismatches: [] },
     },
     {
       valid: false,
       arms: {
-        normal: comparisonArm('normal', { valid: false }),
-        excluded: comparisonArm('excluded'),
+        normal: comparisonArm({ valid: false }),
+        excluded: comparisonArm(),
       },
       pair: { valid: true, mismatches: [] },
     },
     {
       valid: false,
       arms: {
-        normal: comparisonArm('normal'),
-        excluded: comparisonArm('excluded', { errors: [error] }),
+        normal: comparisonArm(),
+        excluded: comparisonArm({ errors: [error] }),
       },
       pair: { valid: true, mismatches: [] },
     },
     {
       valid: false,
       arms: {
-        normal: comparisonArm('normal'),
-        excluded: comparisonArm('excluded', { valid: false }),
+        normal: comparisonArm(),
+        excluded: comparisonArm({ valid: false }),
       },
       pair: { valid: true, mismatches: [] },
     },
     {
       valid: false,
       arms: {
-        normal: comparisonArm('normal'),
-        excluded: comparisonArm('excluded'),
+        normal: comparisonArm(),
+        excluded: comparisonArm(),
       },
       pair: { valid: true, mismatches: [mismatch] },
     },
     {
       valid: false,
       arms: {
-        normal: comparisonArm('normal'),
-        excluded: comparisonArm('excluded'),
+        normal: comparisonArm(),
+        excluded: comparisonArm(),
       },
       pair: { valid: false, mismatches: [] },
     },
     {
       valid: true,
       arms: {
-        normal: comparisonArm('normal', { valid: false, errors: [error] }),
-        excluded: comparisonArm('excluded'),
+        normal: comparisonArm({ valid: false, errors: [error] }),
+        excluded: comparisonArm(),
       },
       pair: { valid: true, mismatches: [] },
     },
     {
       valid: false,
       arms: {
-        normal: comparisonArm('normal'),
-        excluded: comparisonArm('excluded'),
+        normal: comparisonArm(),
+        excluded: comparisonArm(),
       },
       pair: { valid: true, mismatches: [] },
     },
@@ -376,35 +378,29 @@ test('summarizeTargetExcludedComparisonReport rejects a same-case pair', () => {
 test('summarizeTargetExcludedComparisonReport requires non-empty arm run IDs', () => {
   for (const arms of [
     {
-      normal: comparisonArm('normal', { analysis: {} }),
-      excluded: comparisonArm('excluded'),
+      normal: { analysis: {} },
+      excluded: { analysis: { runId: 'excluded-run-1' } },
     },
     {
-      normal: comparisonArm('normal', { analysis: { runId: 42 } }),
-      excluded: comparisonArm('excluded'),
+      normal: { analysis: { runId: 42 } },
+      excluded: { analysis: { runId: 'excluded-run-1' } },
     },
     {
-      normal: comparisonArm('normal'),
-      excluded: comparisonArm('excluded', { analysis: {} }),
+      normal: { analysis: { runId: 'normal-run-1' } },
+      excluded: { analysis: {} },
     },
     {
-      normal: comparisonArm('normal'),
-      excluded: comparisonArm('excluded', { analysis: { runId: '' } }),
+      normal: { analysis: { runId: 'normal-run-1' } },
+      excluded: { analysis: { runId: '' } },
     },
   ]) {
     assert.throws(
       () =>
         summarizeTargetExcludedComparisonReport(
           1,
-          report({
-            validity: {
-              valid: true,
-              arms,
-              pair: { valid: true, mismatches: [] },
-            },
-          }),
+          report({ arms }),
         ),
-      /comparison report \$\.validity\.arms\.(normal|excluded)\.analysis\.runId must be a non-empty string/,
+      /comparison report \$\.arms\.(normal|excluded)\.analysis\.runId must be a non-empty string/,
     );
   }
 });
@@ -415,13 +411,9 @@ test('summarizeTargetExcludedComparisonReport rejects a same-run pair', () => {
       summarizeTargetExcludedComparisonReport(
         1,
         report({
-          validity: {
-            valid: true,
-            arms: {
-              normal: comparisonArm('normal', { analysis: { runId: 'same-run' } }),
-              excluded: comparisonArm('excluded', { analysis: { runId: 'same-run' } }),
-            },
-            pair: { valid: true, mismatches: [] },
+          arms: {
+            normal: { analysis: { runId: 'same-run' } },
+            excluded: { analysis: { runId: 'same-run' } },
           },
         }),
       ),
@@ -442,8 +434,7 @@ test('summarizeTargetExcludedComparisonReport rejects content tampered after has
 
 test('summarizeTargetExcludedComparisonReport rejects a run ID tampered after hashing', () => {
   const value = report();
-  const validity = value.validity as Record<string, unknown>;
-  const arms = validity.arms as Record<string, unknown>;
+  const arms = value.arms as Record<string, unknown>;
   const normal = arms.normal as Record<string, unknown>;
   const analysis = normal.analysis as Record<string, unknown>;
   analysis.runId = 'tampered-normal-run';

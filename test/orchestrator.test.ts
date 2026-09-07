@@ -146,11 +146,15 @@ function validComparisonReport(
     kind: 'ainative-planner/evidence-visibility-comparison',
     schemaVersion: 1,
     inputs: { normalCaseId, excludedCaseId },
+    arms: {
+      normal: { analysis: { runId: normalRunId } },
+      excluded: { analysis: { runId: excludedRunId } },
+    },
     validity: {
       valid: true,
       arms: {
-        normal: { valid: true, errors: [], analysis: { runId: normalRunId } },
-        excluded: { valid: true, errors: [], analysis: { runId: excludedRunId } },
+        normal: { valid: true, errors: [] },
+        excluded: { valid: true, errors: [] },
       },
       pair: { valid: true, mismatches: [] },
     },
