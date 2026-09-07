@@ -12,6 +12,7 @@ import {
   type DiagnosisOutput,
   type Hypothesis,
   type HypothesisComplianceOutput,
+  type HypothesisComplianceOutputV2,
   type JudgeOutput,
   type RunFacts,
   type VariantRecord,
@@ -20,6 +21,7 @@ import { runCommand } from './process.js';
 import { sha256File } from './config.js';
 import { diagnosisResultPath, validateDiagnosisFindingReferences } from './diagnosis.js';
 import {
+  hypothesisComplianceAttemptDirectory,
   hypothesisComplianceResultPath,
   mutationContextRequiresFalsification,
   verifyHypothesisComplianceResult,
@@ -177,27 +179,47 @@ export class AgentRunner {
     historyPath: string,
     count: number,
     requireFindingIds = true,
+    allowedFindingIds: readonly string[] | null = null,
   ): Promise<Hypothesis[]> {
     const prompt = `You are the strategist for a generic requirements-to-builder planner evaluation.
 
-Read the attached campaign history. Propose exactly ${count} independent, bounded hypotheses for the next round. Each hypothesis must address an observed, source-backed failure mechanism rather than optimize decision counts. ${requireFindingIds ? "Every hypothesis must cite one or more real finding IDs from the current parent variant's completed model-generated diagnosis in findingIds. Diagnosis is unverified interpretation: preserve supporting evidence, counterevidence, limitations, and falsification rather than treating it as truth. Do not invent IDs." : 'The campaign explicitly opted out of requiring a current-parent diagnosis. Return an empty findingIds array and rely only on the separately identified measured facts, labels, and limitations in history.'} Instructions must implement every material clause of each selected generic intervention rather than a convenient subset. Distinguish code-level regression boundaries from campaign-level falsification that requires repeated planner evaluation; the latter is executed by the coordinator, not encoded wholesale in the candidate patch. Configured research is historical context only: it may inform hypotheses but is not current-run evidence and cannot support claims about a variant. Record the assumptions that must be true for the proposed intervention to work. Assumptions are model-generated and must remain visibly unverified. Do not add customer names, workflow names, fixed source paths, capability IDs, aliases, or pack-specific rules to production code. Prefer one causal mechanism per hypothesis so the experiment remains attributable.
+Read the attached campaign history. Propose exactly ${count} independent, bounded hypotheses for the next round. Each hypothesis must address an observed, source-backed failure mechanism rather than optimize decision counts. ${requireFindingIds ? `Every hypothesis must cite one or more real finding IDs from the current parent variant's completed model-generated diagnosis in findingIds. Use only this exact current-parent allowlist: ${JSON.stringify(allowedFindingIds ?? [])}. Diagnosis is unverified interpretation: preserve supporting evidence, counterevidence, limitations, and falsification rather than treating it as truth. Do not cite findings from sibling, rejected, or historical variants.` : 'The campaign explicitly opted out of requiring a current-parent diagnosis. Return an empty findingIds array and rely only on the separately identified measured facts, labels, and limitations in history.'} Instructions must implement every material clause of each selected generic intervention rather than a convenient subset. Distinguish code-level regression boundaries from campaign-level falsification that requires repeated planner evaluation; the latter is executed by the coordinator, not encoded wholesale in the candidate patch. Configured research is historical context only: it may inform hypotheses but is not current-run evidence and cannot support claims about a variant. Record the assumptions that must be true for the proposed intervention to work. Assumptions are model-generated and must remain visibly unverified. Do not add customer names, workflow names, fixed source paths, capability IDs, aliases, or pack-specific rules to production code. Prefer one causal mechanism per hypothesis so the experiment remains attributable.
 
 Return JSON only:
 {"hypotheses":[{"title":"...","rationale":"...","instructions":"...","expectedImpact":"...","risk":"...","findingIds":["finding-..."],"assumptions":["..."]}]}`;
-    const result = await this.commandRunner(
-      this.campaign.config.agent.command,
-      this.argumentsFor(prompt, `${this.campaign.id} strategist`, [historyPath], contextDirectory),
-      {
-        cwd: contextDirectory,
-        timeoutMs: 900_000,
-        logPath: path.join(contextDirectory, 'strategist.jsonl'),
-      },
-    );
-    const output = parseJsonResponse(result.stdout, StrategyOutputSchema);
-    if (output.hypotheses.length !== count) {
-      throw new Error(`strategist returned ${output.hypotheses.length} hypotheses; expected ${count}`);
+    const run = async (value: string, repair = false) =>
+      await this.commandRunner(
+        this.campaign.config.agent.command,
+        this.argumentsFor(
+          value,
+          `${this.campaign.id} strategist${repair ? ' repair' : ''}`,
+          [historyPath],
+          contextDirectory,
+        ),
+        {
+          cwd: contextDirectory,
+          timeoutMs: 900_000,
+          logPath: path.join(contextDirectory, repair ? 'strategist-repair.jsonl' : 'strategist.jsonl'),
+        },
+      );
+    const valid = (hypotheses: readonly Hypothesis[]): boolean =>
+      hypotheses.length === count &&
+      hypotheses.every((hypothesis) =>
+        requireFindingIds
+          ? hypothesis.findingIds.length > 0 &&
+            new Set(hypothesis.findingIds).size === hypothesis.findingIds.length &&
+            (allowedFindingIds === null ||
+              hypothesis.findingIds.every((id) => allowedFindingIds.includes(id)))
+          : hypothesis.findingIds.length === 0,
+      );
+    const initial = parseJsonResponse((await run(prompt)).stdout, StrategyOutputSchema);
+    if (valid(initial.hypotheses)) return initial.hypotheses;
+    const repairPrompt = `${prompt}\n\nYour previous hypotheses cited stale or unknown finding IDs or returned the wrong count. Return exactly ${count} corrected hypotheses using only the current-parent finding allowlist ${JSON.stringify(allowedFindingIds ?? [])}. Do not cite sibling or historical findings.`;
+    const repaired = parseJsonResponse((await run(repairPrompt, true)).stdout, StrategyOutputSchema);
+    if (!valid(repaired.hypotheses)) {
+      throw new Error('strategist repair did not return the exact current-parent hypothesis set');
     }
-    return output.hypotheses;
+    return repaired.hypotheses;
   }
 
   async mutate(
@@ -348,30 +370,89 @@ Return JSON only:
               ),
             },
           );
+        const parseBoundResult = (stdout: string): HypothesisComplianceOutputV2 => {
+          const output = parseJsonResponse(stdout, HypothesisComplianceOutputV2Schema);
+          if (
+            output.variantId !== variant.id ||
+            output.patchSha256 !== patchSha256 ||
+            output.mutationContextSha256 !== mutationContextSha256
+          ) {
+            throw new Error('hypothesis compliance reviewer returned a result for another mutation');
+          }
+          return output;
+        };
         const initial = await run(prompt);
         try {
-          return parseJsonResponse(initial.stdout, HypothesisComplianceOutputV2Schema);
+          return parseBoundResult(initial.stdout);
         } catch {
           const repaired = await run(
             `${prompt}\n\nYour previous response did not satisfy the required JSON contract. Return exactly one corrected JSON object with the bound variant and hashes. Do not narrate progress or tool use.`,
             '-repair',
           );
-          return parseJsonResponse(repaired.stdout, HypothesisComplianceOutputV2Schema);
+          return parseBoundResult(repaired.stdout);
         }
       },
     );
-    if (
-      result.variantId !== variant.id ||
-      result.patchSha256 !== patchSha256 ||
-      result.mutationContextSha256 !== mutationContextSha256
-    ) {
-      throw new Error('hypothesis compliance reviewer returned a result for another mutation');
-    }
     if (falsificationRequired && result.falsificationTest.status === 'not_applicable') {
       throw new Error('hypothesis compliance falsification check cannot be not_applicable');
     }
     await writeImmutableText(resultPath, `${JSON.stringify(result, null, 2)}\n`);
     return { result, resultPath };
+  }
+
+  async repairHypothesisCompliance(
+    variant: VariantRecord,
+    worktree: string,
+    artifactDirectory: string,
+    mutationContextPath: string,
+    treatmentPatchPath: string,
+    failedResultPath: string,
+    attempt: number,
+  ): Promise<void> {
+    const prompt = `Repair the existing mutation for the same hypothesis in this disposable worktree.
+
+Hypothesis:
+${JSON.stringify(variant.hypothesis, null, 2)}
+
+Read the attached original mutation context, prior treatment patch, and failed compliance result.
+
+Rules:
+- Address all failed compliance checks and their cited evidence. Do not replace, broaden, or silently narrow the hypothesis.
+- Preserve checks already marked satisfied and preserve cited counterevidence.
+- Implement every material intervention clause with a generic mechanism.
+- Add or correct executable regression coverage for locally testable mechanics. Leave campaign-level empirical falsification to the coordinator.
+- Do not add customer, workflow, requirement-text, source-path, alias, capability-ID, or fixed-distribution heuristics.
+- Change files only under these configured path prefixes: ${JSON.stringify(this.campaign.config.gates.allowedPathPrefixes)}.
+- Do not edit the harness, campaign data, experiment reports, or attached feedback.
+- Do not stage changes or alter the Git index. Do not commit, alter Git configuration, push, or start Docker.
+- Do not run host tests; the coordinator runs trusted tests in a networkless builder container.
+- Leave the repaired mutation unstaged in this same worktree.`;
+    const directory = hypothesisComplianceAttemptDirectory(artifactDirectory, attempt);
+    await writeImmutableText(path.join(directory, 'repair-prompt.txt'), `${prompt}\n`);
+    await withLocalAgentAttachments(
+      worktree,
+      [
+        { source: mutationContextPath, name: `.harness-repair-context-${variant.id}.json` },
+        { source: treatmentPatchPath, name: `.harness-prior-treatment-${variant.id}.patch` },
+        { source: failedResultPath, name: `.harness-compliance-feedback-${variant.id}.json` },
+      ],
+      async (attachments) =>
+        await this.commandRunner(
+          this.campaign.config.agent.command,
+          this.argumentsFor(
+            prompt,
+            `${variant.id} compliance repair ${attempt}`,
+            attachments,
+            worktree,
+            true,
+          ),
+          {
+            cwd: worktree,
+            timeoutMs: 1_800_000,
+            logPath: path.join(directory, 'repair.jsonl'),
+          },
+        ),
+    );
   }
 
   async diagnose(

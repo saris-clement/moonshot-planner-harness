@@ -95,6 +95,7 @@ export const CampaignConfigSchema = z
       .object({
         concurrency: z.number().int().min(1).max(3).default(3),
         maxVariants: z.number().int().min(1).max(50).default(9),
+        hypothesisComplianceRepairAttempts: z.number().int().min(0).max(1).default(1),
         noImprovementRounds: z.number().int().min(1).max(10).default(2),
         phase2TimeoutMs: z.number().int().min(60_000).default(43_200_000),
         stackReadyTimeoutMs: z.number().int().min(10_000).default(300_000),
@@ -105,6 +106,7 @@ export const CampaignConfigSchema = z
       .default({
         concurrency: 3,
         maxVariants: 9,
+        hypothesisComplianceRepairAttempts: 1,
         noImprovementRounds: 2,
         phase2TimeoutMs: 43_200_000,
         stackReadyTimeoutMs: 300_000,
@@ -362,10 +364,72 @@ export const HypothesisComplianceOutputSchema = z
 export type HypothesisComplianceOutput = z.infer<typeof HypothesisComplianceOutputSchema>;
 export type HypothesisComplianceOutputV2 = z.infer<typeof HypothesisComplianceOutputV2Schema>;
 
+export const HypothesisComplianceAttemptSchema = z
+  .object({
+    variantId: z.string().min(1).max(256),
+    attempt: z.number().int().min(1).max(2),
+    phase: z.enum(['initial', 'repair']),
+    outcome: z.enum(['passed', 'semantic_failed', 'no_op', 'operational_failed']),
+    treatmentPatchSha256: Sha256Schema.nullable(),
+    candidatePatchSha256: Sha256Schema.nullable(),
+    mutationContextSha256: Sha256Schema,
+    resultSha256: Sha256Schema.nullable(),
+    result: HypothesisComplianceOutputV2Schema.nullable(),
+    error: z.string().min(1).max(20_000).nullable(),
+    startedAt: z.string().datetime(),
+    completedAt: z.string().datetime(),
+  })
+  .strict()
+  .superRefine((attempt, context) => {
+    if ((attempt.attempt === 1) !== (attempt.phase === 'initial')) {
+      context.addIssue({
+        code: 'custom',
+        path: ['phase'],
+        message: 'attempt one must be initial and later attempts must be repairs',
+      });
+    }
+    const semantic = attempt.outcome === 'passed' || attempt.outcome === 'semantic_failed';
+    if (
+      semantic &&
+      (!attempt.result ||
+        !attempt.resultSha256 ||
+        !attempt.treatmentPatchSha256 ||
+        !attempt.candidatePatchSha256)
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['result'],
+        message: 'semantic attempts require patch hashes and a persisted V2 result',
+      });
+    }
+    if (
+      attempt.result &&
+      (attempt.result.variantId !== attempt.variantId ||
+        attempt.result.patchSha256 !== attempt.treatmentPatchSha256 ||
+        attempt.result.mutationContextSha256 !== attempt.mutationContextSha256 ||
+        (attempt.outcome === 'passed') !== (attempt.result.status === 'passed'))
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['result'],
+        message: 'attempt result must bind its variant, inputs, and outcome',
+      });
+    }
+    if (semantic ? attempt.error !== null : attempt.error === null) {
+      context.addIssue({
+        code: 'custom',
+        path: ['error'],
+        message: 'only non-semantic attempts require an error',
+      });
+    }
+  });
+export type HypothesisComplianceAttempt = z.infer<typeof HypothesisComplianceAttemptSchema>;
+
 export const HypothesisComplianceStatusSchema = z.enum([
   'not_required',
   'not_started',
   'running',
+  'needs_revision',
   'passed',
   'failed',
 ]);
@@ -1009,6 +1073,7 @@ export interface VariantRecord {
   hypothesisComplianceResultHash: string | null;
   hypothesisCompliance: HypothesisComplianceOutput | null;
   hypothesisComplianceError: string | null;
+  hypothesisComplianceAttempts: HypothesisComplianceAttempt[];
   artifactCollectionComplete: boolean;
   facts: RunFacts | null;
   replicateFacts: RunFacts[] | null;

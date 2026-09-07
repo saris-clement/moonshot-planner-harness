@@ -207,12 +207,22 @@ function renderConclusion(
 
 function renderHypothesisCompliance(variant: VariantRecord): string {
   const result = variant.hypothesisCompliance;
+  const attempts = variant.hypothesisComplianceAttempts;
+  const attemptHistory = attempts.length > 0
+    ? `### Attempt History
+
+| Attempt | Phase | Outcome | Treatment | Candidate | Result |
+| ---: | --- | --- | --- | --- | --- |
+${attempts.map((attempt) => `| ${attempt.attempt} | ${attempt.phase} | ${attempt.outcome} | ${attempt.treatmentPatchSha256 ?? 'unavailable'} | ${attempt.candidatePatchSha256 ?? 'unavailable'} | ${attempt.resultSha256 ?? 'unavailable'} |`).join('\n')}`
+    : '### Attempt History\n\nNo append-only attempt history exists for this legacy result.';
   if (!result) {
     return `This preflight is a model-generated semantic review and is never measured or human-verified truth.
 
 Status: \`${variant.hypothesisComplianceStatus}\`
 
-${variant.hypothesisComplianceError ? quote(variant.hypothesisComplianceError) : 'No compliance result is available.'}`;
+${variant.hypothesisComplianceError ? quote(variant.hypothesisComplianceError) : 'No compliance result is available.'}
+
+${attemptHistory}`;
   }
   const renderCheck = (
     name: string,
@@ -246,7 +256,9 @@ ${'codeRegression' in result ? renderCheck('Code Regression', result.codeRegress
 ${renderCheck('Falsification Test', result.falsificationTest)}
 
 Limitations:
-${result.limitations.map((item) => `- ${markdown(item)}`).join('\n')}`;
+${result.limitations.map((item) => `- ${markdown(item)}`).join('\n')}
+
+${attemptHistory}`;
 }
 
 function renderEvidenceLedger(
@@ -288,7 +300,23 @@ function renderEvidenceLedger(
       variant.diagnosisStatus,
     ]);
   }
-  if (variant.hypothesisCompliance && variant.hypothesisComplianceResultHash) {
+  if (variant.hypothesisComplianceAttempts.length > 0) {
+    for (const attempt of variant.hypothesisComplianceAttempts.filter(
+      ({ treatmentPatchSha256 }) => treatmentPatchSha256 !== null,
+    )) {
+      rows.push([
+        `Compliance attempt ${attempt.attempt} treatment`,
+        'observed_durable',
+        path.join(
+          root,
+          'hypothesis-compliance',
+          `attempt-${String(attempt.attempt).padStart(2, '0')}`,
+          'mutation.patch',
+        ),
+        attempt.treatmentPatchSha256 ?? attempt.outcome,
+      ]);
+    }
+  } else if (variant.hypothesisCompliance && variant.hypothesisComplianceResultHash) {
     rows.push([
       'Current treatment patch',
       'observed_durable',
@@ -775,6 +803,22 @@ export async function writeCampaignIndex(
         `| ${variant.ordinal} | ${variant.id} | ${variant.round} | ${markdown(variant.hypothesis.title)} | ${variant.status} | ${percentage(variant.score?.verified.accuracy ?? null)} | ${percentage(variant.score?.provisional.accuracy ?? null)} |`,
     )
     .join('\n');
+  const attempted = variants.filter(({ hypothesisComplianceAttempts }) =>
+    hypothesisComplianceAttempts.length > 0,
+  );
+  const firstPasses = attempted.filter(
+    ({ hypothesisComplianceAttempts }) =>
+      hypothesisComplianceAttempts[0]?.outcome === 'passed',
+  ).length;
+  const postRepairPasses = attempted.filter(
+    ({ hypothesisComplianceAttempts }) =>
+      hypothesisComplianceAttempts.some(({ outcome }) => outcome === 'passed'),
+  ).length;
+  const exhausted = attempted.filter(({ hypothesisComplianceAttempts, status }) => {
+    const outcome = hypothesisComplianceAttempts.at(-1)?.outcome;
+    return status === 'failed' && (outcome === 'semantic_failed' || outcome === 'no_op');
+  }).length;
+  const executed = variants.filter(({ round, facts }) => round > 0 && facts !== null).length;
   const output = `# ${campaign.id}
 
 ## Goal
@@ -790,9 +834,20 @@ ${campaign.config.goal.trim()}
 - Concurrency: ${campaign.config.limits.concurrency}
 - Replicate concurrency: ${campaign.config.evaluation.replicateConcurrency ?? 2}
 - Maximum generated variants: ${campaign.config.limits.maxVariants}
+- Compliance repairs per hypothesis: ${campaign.config.limits.hypothesisComplianceRepairAttempts}
 - Effective replicate protocol: ${targetConfig ? `${targetConfig.replicates} runs at concurrency ${targetConfig.concurrency}` : `${campaign.config.evaluation.replicates} runs`}
 - Target-excluded workflow: ${targetConfig ? `\`${targetConfig.targetImplementationWorkflow}\`` : 'not configured'}
 - Target-excluded baseline: ${targetConfig?.baselineVariantId ?? 'not configured'}
+
+## Compliance Throughput
+
+| Metric | Count |
+| --- | ---: |
+| Hypotheses with attempts | ${attempted.length} |
+| First-pass compliant | ${firstPasses} |
+| Compliant after bounded repair | ${postRepairPasses} |
+| Compliance-exhausted hypotheses | ${exhausted} |
+| Executed generated variants | ${executed} |
 
 ## Target-Excluded Evaluations
 
@@ -824,13 +879,31 @@ export async function writeAgentHistory(
   variants: readonly VariantRecord[],
   labels: readonly LabelRecord[],
   targetEvaluations: readonly TargetExcludedEvaluationRecord[] = [],
+  allowedCurrentParentFindingIds?: readonly string[],
 ): Promise<void> {
   const [historicalExperiments, researchContext] = await Promise.all([
     readHistoricalExperiments(experimentsRoot),
     readFrozenResearchContext(campaign.config.researchPaths, campaign.config.researchSha256),
   ]);
+  const currentParent = variants.find(({ id }) => id === campaign.currentParentVariantId) ?? null;
+  const allowedFindingIds = new Set(
+    allowedCurrentParentFindingIds ??
+      (currentParent?.diagnosisStatus === 'completed'
+        ? currentParent.diagnosis?.findings.map(({ id }) => id) ?? []
+        : []),
+  );
+  const currentParentFindings =
+    currentParent?.diagnosisStatus === 'completed'
+      ? currentParent.diagnosis?.findings.filter(({ id }) => allowedFindingIds.has(id)) ?? []
+      : [];
   const history = {
     goal: campaign.config.goal,
+    currentParent: currentParent
+      ? {
+          id: currentParent.id,
+          allowedFindingIds: currentParentFindings.map(({ id }) => id),
+        }
+      : null,
     genericityConstraints: [
       'No customer or workflow constants in production code.',
       'Prefer a single causal mechanism per experiment.',
@@ -857,7 +930,10 @@ export async function writeAgentHistory(
       id: variant.id,
       parent: variant.parentVariantId,
       round: variant.round,
-      hypothesis: variant.hypothesis,
+      hypothesis:
+        variant.id === currentParent?.id
+          ? variant.hypothesis
+          : { ...variant.hypothesis, findingSnapshots: [] },
       status: variant.status,
       patchSha256: variant.patchHash,
       decisions: variant.facts?.decisions,
@@ -870,9 +946,9 @@ export async function writeAgentHistory(
         status: variant.diagnosisStatus,
         inputSha256: variant.diagnosisInputHash,
         interpretationStatus: variant.diagnosis?.interpretationStatus ?? null,
-        summary: variant.diagnosis?.summary ?? null,
+        summary: variant.id === currentParent?.id ? variant.diagnosis?.summary ?? null : null,
         findings:
-          variant.diagnosis?.findings.map(
+          (variant.id === currentParent?.id ? currentParentFindings : []).map(
             ({
               id,
               category,
@@ -916,6 +992,7 @@ export async function writeAgentHistory(
         falsificationTest: variant.hypothesisCompliance?.falsificationTest ?? null,
         limitations: variant.hypothesisCompliance?.limitations ?? [],
         error: variant.hypothesisComplianceError,
+        attempts: variant.hypothesisComplianceAttempts,
       },
       holdouts: Object.fromEntries(
         Object.entries(variant.holdoutFacts ?? {}).map(([name, facts]) => [

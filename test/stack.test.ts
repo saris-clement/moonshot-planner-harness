@@ -13,6 +13,7 @@ import {
 } from '../src/stack.js';
 import { CampaignConfigSchema, type CampaignRecord, type VariantRecord } from '../src/types.js';
 import type { HarnessPaths } from '../src/paths.js';
+import { archiveHypothesisComplianceAttemptInputs } from '../src/hypothesisCompliance.js';
 
 async function fixture(): Promise<{
   directory: string;
@@ -98,6 +99,7 @@ async function fixture(): Promise<{
     hypothesisComplianceResultHash: null,
     hypothesisCompliance: null,
     hypothesisComplianceError: null,
+    hypothesisComplianceAttempts: [],
     artifactCollectionComplete: false,
     facts: null,
     replicateFacts: null,
@@ -514,5 +516,48 @@ test('diff gate rejects embedded repositories whose dirty bytes are not patch-bo
     );
   } finally {
     await rm(value.directory, { recursive: true, force: true });
+  }
+});
+
+test('compliance attempt inputs are immutable across later mutation captures', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'planner-eval-attempt-inputs-'));
+  const treatmentPath = path.join(root, 'mutation.patch');
+  const candidatePath = path.join(root, 'variant.patch');
+  const contextPath = path.join(root, 'mutation-context.json');
+  await Promise.all([
+    writeFile(treatmentPath, 'treatment one'),
+    writeFile(candidatePath, 'candidate one'),
+    writeFile(contextPath, '{"selectedFindings":[]}\n'),
+  ]);
+  try {
+    const first = await archiveHypothesisComplianceAttemptInputs(
+      root,
+      1,
+      treatmentPath,
+      candidatePath,
+      contextPath,
+    );
+    const repeated = await archiveHypothesisComplianceAttemptInputs(
+      root,
+      1,
+      treatmentPath,
+      candidatePath,
+      contextPath,
+    );
+    assert.deepEqual(repeated, first);
+    await writeFile(treatmentPath, 'treatment two');
+    await assert.rejects(
+      archiveHypothesisComplianceAttemptInputs(
+        root,
+        1,
+        treatmentPath,
+        candidatePath,
+        contextPath,
+      ),
+      /immutable compliance attempt input changed/,
+    );
+    assert.equal(await readFile(first.treatmentPatchPath, 'utf8'), 'treatment one');
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

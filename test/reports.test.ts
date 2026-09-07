@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { HarnessDatabase } from '../src/db.js';
 import type { HarnessPaths } from '../src/paths.js';
-import { writeAgentHistory, writeVariantReport } from '../src/reports.js';
+import { writeAgentHistory, writeCampaignIndex, writeVariantReport } from '../src/reports.js';
 import {
   CampaignConfigSchema,
   type RunFacts,
@@ -111,7 +111,7 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
         },
       ],
     };
-    const variant = database.updateVariant(created.id, {
+    let variant = database.updateVariant(created.id, {
       status: 'review',
       artifactCollectionComplete: true,
       facts: runFacts,
@@ -182,6 +182,48 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
       },
       hypothesisComplianceError: null,
     });
+    const passedCompliance = variant.hypothesisCompliance;
+    if (!passedCompliance || passedCompliance.schemaVersion !== 2) {
+      throw new Error('fixture requires compliance V2');
+    }
+    const failedCompliance = {
+      ...passedCompliance,
+      status: 'failed' as const,
+      patchSha256: `sha256:${'5'.repeat(64)}`,
+      intervention: {
+        ...variant.hypothesisCompliance!.intervention,
+        status: 'not_satisfied' as const,
+      },
+    };
+    database.appendHypothesisComplianceAttempt(variant.id, {
+      variantId: variant.id,
+      attempt: 1,
+      phase: 'initial',
+      outcome: 'semantic_failed',
+      treatmentPatchSha256: failedCompliance.patchSha256,
+      candidatePatchSha256: `sha256:${'6'.repeat(64)}`,
+      mutationContextSha256: failedCompliance.mutationContextSha256,
+      resultSha256: `sha256:${'7'.repeat(64)}`,
+      result: failedCompliance,
+      error: null,
+      startedAt: '2026-09-07T10:00:00.000Z',
+      completedAt: '2026-09-07T10:01:00.000Z',
+    });
+    database.appendHypothesisComplianceAttempt(variant.id, {
+      variantId: variant.id,
+      attempt: 2,
+      phase: 'repair',
+      outcome: 'passed',
+      treatmentPatchSha256: variant.hypothesisCompliancePatchHash,
+      candidatePatchSha256: variant.hypothesisComplianceCandidatePatchHash,
+      mutationContextSha256: passedCompliance.mutationContextSha256,
+      resultSha256: variant.hypothesisComplianceResultHash,
+      result: passedCompliance,
+      error: null,
+      startedAt: '2026-09-07T10:02:00.000Z',
+      completedAt: '2026-09-07T10:03:00.000Z',
+    });
+    variant = database.getVariant(variant.id);
     const label = database.upsertLabel({
       campaignId: campaign.id,
       benchmark: 'primary-pack',
@@ -200,6 +242,9 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
     assert.match(report, /unverified model judgment/i);
     assert.match(report, /Runtime code changes the cited mechanism/);
     assert.match(report, /### Code Regression/);
+    assert.match(report, /### Attempt History/);
+    assert.match(report, /\| 1 \| initial \| semantic_failed \|/);
+    assert.match(report, /\| 2 \| repair \| passed \|/);
     assert.match(report, /Cumulative candidate patch hash: `sha256:4444/);
     assert.match(report, /does not contribute to numeric scoring/);
     assert.match(report, /The baseline plan below is harness-authored/);
@@ -259,6 +304,7 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
     );
     const campaignWithResearch = {
       ...campaign,
+      currentParentVariantId: variant.id,
       config: {
         ...campaign.config,
         researchPaths: [frozenResearchPath],
@@ -267,10 +313,44 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
         ],
       },
     };
-    await writeAgentHistory(historyPath, paths.reports, campaignWithResearch, [variant], [label]);
+    const sibling = {
+      ...variant,
+      id: 'report-diagnosis-v999',
+      hypothesis: {
+        ...variant.hypothesis,
+        findingSnapshots: [
+          {
+            ...variant.diagnosis!.findings[0]!,
+            id: 'finding-sibling-snapshot',
+          },
+        ],
+      },
+      diagnosis: {
+        ...variant.diagnosis!,
+        summary: 'Sibling semantic summary must stay hidden.',
+        findings: [
+          {
+            ...variant.diagnosis!.findings[0]!,
+            id: 'finding-sibling-secret',
+          },
+        ],
+      },
+    };
+    await writeAgentHistory(
+      historyPath,
+      paths.reports,
+      campaignWithResearch,
+      [variant, sibling],
+      [label],
+    );
     const history = JSON.parse(await readFile(historyPath, 'utf8')) as Record<string, unknown>;
     const serialized = JSON.stringify(history);
     assert.match(serialized, /"benchmark":"primary-pack"/);
+    assert.match(serialized, /"currentParent":\{"id":"report-diagnosis-v000"/);
+    assert.match(serialized, /"allowedFindingIds":\["finding-hydration"\]/);
+    assert.doesNotMatch(serialized, /finding-sibling-secret/);
+    assert.doesNotMatch(serialized, /finding-sibling-snapshot/);
+    assert.doesNotMatch(serialized, /Sibling semantic summary/);
     assert.match(serialized, /"interpretationStatus":"unverified_model_judgment"/);
     assert.match(serialized, /"unverified":true/);
     assert.match(serialized, /"holdouts":\{"holdout-pack"/);
@@ -280,6 +360,15 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
     assert.match(serialized, /"hypothesisCompliance":\{"status":"passed"/);
     assert.match(serialized, /"patchSha256":"sha256:1111/);
     assert.match(serialized, /"candidatePatchSha256":"sha256:4444/);
+    assert.match(serialized, /"attempts":\[\{"variantId":"report-diagnosis-v000"/);
+    const index = await readFile(
+      await writeCampaignIndex(paths, campaignWithResearch, [variant]),
+      'utf8',
+    );
+    assert.match(index, /## Compliance Throughput/);
+    assert.match(index, /\| First-pass compliant \| 0 \|/);
+    assert.match(index, /\| Compliant after bounded repair \| 1 \|/);
+    assert.match(index, /\| Executed generated variants \| 0 \|/);
     assert.match(serialized, /"name":"V13c experiment axes"/);
     assert.match(serialized, /"comparability":"historical_context_only"/);
     assert.match(serialized, /No results claimed/);
@@ -293,7 +382,7 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
     await rm(manifestPath);
     await symlink(outsideManifest, manifestPath);
     await assert.rejects(
-      writeAgentHistory(historyPath, paths.reports, campaignWithResearch, [variant], [label]),
+      writeAgentHistory(historyPath, paths.reports, campaignWithResearch, [variant, sibling], [label]),
       /historical research manifest must be a contained regular file/,
     );
 
@@ -302,7 +391,7 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
     await mkdir(outsideHistory);
     await symlink(outsideHistory, path.join(paths.reports, 'history'));
     await assert.rejects(
-      writeAgentHistory(historyPath, paths.reports, campaignWithResearch, [variant], [label]),
+      writeAgentHistory(historyPath, paths.reports, campaignWithResearch, [variant, sibling], [label]),
       /historical research root must be a real directory/,
     );
   } finally {
