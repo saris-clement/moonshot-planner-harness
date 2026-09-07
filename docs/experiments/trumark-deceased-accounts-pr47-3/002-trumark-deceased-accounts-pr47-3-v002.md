@@ -154,7 +154,7 @@ The result is not causally comparable with its parent because of: analysis pins.
 
 Correctness remains unverified because no human-verified labels score this experiment. Provisional accuracy is an LLM suggestion only.
 
-The standard-primary reference and target-excluded comparison is failed; the conclusion is incomplete until it finishes.
+The target-excluded promotion guard is passed.
 
 ## LLM Suggestion
 
@@ -443,15 +443,15 @@ Evidence:
 
 ## Target-Excluded Guard
 
-Status: `failed`
+Status: `completed`
 
-Gate: `pending`
+Gate: `passed`
 
-Baseline mean build rate: unscored
+Baseline mean build rate: 81.6%
 
-Candidate mean build rate: unscored
+Candidate mean build rate: 82.0%
 
-Build-rate drop: unscored
+Build-rate drop: -0.5%
 
 Pair validity: valid
 
@@ -469,7 +469,7 @@ Comparison lineage: replicate 1: normal case `6EMCSGQQ2WZCPEH825MQV5VY05` run `r
 
 Comparison mismatches: none
 
-Recorded error: `target-blind judge referenced the excluded implementation`
+Recorded error: none
 
 Target-arm questions: 15
 
@@ -496,7 +496,7 @@ None recorded.
 | Parent measured facts | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr47-3/trumark-deceased-accounts-pr47-3-v001/deceased-account/facts.json` | archived |
 | Diagnosis input | `deterministic_reconstruction` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr47-3/trumark-deceased-accounts-pr47-3-v002/diagnosis/diagnosis-input-8c65f76526ca55bfc6de2cba029001f6a22ab2b476a40d16e2302843692d3d8a.json` | completed |
 | Model diagnosis | `model_inference` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr47-3/trumark-deceased-accounts-pr47-3-v002/diagnosis/diagnosis-result-8c65f76526ca55bfc6de2cba029001f6a22ab2b476a40d16e2302843692d3d8a.json` | completed |
-| Target-excluded comparisons | `deterministic_reconstruction` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr47-3/trumark-deceased-accounts-pr47-3-v002/target-excluded/comparisons/` | failed |
+| Target-excluded comparisons | `deterministic_reconstruction` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr47-3/trumark-deceased-accounts-pr47-3-v002/target-excluded/comparisons/` | completed |
 | Human labels | `human_verified` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/harness.sqlite` | 0 verified |
 
 ## Human Notes

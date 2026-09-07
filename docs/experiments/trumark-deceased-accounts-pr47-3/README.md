@@ -46,7 +46,7 @@ The selected seed includes PR47’s six-slot execution capacity only to improve 
 - trumark-deceased-accounts-pr47-3-v000: failed; gate=pending; build drop=unscored
 - trumark-deceased-accounts-pr47-3-v001: completed; gate=passed; build drop=0.0%
 - trumark-deceased-accounts-pr47-3-v003: failed; gate=pending; build drop=unscored
-- trumark-deceased-accounts-pr47-3-v002: failed; gate=pending; build drop=unscored
+- trumark-deceased-accounts-pr47-3-v002: completed; gate=passed; build drop=-0.5%
 - trumark-deceased-accounts-pr47-3-v004: completed; gate=passed; build drop=2.0%
 
 ## Experiments
