@@ -1,14 +1,17 @@
-import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, open, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 import {
   DiagnosisInputSchema,
   DiagnosisOutputSchema,
   HypothesisSchema,
+  HypothesisComplianceOutputV2Schema,
   JudgeOutputSchema,
   type CampaignRecord,
   type DiagnosisOutput,
   type Hypothesis,
+  type HypothesisComplianceOutput,
   type JudgeOutput,
   type RunFacts,
   type VariantRecord,
@@ -16,6 +19,11 @@ import {
 import { runCommand } from './process.js';
 import { sha256File } from './config.js';
 import { diagnosisResultPath, validateDiagnosisFindingReferences } from './diagnosis.js';
+import {
+  hypothesisComplianceResultPath,
+  mutationContextRequiresFalsification,
+  verifyHypothesisComplianceResult,
+} from './hypothesisCompliance.js';
 
 const StrategyOutputSchema = z
   .object({
@@ -98,6 +106,38 @@ async function writeImmutableText(filePath: string, content: string): Promise<vo
   await writeFile(filePath, content, { flag: 'wx', mode: 0o600 });
 }
 
+async function withLocalAgentAttachments<T>(
+  directory: string,
+  attachments: ReadonlyArray<{ source: string; name: string }>,
+  action: (localPaths: string[]) => Promise<T>,
+): Promise<T> {
+  const localPaths: string[] = [];
+  const expectedHashes = new Map<string, string>();
+  try {
+    for (const attachment of attachments) {
+      const localPath = path.join(directory, `${attachment.name}.${randomUUID()}`);
+      const bytes = await readFile(attachment.source);
+      const handle = await open(localPath, 'wx', 0o600);
+      localPaths.push(localPath);
+      try {
+        await handle.writeFile(bytes);
+      } finally {
+        await handle.close();
+      }
+      expectedHashes.set(localPath, await sha256File(localPath));
+    }
+    const result = await action(localPaths);
+    for (const localPath of localPaths) {
+      if ((await sha256File(localPath).catch(() => null)) !== expectedHashes.get(localPath)) {
+        throw new Error('agent modified a local immutable attachment');
+      }
+    }
+    return result;
+  } finally {
+    await Promise.all(localPaths.map(async (localPath) => await rm(localPath, { force: true })));
+  }
+}
+
 export class AgentRunner {
   constructor(
     private readonly campaign: CampaignRecord,
@@ -140,7 +180,7 @@ export class AgentRunner {
   ): Promise<Hypothesis[]> {
     const prompt = `You are the strategist for a generic requirements-to-builder planner evaluation.
 
-Read the attached campaign history. Propose exactly ${count} independent, bounded hypotheses for the next round. Each hypothesis must address an observed, source-backed failure mechanism rather than optimize decision counts. ${requireFindingIds ? "Every hypothesis must cite one or more real finding IDs from the current parent variant's completed model-generated diagnosis in findingIds. Diagnosis is unverified interpretation: preserve supporting evidence, counterevidence, limitations, and falsification rather than treating it as truth. Do not invent IDs." : 'The campaign explicitly opted out of requiring a current-parent diagnosis. Return an empty findingIds array and rely only on the separately identified measured facts, labels, and limitations in history.'} Configured research is historical context only: it may inform hypotheses but is not current-run evidence and cannot support claims about a variant. Record the assumptions that must be true for the proposed intervention to work. Assumptions are model-generated and must remain visibly unverified. Do not add customer names, workflow names, fixed source paths, capability IDs, aliases, or pack-specific rules to production code. Prefer one causal mechanism per hypothesis so the experiment remains attributable.
+Read the attached campaign history. Propose exactly ${count} independent, bounded hypotheses for the next round. Each hypothesis must address an observed, source-backed failure mechanism rather than optimize decision counts. ${requireFindingIds ? "Every hypothesis must cite one or more real finding IDs from the current parent variant's completed model-generated diagnosis in findingIds. Diagnosis is unverified interpretation: preserve supporting evidence, counterevidence, limitations, and falsification rather than treating it as truth. Do not invent IDs." : 'The campaign explicitly opted out of requiring a current-parent diagnosis. Return an empty findingIds array and rely only on the separately identified measured facts, labels, and limitations in history.'} Instructions must implement every material clause of each selected generic intervention rather than a convenient subset. Distinguish code-level regression boundaries from campaign-level falsification that requires repeated planner evaluation; the latter is executed by the coordinator, not encoded wholesale in the candidate patch. Configured research is historical context only: it may inform hypotheses but is not current-run evidence and cannot support claims about a variant. Record the assumptions that must be true for the proposed intervention to work. Assumptions are model-generated and must remain visibly unverified. Do not add customer names, workflow names, fixed source paths, capability IDs, aliases, or pack-specific rules to production code. Prefer one causal mechanism per hypothesis so the experiment remains attributable.
 
 Return JSON only:
 {"hypotheses":[{"title":"...","rationale":"...","instructions":"...","expectedImpact":"...","risk":"...","findingIds":["finding-..."],"assumptions":["..."]}]}`;
@@ -177,6 +217,8 @@ ${JSON.stringify(variant.hypothesis, null, 2)}
 Rules:
 - Read the attached bounded mutation context. Cite and address only the selected finding IDs; the diagnosis is unverified model interpretation, not established truth. If and only if the context records the campaign's explicit missing-parent opt-out, proceed without diagnosis findings.
 - Preserve the cited counterevidence and implement the listed falsification test as a regression test when feasible.
+- Implement every material intervention clause in the selected findings; do not silently narrow the hypothesis to the easiest subset.
+- Add executable regression coverage for code-level mechanics and boundaries. Do not try to encode campaign-level empirical falsification such as repeated frozen-cohort accuracy or stability measurement inside the planner patch; the coordinator performs that evaluation after preflight.
 - Investigate the current code before editing.
 - Implement only this hypothesis using a generic mechanism.
 - Change files only under these configured path prefixes: ${JSON.stringify(this.campaign.config.gates.allowedPathPrefixes)}. Changes outside them are rejected before tests or evaluation; leave cross-surface synchronization for post-promotion integration.
@@ -184,18 +226,152 @@ Rules:
 - Add or update a regression test before fixing the behavior when feasible.
 - Do not edit the evaluation harness, campaign data, or experiment reports.
 - Do not commit, push, create branches, alter git configuration, or start Docker.
+- Do not stage changes or alter the Git index; the coordinator uses the staged parent state to isolate this mutation.
 - Do not run host tests; the coordinator runs trusted tests in a networkless builder container.
 - Leave all intended changes in the worktree when done.`;
     await writeFile(path.join(artifactDirectory, 'mutator-prompt.txt'), `${prompt}\n`);
-    await this.commandRunner(
-      this.campaign.config.agent.command,
-      this.argumentsFor(prompt, `${variant.id} mutator`, [mutationContextPath], worktree, true),
-      {
-        cwd: worktree,
-        timeoutMs: 1_800_000,
-        logPath: path.join(artifactDirectory, 'mutator.jsonl'),
+    await withLocalAgentAttachments(
+      worktree,
+      [
+        {
+          source: mutationContextPath,
+          name: `.harness-mutation-context-${variant.id}.json`,
+        },
+      ],
+      async ([localMutationContextPath]) =>
+        await this.commandRunner(
+          this.campaign.config.agent.command,
+          this.argumentsFor(
+            prompt,
+            `${variant.id} mutator`,
+            [localMutationContextPath!],
+            worktree,
+            true,
+          ),
+          {
+            cwd: worktree,
+            timeoutMs: 1_800_000,
+            logPath: path.join(artifactDirectory, 'mutator.jsonl'),
+          },
+        ),
+    );
+  }
+
+  async assessHypothesisCompliance(
+    variant: VariantRecord,
+    patchPath: string,
+    mutationContextPath: string,
+    artifactDirectory: string,
+    contextDirectory: string,
+    expectedResultSha256: string | null = null,
+  ): Promise<{ result: HypothesisComplianceOutput; resultPath: string }> {
+    const [patchSha256, mutationContextSha256, falsificationRequired] = await Promise.all([
+      sha256File(patchPath),
+      sha256File(mutationContextPath),
+      mutationContextRequiresFalsification(mutationContextPath),
+    ]);
+    const resultPath = hypothesisComplianceResultPath(
+      artifactDirectory,
+      patchSha256,
+      mutationContextSha256,
+    );
+    if ((await stat(resultPath).catch(() => null))?.isFile()) {
+      if (!expectedResultSha256) {
+        throw new Error('hypothesis compliance result exists without a trusted persisted hash');
+      }
+      return {
+        result: await verifyHypothesisComplianceResult(
+          resultPath,
+          variant.id,
+          patchSha256,
+          mutationContextSha256,
+          expectedResultSha256,
+          falsificationRequired,
+        ),
+        resultPath,
+      };
+    }
+    if (expectedResultSha256) {
+      throw new Error('trusted persisted hypothesis compliance result is missing');
+    }
+    const prompt = `Act as a read-only hypothesis-compliance reviewer for a planner experiment.
+
+The attached mutation context contains the selected unverified diagnosis findings, proposed generic interventions, and falsification tests. The attached patch is the isolated current mutation relative to its inherited parent. The working directory contains the complete candidate planner source.
+
+Assess whether the concrete runtime change implements this hypothesis:
+${JSON.stringify(variant.hypothesis, null, 2)}
+
+Rules:
+- Inspect the current code contract and the patch itself. Do not accept invented fixture shapes, metadata, APIs, or behavior absent from source.
+- Do not accept a prompt-only change for a claim of deterministic runtime behavior or identical evidence replay. Judge the claimed mechanism, not the patch description.
+- Do not credit behavior inherited from the parent unless the isolated mutation patch changes it for this hypothesis.
+- The intervention passes only if executable code implements every cited generic intervention without customer, workflow, source-path, alias, capability-ID, requirement-text, or fixed-distribution heuristics.
+- Require executable falsification regression coverage for deterministic code mechanics and positive/negative boundaries that can be tested inside the planner repository.
+- Use deferred_to_evaluation when the decisive falsification requires repeated full planner runs, frozen-cohort accuracy, evidence recall, or stability measurements that the coordinator performs after this preflight. Deferral is not a failure and must cite the campaign-level measurement plus the patch's code-level regression coverage; never use it to excuse a missing locally testable boundary.
+- Use not_applicable only when the mutation context contains no falsification test.
+- Uncertain is fail-closed. This review is an unverified model judgment, not measured output or human-verified truth.
+- Do not modify files, the Git index, or HEAD.
+
+Return JSON only:
+{"kind":"ainative-planner-eval/hypothesis-compliance","schemaVersion":2,"interpretationStatus":"unverified_model_judgment","variantId":"${variant.id}","patchSha256":"${patchSha256}","mutationContextSha256":"${mutationContextSha256}","status":"passed|failed","summary":"...","intervention":{"status":"satisfied|not_satisfied|uncertain","rationale":"...","evidence":["path:line or exact patch fact"]},"codeRegression":{"status":"satisfied|not_satisfied|uncertain","rationale":"...","evidence":["path:line or exact patch fact"]},"falsificationTest":{"status":"satisfied|deferred_to_evaluation|not_satisfied|uncertain|not_applicable","rationale":"...","evidence":["path:line or exact patch fact"]},"limitations":["This is an unverified model judgment."]}`;
+    const directory = path.join(artifactDirectory, 'hypothesis-compliance');
+    const promptPath = path.join(
+      directory,
+      `prompt-${patchSha256.slice(7)}-${mutationContextSha256.slice(7)}.txt`,
+    );
+    await writeImmutableText(promptPath, `${prompt}\n`);
+    const result = await withLocalAgentAttachments(
+      contextDirectory,
+      [
+        { source: patchPath, name: `.harness-treatment-${patchSha256.slice(7)}.patch` },
+        {
+          source: mutationContextPath,
+          name: `.harness-mutation-context-${mutationContextSha256.slice(7)}.json`,
+        },
+      ],
+      async (localAttachments) => {
+        const run = async (reviewPrompt: string, suffix = '') =>
+          await this.commandRunner(
+            this.campaign.config.agent.command,
+            this.argumentsFor(
+              reviewPrompt,
+              `${variant.id} hypothesis compliance${suffix ? ' repair' : ''}`,
+              localAttachments,
+              contextDirectory,
+            ),
+            {
+              cwd: contextDirectory,
+              timeoutMs: 900_000,
+              logPath: path.join(
+                directory,
+                `review-${patchSha256.slice(7)}-${mutationContextSha256.slice(7)}${suffix}.jsonl`,
+              ),
+            },
+          );
+        const initial = await run(prompt);
+        try {
+          return parseJsonResponse(initial.stdout, HypothesisComplianceOutputV2Schema);
+        } catch {
+          const repaired = await run(
+            `${prompt}\n\nYour previous response did not satisfy the required JSON contract. Return exactly one corrected JSON object with the bound variant and hashes. Do not narrate progress or tool use.`,
+            '-repair',
+          );
+          return parseJsonResponse(repaired.stdout, HypothesisComplianceOutputV2Schema);
+        }
       },
     );
+    if (
+      result.variantId !== variant.id ||
+      result.patchSha256 !== patchSha256 ||
+      result.mutationContextSha256 !== mutationContextSha256
+    ) {
+      throw new Error('hypothesis compliance reviewer returned a result for another mutation');
+    }
+    if (falsificationRequired && result.falsificationTest.status === 'not_applicable') {
+      throw new Error('hypothesis compliance falsification check cannot be not_applicable');
+    }
+    await writeImmutableText(resultPath, `${JSON.stringify(result, null, 2)}\n`);
+    return { result, resultPath };
   }
 
   async diagnose(

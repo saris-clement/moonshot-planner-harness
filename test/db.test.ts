@@ -51,6 +51,7 @@ test('database persists campaign lineage, labels, and ordered events', async () 
       noImprovementRounds: 1,
     });
     database.updateVariant(variant.id, {
+      patchHash: `sha256:${'0'.repeat(64)}`,
       startedAt: '2026-09-06T04:40:00.000Z',
       completedAt: '2026-09-06T04:50:00.000Z',
       elapsedMs: 600_000,
@@ -150,6 +151,7 @@ test('database persists campaign lineage, labels, and ordered events', async () 
     );
     const persistedVariant = database.getVariant(variant.id);
     assert.equal(persistedVariant.elapsedMs, 600_000);
+    assert.equal(persistedVariant.patchHash, `sha256:${'0'.repeat(64)}`);
     assert.equal(persistedVariant.phase2ElapsedMs, 240_000);
     assert.equal(persistedVariant.executionState?.executions[0]?.caseId, 'case-a');
     assert.equal(persistedVariant.executionState?.executions[0]?.elapsedMs, 120_000);
@@ -185,6 +187,44 @@ test('database persists campaign lineage, labels, and ordered events', async () 
     });
     assert.equal(database.getVariant(variant.id).diagnosisStatus, 'completed');
     assert.equal(database.getVariant(variant.id).diagnosis?.findings[0]?.id, 'finding-hydration');
+    const compliance = {
+      kind: 'ainative-planner-eval/hypothesis-compliance' as const,
+      schemaVersion: 1 as const,
+      interpretationStatus: 'unverified_model_judgment' as const,
+      variantId: variant.id,
+      patchSha256: `sha256:${'1'.repeat(64)}`,
+      mutationContextSha256: `sha256:${'2'.repeat(64)}`,
+      status: 'passed' as const,
+      summary: 'The patch aligns with the bounded intervention.',
+      intervention: {
+        status: 'satisfied' as const,
+        rationale: 'Runtime behavior changed at the cited mechanism.',
+        evidence: ['server/src/policy.ts:12'],
+      },
+      falsificationTest: {
+        status: 'satisfied' as const,
+        rationale: 'A positive and negative regression was added.',
+        evidence: ['server/test/policy.test.ts:40'],
+      },
+      limitations: ['This is an unverified model judgment.'],
+    };
+    database.updateVariant(variant.id, {
+      hypothesisComplianceStatus: 'passed',
+      hypothesisCompliancePatchHash: compliance.patchSha256,
+      hypothesisComplianceCandidatePatchHash: `sha256:${'4'.repeat(64)}`,
+      hypothesisComplianceResultHash: `sha256:${'3'.repeat(64)}`,
+      hypothesisCompliance: compliance,
+      hypothesisComplianceError: null,
+    });
+    const compliantVariant = database.getVariant(variant.id);
+    assert.equal(compliantVariant.hypothesisComplianceStatus, 'passed');
+    assert.equal(compliantVariant.hypothesisCompliance?.status, 'passed');
+    assert.equal(compliantVariant.hypothesisCompliancePatchHash, compliance.patchSha256);
+    assert.equal(
+      compliantVariant.hypothesisComplianceCandidatePatchHash,
+      `sha256:${'4'.repeat(64)}`,
+    );
+    assert.equal(compliantVariant.hypothesisComplianceResultHash, `sha256:${'3'.repeat(64)}`);
     database.upsertLabel({
       campaignId: config.id,
       benchmark: 'primary-pack',

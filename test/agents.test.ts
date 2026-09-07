@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -164,6 +164,8 @@ test('strategist prompt and schema require current diagnosis finding citations',
   assert.match(calls[0]!.join(' '), /assumptions/);
   assert.match(calls[0]!.join(' '), /research.*historical context only/i);
   assert.match(calls[0]!.join(' '), /not current-run evidence/i);
+  assert.match(calls[0]!.join(' '), /every material clause/i);
+  assert.match(calls[0]!.join(' '), /campaign-level falsification/i);
 });
 
 test('strategist output is rejected when it omits explicit assumptions', async () => {
@@ -207,16 +209,25 @@ test('mutator prompt discloses the configured path allowlist', async () => {
       },
     },
   };
+  let localContextPath: string | null = null;
   const runner = new AgentRunner(
     scopedCampaign,
-    async (command, args): Promise<CommandResult> => ({
-      command,
-      args: [...args],
-      exitCode: 0,
-      stdout: '',
-      stderr: '',
-      durationMs: 1,
-    }),
+    async (command, args): Promise<CommandResult> => {
+      const attachmentIndex = args.indexOf('--file');
+      localContextPath = args[attachmentIndex + 1] ?? null;
+      assert.ok(localContextPath);
+      assert.equal(path.dirname(localContextPath), directory);
+      assert.notEqual(localContextPath, contextPath);
+      assert.equal(await readFile(localContextPath, 'utf8'), '{"selectedFindings":[]}\n');
+      return {
+        command,
+        args: [...args],
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        durationMs: 1,
+      };
+    },
   );
   const variant = {
     id: 'agent-paths-v001',
@@ -236,6 +247,239 @@ test('mutator prompt discloses the configured path allowlist', async () => {
     assert.match(prompt, /server\/src\/custom\//);
     assert.match(prompt, /server\/test\/custom\//);
     assert.match(prompt, /rejected before tests or evaluation/);
+    assert.match(prompt, /Do not stage changes or alter the Git index/);
+    assert.match(prompt, /campaign-level empirical falsification/i);
+    assert.match(prompt, /every material intervention clause/i);
+    assert.equal(await stat(localContextPath!).catch(() => null), null);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('hypothesis compliance reviewer binds its unverified verdict to patch and mutation context', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'planner-agent-compliance-'));
+  const patchPath = path.join(directory, 'variant.patch');
+  const mutationContextPath = path.join(directory, 'mutation-context.json');
+  const patch = 'diff --git a/server/src/policy.ts b/server/src/policy.ts\n+export const policy = true;\n';
+  const mutationContext = JSON.stringify({
+    selectedFindings: [
+      {
+        genericIntervention: 'Retain executable evidence.',
+        falsificationTest: 'Admit executable evidence while rejecting type-only aliases.',
+      },
+    ],
+  });
+  await Promise.all([
+    writeFile(patchPath, patch),
+    writeFile(mutationContextPath, mutationContext),
+  ]);
+  const patchSha256 = `sha256:${createHash('sha256').update(patch).digest('hex')}`;
+  const mutationContextSha256 = `sha256:${createHash('sha256')
+    .update(mutationContext)
+    .digest('hex')}`;
+  const output = {
+    kind: 'ainative-planner-eval/hypothesis-compliance',
+    schemaVersion: 2,
+    interpretationStatus: 'unverified_model_judgment',
+    variantId: 'agent-repair-v001',
+    patchSha256,
+    mutationContextSha256,
+    status: 'passed',
+    summary: 'The implementation and regression test align with the selected finding.',
+    intervention: {
+      status: 'satisfied',
+      rationale: 'The runtime path retains executable evidence.',
+      evidence: ['server/src/policy.ts:1'],
+    },
+    codeRegression: {
+      status: 'satisfied',
+      rationale: 'The test covers the deterministic positive and negative boundary.',
+      evidence: ['server/test/policy.test.ts:1'],
+    },
+    falsificationTest: {
+      status: 'satisfied',
+      rationale: 'The test covers admitted and rejected declarations.',
+      evidence: ['server/test/policy.test.ts:1'],
+    },
+    limitations: ['This is an unverified model judgment.'],
+  };
+  const calls: string[][] = [];
+  const runner = new AgentRunner(campaign, async (command, args): Promise<CommandResult> => {
+    calls.push([...args]);
+    return {
+      command,
+      args: [...args],
+      exitCode: 0,
+      stdout: calls.length === 1 ? 'I am reviewing the patch.' : JSON.stringify(output),
+      stderr: '',
+      durationMs: 1,
+    };
+  });
+  const variant = {
+    id: 'agent-repair-v001',
+    hypothesis: {
+      title: 'Retain evidence',
+      rationale: 'Exercise the diagnosed admission loss.',
+      instructions: 'Retain executable evidence and add the falsification regression.',
+      expectedImpact: 'Fewer unsupported build decisions.',
+      risk: 'Could admit declarations without behavior.',
+      findingIds: ['finding-hydration'],
+    },
+  } as VariantRecord;
+
+  try {
+    const assessment = await runner.assessHypothesisCompliance(
+      variant,
+      patchPath,
+      mutationContextPath,
+      directory,
+      directory,
+    );
+    assert.equal(assessment.result.status, 'passed');
+    assert.equal(assessment.result.patchSha256, patchSha256);
+    assert.equal(assessment.result.mutationContextSha256, mutationContextSha256);
+    assert.match(calls[0]!.join(' '), /prompt-only change/i);
+    assert.match(calls[0]!.join(' '), /invented fixture|current code contract/i);
+    assert.match(calls[0]!.join(' '), /executable falsification/i);
+    assert.match(calls[0]!.join(' '), /unverified model judgment/i);
+    assert.match(calls[0]!.join(' '), /Do not modify files, the Git index, or HEAD/);
+    assert.match(calls[0]!.join(' '), /deferred_to_evaluation/);
+    const attachedPaths = calls[0]!
+      .flatMap((value, index, values) => (value === '--file' ? [values[index + 1]!] : []));
+    assert.equal(attachedPaths.length, 2);
+    assert.ok(attachedPaths.every((value) => path.dirname(value) === directory));
+    assert.ok(attachedPaths.every((value) => path.basename(value).startsWith('.harness-')));
+    assert.match(calls[1]!.join(' '), /previous response did not satisfy/i);
+    assert.match(await readFile(assessment.resultPath, 'utf8'), /hypothesis-compliance/);
+    assert.ok(
+      (await Promise.all(attachedPaths.map(async (value) => await stat(value).catch(() => null)))).every(
+        (value) => value === null,
+      ),
+    );
+    await assert.rejects(
+      runner.assessHypothesisCompliance(
+        variant,
+        patchPath,
+        mutationContextPath,
+        directory,
+        directory,
+      ),
+      /result exists without a trusted persisted hash/,
+    );
+    const resultBytes = await readFile(assessment.resultPath);
+    const resultSha256 = `sha256:${createHash('sha256').update(resultBytes).digest('hex')}`;
+    const reused = await runner.assessHypothesisCompliance(
+      variant,
+      patchPath,
+      mutationContextPath,
+      directory,
+      directory,
+      resultSha256,
+    );
+    assert.deepEqual(reused.result, assessment.result);
+    await rm(assessment.resultPath);
+    await assert.rejects(
+      runner.assessHypothesisCompliance(
+        variant,
+        patchPath,
+        mutationContextPath,
+        directory,
+        directory,
+        resultSha256,
+      ),
+      /trusted persisted hypothesis compliance result is missing/,
+    );
+
+    const requiredContextPath = path.join(directory, 'required-mutation-context.json');
+    const requiredContext = JSON.stringify({
+      selectedFindings: [
+        {
+          id: 'finding-required-test',
+          falsificationTest: 'Exercise both retained and rejected evidence.',
+        },
+      ],
+    });
+    await writeFile(requiredContextPath, requiredContext);
+    const requiredContextSha256 = `sha256:${createHash('sha256')
+      .update(requiredContext)
+      .digest('hex')}`;
+    const invalidRunner = new AgentRunner(
+      campaign,
+      async (command, args): Promise<CommandResult> => ({
+        command,
+        args: [...args],
+        exitCode: 0,
+        stdout: JSON.stringify({
+          ...output,
+          mutationContextSha256: requiredContextSha256,
+          falsificationTest: {
+            status: 'not_applicable',
+            rationale: 'No test was checked.',
+            evidence: ['mutation-context.json'],
+          },
+        }),
+        stderr: '',
+        durationMs: 1,
+      }),
+    );
+    await assert.rejects(
+      invalidRunner.assessHypothesisCompliance(
+        variant,
+        patchPath,
+        requiredContextPath,
+        directory,
+        directory,
+      ),
+      /falsification check cannot be not_applicable/,
+    );
+
+    const tamperingRunner = new AgentRunner(
+      campaign,
+      async (command, args): Promise<CommandResult> => {
+        const attachmentIndex = args.indexOf('--file');
+        await writeFile(args[attachmentIndex + 1]!, 'tampered attachment');
+        return {
+          command,
+          args: [...args],
+          exitCode: 0,
+          stdout: JSON.stringify(output),
+          stderr: '',
+          durationMs: 1,
+        };
+      },
+    );
+    await assert.rejects(
+      tamperingRunner.assessHypothesisCompliance(
+        variant,
+        patchPath,
+        mutationContextPath,
+        directory,
+        directory,
+      ),
+      /agent modified a local immutable attachment/,
+    );
+    const { codeRegression: _codeRegression, ...legacyOutput } = output;
+    const legacyRunner = new AgentRunner(
+      campaign,
+      async (command, args): Promise<CommandResult> => ({
+        command,
+        args: [...args],
+        exitCode: 0,
+        stdout: JSON.stringify({ ...legacyOutput, schemaVersion: 1 }),
+        stderr: '',
+        durationMs: 1,
+      }),
+    );
+    await assert.rejects(
+      legacyRunner.assessHypothesisCompliance(
+        variant,
+        patchPath,
+        mutationContextPath,
+        directory,
+        directory,
+      ),
+      /agent returned invalid structured output/,
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -370,7 +614,7 @@ test('diagnostician archives strict cited unverified output and mutator receives
     } as VariantRecord;
     await runner.mutate(variant, directory, directory, contextPath);
     const mutatorCall = calls[2]!.join(' ');
-    assert.match(mutatorCall, /mutation-context\.json/);
+    assert.match(mutatorCall, /harness-mutation-context/);
     assert.match(mutatorCall, /unverified model interpretation/);
     assert.doesNotMatch(mutatorCall, /raw log/i);
   } finally {

@@ -150,6 +150,37 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
         ],
         limitations: ['Unverified model inference.'],
       },
+      hypothesisComplianceStatus: 'passed',
+      hypothesisCompliancePatchHash: `sha256:${'1'.repeat(64)}`,
+      hypothesisComplianceCandidatePatchHash: `sha256:${'4'.repeat(64)}`,
+      hypothesisComplianceResultHash: `sha256:${'2'.repeat(64)}`,
+      hypothesisCompliance: {
+        kind: 'ainative-planner-eval/hypothesis-compliance',
+        schemaVersion: 2,
+        interpretationStatus: 'unverified_model_judgment',
+        variantId: created.id,
+        patchSha256: `sha256:${'1'.repeat(64)}`,
+        mutationContextSha256: `sha256:${'3'.repeat(64)}`,
+        status: 'passed',
+        summary: 'The patch and regression test align with the stated intervention.',
+        intervention: {
+          status: 'satisfied',
+          rationale: 'Runtime code changes the cited mechanism.',
+          evidence: ['server/src/policy.ts:12'],
+        },
+        codeRegression: {
+          status: 'satisfied',
+          rationale: 'The deterministic boundary has positive and negative coverage.',
+          evidence: ['server/test/policy.test.ts:40'],
+        },
+        falsificationTest: {
+          status: 'satisfied',
+          rationale: 'The test covers the positive and negative cases.',
+          evidence: ['server/test/policy.test.ts:40'],
+        },
+        limitations: ['This is an unverified model judgment.'],
+      },
+      hypothesisComplianceError: null,
     });
     const label = database.upsertLabel({
       campaignId: campaign.id,
@@ -165,6 +196,11 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
     assert.match(report, /## Actual Facts/);
     assert.match(report, /## LLM Suggestion/);
     assert.match(report, /## Model-Generated Diagnosis/);
+    assert.match(report, /## Hypothesis Compliance Preflight/);
+    assert.match(report, /unverified model judgment/i);
+    assert.match(report, /Runtime code changes the cited mechanism/);
+    assert.match(report, /### Code Regression/);
+    assert.match(report, /Cumulative candidate patch hash: `sha256:4444/);
     assert.match(report, /does not contribute to numeric scoring/);
     assert.match(report, /The baseline plan below is harness-authored/);
     assert.ok(report.indexOf('## Actual Facts') < report.indexOf('## Model-Generated Diagnosis'));
@@ -241,6 +277,9 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
     assert.match(serialized, /"supportingEvidenceRefs"/);
     assert.match(serialized, /"counterEvidenceRefs"/);
     assert.match(serialized, /"falsificationTest"/);
+    assert.match(serialized, /"hypothesisCompliance":\{"status":"passed"/);
+    assert.match(serialized, /"patchSha256":"sha256:1111/);
+    assert.match(serialized, /"candidatePatchSha256":"sha256:4444/);
     assert.match(serialized, /"name":"V13c experiment axes"/);
     assert.match(serialized, /"comparability":"historical_context_only"/);
     assert.match(serialized, /No results claimed/);
