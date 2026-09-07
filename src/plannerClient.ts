@@ -120,7 +120,12 @@ export interface Phase2QuestionAudit {
   questionId: string;
   prompt: string;
   answer: string;
-  resolution: 'requirements_agent' | 'source_fallback' | 'reused_source_answer' | 'human_answer';
+  resolution:
+    | 'requirements_agent'
+    | 'source_fallback'
+    | 'pm_simulation'
+    | 'reused_source_answer'
+    | 'human_answer';
   evidence: string[];
   requirementsAgentRequests: number;
 }

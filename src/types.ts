@@ -696,6 +696,7 @@ export interface BenchmarkQuestionResolution {
   plannerRequirementsAgentRequests: number;
   plannerRequirementsAgentAnswers: number;
   plannerSourceFallbackAnswers: number;
+  plannerPmSimulationAnswers?: number;
   plannerReusedAnswers: number;
   plannerHumanAnswers?: number;
   entries: QuestionResolutionEntry[];
@@ -712,7 +713,13 @@ export interface RuntimeQuestionObservation {
   rationale: string;
   status: string;
   answer: string | null;
-  resolution: 'requirements_agent' | 'source_fallback' | 'reused_source_answer' | 'human_answer' | null;
+  resolution:
+    | 'requirements_agent'
+    | 'source_fallback'
+    | 'pm_simulation'
+    | 'reused_source_answer'
+    | 'human_answer'
+    | null;
   evidence: string[];
   createdAt: string | null;
   updatedAt: string | null;

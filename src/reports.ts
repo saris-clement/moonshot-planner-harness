@@ -623,6 +623,7 @@ ${
 | Planner requirements-agent requests | ${resolution.plannerRequirementsAgentRequests} |
 | Planner requirements-agent answers | ${resolution.plannerRequirementsAgentAnswers} |
 | Planner source fallback answers | ${resolution.plannerSourceFallbackAnswers} |
+| Planner PM-simulation answers | ${resolution.plannerPmSimulationAnswers ?? 0} |
 | Planner reused answers | ${resolution.plannerReusedAnswers} |
 | Planner human answers | ${resolution.plannerHumanAnswers ?? 0} |
 

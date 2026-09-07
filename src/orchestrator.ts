@@ -11,7 +11,7 @@ import {
   writeResolvedCampaignConfig,
 } from './config.js';
 import { HarnessDatabase } from './db.js';
-import { AgentRunner } from './agents.js';
+import { AgentRunner, type SourceQuestionAnswer } from './agents.js';
 import {
   compareCohort,
   compareScores,
@@ -348,6 +348,9 @@ export function withRuntimeQuestions(
     ).length,
     plannerSourceFallbackAnswers: summary.plannerSourceFallbackAnswers + questions.filter(
       (question) => question.resolution === 'source_fallback',
+    ).length,
+    plannerPmSimulationAnswers: (summary.plannerPmSimulationAnswers ?? 0) + questions.filter(
+      (question) => question.resolution === 'pm_simulation',
     ).length,
     plannerReusedAnswers: summary.plannerReusedAnswers + questions.filter(
       (question) => question.resolution === 'reused_source_answer',
@@ -2909,7 +2912,7 @@ export class CampaignOrchestrator {
     campaign: CampaignRecord,
     question: PlannerQuestionRecord,
     consultations: unknown[],
-    workflowsSource: string,
+    _workflowsSource: string,
     artifactDirectory: string,
     answerCache: RuntimeAnswerCache,
     targetContext?: {
@@ -3082,23 +3085,12 @@ export class CampaignOrchestrator {
          return cacheAnswer(answer);
       }
     }
-      const source = await new AgentRunner(campaign).answerUpstreamQuestion(
-      {
-        id: question.id,
-        question: question.prompt,
-        type: question.responseKind,
-        options: (question.options ?? []).map((option) => ({
-          id: option.id,
-          label: option.label,
-          description: option.description ?? option.consequences ?? '',
-        })),
-      },
-      workflowsSource,
-      artifactDirectory,
-    );
-      if (targetContext) {
-        await this.ensureTargetExcludedWorkflowsSource(campaign, targetContext.targetWorkflow);
-      }
+      const source = await this.answerRuntimeQuestionFromImplementation(
+        campaign,
+        question,
+        await this.ensureFrozenWorkflowsSource(campaign),
+        artifactDirectory,
+      );
       if (source.resolution !== 'answered') {
         if (!targetContext) {
           throw new Error(`planner question ${question.id} remains unresolved: ${source.reason}`);
@@ -3106,21 +3098,26 @@ export class CampaignOrchestrator {
         return null;
       }
       const selectedOptionId = selectedOptionIdForAnswer(
-      question,
-      source.answer,
-      source.selectedOptionId,
-    );
+        question,
+        source.answer,
+        source.selectedOptionId,
+      );
       if (question.responseKind === 'single_select' && !selectedOptionId) {
-      throw new Error(`source answer did not select an option for ${question.id}`);
-    }
+        throw new Error(`source answer did not select an option for ${question.id}`);
+      }
       const answer: Phase2QuestionAnswer = {
-      answer: source.answer,
-      ...(selectedOptionId ? { selectedOptionId } : {}),
-      resolution: 'source_fallback',
-      evidence: source.evidence,
-      requirementsAgentRequests: consultationRecords.length,
+        answer: source.answer,
+        ...(selectedOptionId ? { selectedOptionId } : {}),
+        resolution: 'pm_simulation',
+        evidence: targetContext
+          ? ['PM simulation evidence is retained in the immutable harness agent transcript.']
+          : source.evidence,
+        requirementsAgentRequests: consultationRecords.length,
       };
-      if (targetContext && containsTargetIdentityLeak(answer, targetContext.targetWorkflow)) {
+      if (
+        targetContext &&
+        containsTargetIdentityLeak({ answer: answer.answer }, targetContext.targetWorkflow)
+      ) {
         return null;
       }
       return cacheAnswer(answer);
@@ -3141,6 +3138,29 @@ export class CampaignOrchestrator {
       if (answerCache.get(cacheKey) === resolutionPromise) answerCache.delete(cacheKey);
       throw error;
     }
+  }
+
+  private async answerRuntimeQuestionFromImplementation(
+    campaign: CampaignRecord,
+    question: PlannerQuestionRecord,
+    workflowsSource: string,
+    artifactDirectory: string,
+  ): Promise<SourceQuestionAnswer> {
+    return await new AgentRunner(campaign).answerUpstreamQuestion(
+      {
+        id: question.id,
+        question: question.prompt,
+        type: question.responseKind,
+        options: (question.options ?? []).map((option) => ({
+          id: option.id,
+          label: option.label,
+          description: option.description ?? option.consequences ?? '',
+        })),
+      },
+      workflowsSource,
+      artifactDirectory,
+      { mode: 'pm-simulation' },
+    );
   }
 
   private async waitForTargetExcludedAnswer(

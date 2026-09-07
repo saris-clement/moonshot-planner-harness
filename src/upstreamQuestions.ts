@@ -463,6 +463,7 @@ export async function resolveBenchmarkQuestions(input: {
         plannerRequirementsAgentRequests: 0,
         plannerRequirementsAgentAnswers: 0,
         plannerSourceFallbackAnswers: 0,
+        plannerPmSimulationAnswers: 0,
         plannerReusedAnswers: 0,
         plannerHumanAnswers: 0,
       };
@@ -609,6 +610,7 @@ export async function resolveBenchmarkQuestions(input: {
     plannerRequirementsAgentRequests: 0,
     plannerRequirementsAgentAnswers: 0,
     plannerSourceFallbackAnswers: 0,
+    plannerPmSimulationAnswers: 0,
     plannerReusedAnswers: 0,
     plannerHumanAnswers: 0,
     entries,

@@ -12,6 +12,7 @@ import {
   targetExcludedComparisonDirectories,
   targetExcludedLiveStackDirectory,
   targetExcludedProtocolPlan,
+  withRuntimeQuestions,
 } from '../src/orchestrator.js';
 import type { HarnessPaths } from '../src/paths.js';
 import { resolveCampaignConfig } from '../src/config.js';
@@ -1287,6 +1288,107 @@ test('V2 primary resolution uses full-source PM simulation while preserving excl
     const recovered = await internal.runBaseline(fixture.campaign.id);
     assert.equal(recovered.id, fixture.variant.id);
     assert.equal(fixture.database.listVariants(fixture.campaign.id).length, 1);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('target-bound runtime questions use full-source PM simulation without exposing evidence', async () => {
+  const fixture = await v2LifecycleFixture('v2-runtime-pm-answer');
+  try {
+    const fullSource = path.join(fixture.root, 'full-frozen-workflows');
+    let observedSource: string | null = null;
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      ensureFrozenWorkflowsSource: () => Promise<string>;
+      answerRuntimeQuestionFromImplementation: (
+        campaign: CampaignRecord,
+        question: PlannerQuestionRecord,
+        workflowsSource: string,
+        artifactDirectory: string,
+      ) => Promise<{
+        resolution: 'answered';
+        answer: string;
+        evidence: string[];
+      }>;
+      answerRuntimeQuestion: (
+        campaign: CampaignRecord,
+        question: PlannerQuestionRecord,
+        consultations: unknown[],
+        workflowsSource: string,
+        artifactDirectory: string,
+        answerCache: Map<string, unknown>,
+        targetContext: {
+          targetWorkflow: string;
+          variantId: string;
+          benchmark: string;
+          replicate: number;
+        },
+      ) => Promise<{
+        answer: string;
+        resolution: string;
+        evidence: string[];
+        requirementsAgentRequests: number;
+      }>;
+    };
+    internal.ensureFrozenWorkflowsSource = async () => fullSource;
+    internal.answerRuntimeQuestionFromImplementation = async (
+      _campaign,
+      _question,
+      workflowsSource,
+    ) => {
+      observedSource = workflowsSource;
+      return {
+        resolution: 'answered',
+        answer: 'Use the implementation-backed keyable row format.',
+        evidence: ['src/customers/trumark/deceased-accounts/summary-block.ts:197-204'],
+      };
+    };
+    const question: PlannerQuestionRecord = {
+      id: 'runtime-pm-question',
+      createdByRunId: 'runtime-pm-run',
+      responseKind: 'free_text',
+      prompt: 'Which keyable row format should be used?',
+      rationale: 'The reviewed text leaves the exact format unresolved.',
+      context: {},
+      status: 'open',
+    };
+
+    const answer = await internal.answerRuntimeQuestion(
+      fixture.campaign,
+      question,
+      [],
+      path.join(fixture.root, 'target-safe-source'),
+      path.join(fixture.root, 'runtime-question'),
+      new Map(),
+      {
+        targetWorkflow: fixture.targetConfig.targetImplementationWorkflow,
+        variantId: fixture.variant.id,
+        benchmark: 'primary:excluded',
+        replicate: 1,
+      },
+    );
+
+    assert.equal(observedSource, fullSource);
+    assert.equal(answer.resolution, 'pm_simulation');
+    assert.deepEqual(answer.evidence, [
+      'PM simulation evidence is retained in the immutable harness agent transcript.',
+    ]);
+    assert.equal(answer.requirementsAgentRequests, 0);
+    const summary = withRuntimeQuestions(resolution('primary', `sha256:${'8'.repeat(64)}`), [
+      {
+        questionId: question.id,
+        prompt: question.prompt,
+        answer: answer.answer,
+        resolution: 'pm_simulation',
+        evidence: answer.evidence,
+        requirementsAgentRequests: answer.requirementsAgentRequests,
+      },
+    ]);
+    assert.equal(summary.plannerPmSimulationAnswers, 1);
   } finally {
     fixture.database.close();
     await rm(fixture.root, { recursive: true, force: true });
