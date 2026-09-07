@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -164,6 +164,8 @@ test('strategist prompt and schema require current diagnosis finding citations',
   assert.match(calls[0]!.join(' '), /assumptions/);
   assert.match(calls[0]!.join(' '), /research.*historical context only/i);
   assert.match(calls[0]!.join(' '), /not current-run evidence/i);
+  assert.match(calls[0]!.join(' '), /every material clause/i);
+  assert.match(calls[0]!.join(' '), /campaign-level falsification/i);
 });
 
 test('strategist output is rejected when it omits explicit assumptions', async () => {
@@ -207,16 +209,25 @@ test('mutator prompt discloses the configured path allowlist', async () => {
       },
     },
   };
+  let localContextPath: string | null = null;
   const runner = new AgentRunner(
     scopedCampaign,
-    async (command, args): Promise<CommandResult> => ({
-      command,
-      args: [...args],
-      exitCode: 0,
-      stdout: '',
-      stderr: '',
-      durationMs: 1,
-    }),
+    async (command, args): Promise<CommandResult> => {
+      const attachmentIndex = args.indexOf('--file');
+      localContextPath = args[attachmentIndex + 1] ?? null;
+      assert.ok(localContextPath);
+      assert.equal(path.dirname(localContextPath), directory);
+      assert.notEqual(localContextPath, contextPath);
+      assert.equal(await readFile(localContextPath, 'utf8'), '{"selectedFindings":[]}\n');
+      return {
+        command,
+        args: [...args],
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        durationMs: 1,
+      };
+    },
   );
   const variant = {
     id: 'agent-paths-v001',
@@ -237,6 +248,9 @@ test('mutator prompt discloses the configured path allowlist', async () => {
     assert.match(prompt, /server\/test\/custom\//);
     assert.match(prompt, /rejected before tests or evaluation/);
     assert.match(prompt, /Do not stage changes or alter the Git index/);
+    assert.match(prompt, /campaign-level empirical falsification/i);
+    assert.match(prompt, /every material intervention clause/i);
+    assert.equal(await stat(localContextPath!).catch(() => null), null);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -265,7 +279,7 @@ test('hypothesis compliance reviewer binds its unverified verdict to patch and m
     .digest('hex')}`;
   const output = {
     kind: 'ainative-planner-eval/hypothesis-compliance',
-    schemaVersion: 1,
+    schemaVersion: 2,
     interpretationStatus: 'unverified_model_judgment',
     variantId: 'agent-repair-v001',
     patchSha256,
@@ -276,6 +290,11 @@ test('hypothesis compliance reviewer binds its unverified verdict to patch and m
       status: 'satisfied',
       rationale: 'The runtime path retains executable evidence.',
       evidence: ['server/src/policy.ts:1'],
+    },
+    codeRegression: {
+      status: 'satisfied',
+      rationale: 'The test covers the deterministic positive and negative boundary.',
+      evidence: ['server/test/policy.test.ts:1'],
     },
     falsificationTest: {
       status: 'satisfied',
@@ -324,8 +343,19 @@ test('hypothesis compliance reviewer binds its unverified verdict to patch and m
     assert.match(calls[0]!.join(' '), /executable falsification/i);
     assert.match(calls[0]!.join(' '), /unverified model judgment/i);
     assert.match(calls[0]!.join(' '), /Do not modify files, the Git index, or HEAD/);
+    assert.match(calls[0]!.join(' '), /deferred_to_evaluation/);
+    const attachedPaths = calls[0]!
+      .flatMap((value, index, values) => (value === '--file' ? [values[index + 1]!] : []));
+    assert.equal(attachedPaths.length, 2);
+    assert.ok(attachedPaths.every((value) => path.dirname(value) === directory));
+    assert.ok(attachedPaths.every((value) => path.basename(value).startsWith('.harness-')));
     assert.match(calls[1]!.join(' '), /previous response did not satisfy/i);
     assert.match(await readFile(assessment.resultPath, 'utf8'), /hypothesis-compliance/);
+    assert.ok(
+      (await Promise.all(attachedPaths.map(async (value) => await stat(value).catch(() => null)))).every(
+        (value) => value === null,
+      ),
+    );
     await assert.rejects(
       runner.assessHypothesisCompliance(
         variant,
@@ -401,6 +431,54 @@ test('hypothesis compliance reviewer binds its unverified verdict to patch and m
         directory,
       ),
       /falsification check cannot be not_applicable/,
+    );
+
+    const tamperingRunner = new AgentRunner(
+      campaign,
+      async (command, args): Promise<CommandResult> => {
+        const attachmentIndex = args.indexOf('--file');
+        await writeFile(args[attachmentIndex + 1]!, 'tampered attachment');
+        return {
+          command,
+          args: [...args],
+          exitCode: 0,
+          stdout: JSON.stringify(output),
+          stderr: '',
+          durationMs: 1,
+        };
+      },
+    );
+    await assert.rejects(
+      tamperingRunner.assessHypothesisCompliance(
+        variant,
+        patchPath,
+        mutationContextPath,
+        directory,
+        directory,
+      ),
+      /agent modified a local immutable attachment/,
+    );
+    const { codeRegression: _codeRegression, ...legacyOutput } = output;
+    const legacyRunner = new AgentRunner(
+      campaign,
+      async (command, args): Promise<CommandResult> => ({
+        command,
+        args: [...args],
+        exitCode: 0,
+        stdout: JSON.stringify({ ...legacyOutput, schemaVersion: 1 }),
+        stderr: '',
+        durationMs: 1,
+      }),
+    );
+    await assert.rejects(
+      legacyRunner.assessHypothesisCompliance(
+        variant,
+        patchPath,
+        mutationContextPath,
+        directory,
+        directory,
+      ),
+      /agent returned invalid structured output/,
     );
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -536,7 +614,7 @@ test('diagnostician archives strict cited unverified output and mutator receives
     } as VariantRecord;
     await runner.mutate(variant, directory, directory, contextPath);
     const mutatorCall = calls[2]!.join(' ');
-    assert.match(mutatorCall, /mutation-context\.json/);
+    assert.match(mutatorCall, /harness-mutation-context/);
     assert.match(mutatorCall, /unverified model interpretation/);
     assert.doesNotMatch(mutatorCall, /raw log/i);
   } finally {

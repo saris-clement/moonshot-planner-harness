@@ -6,6 +6,7 @@ import {
   DiagnosisProvenanceSchema,
   HypothesisSchema,
   HypothesisComplianceOutputSchema,
+  HypothesisComplianceOutputV2Schema,
   TargetExcludedConfigSchema,
   type BenchmarkQuestionResolution,
   type QuestionResolutionEntry,
@@ -291,7 +292,7 @@ test('diagnosis and strategist handoff schemas are strict and provenance-explici
 test('hypothesis compliance passes only when intervention and falsification checks are satisfied', () => {
   const output = {
     kind: 'ainative-planner-eval/hypothesis-compliance' as const,
-    schemaVersion: 1 as const,
+    schemaVersion: 2 as const,
     interpretationStatus: 'unverified_model_judgment' as const,
     variantId: 'campaign-v001',
     patchSha256: `sha256:${'a'.repeat(64)}`,
@@ -302,6 +303,11 @@ test('hypothesis compliance passes only when intervention and falsification chec
       status: 'satisfied' as const,
       rationale: 'Runtime code changes the cited mechanism.',
       evidence: ['server/src/policy.ts:12'],
+    },
+    codeRegression: {
+      status: 'satisfied' as const,
+      rationale: 'The patch tests its deterministic positive and negative boundary.',
+      evidence: ['server/test/policy.test.ts:40'],
     },
     falsificationTest: {
       status: 'satisfied' as const,
@@ -319,11 +325,42 @@ test('hypothesis compliance passes only when intervention and falsification chec
     false,
   );
   assert.equal(
+    HypothesisComplianceOutputV2Schema.safeParse({
+      ...output,
+      status: 'passed',
+      codeRegression: { ...output.codeRegression, status: 'not_satisfied' },
+    }).success,
+    false,
+  );
+  assert.equal(
+    HypothesisComplianceOutputSchema.safeParse({
+      ...output,
+      codeRegression: { ...output.codeRegression, status: 'uncertain' },
+    }).success,
+    false,
+  );
+  assert.equal(
     HypothesisComplianceOutputSchema.safeParse({
       ...output,
       status: 'failed',
       falsificationTest: { ...output.falsificationTest, status: 'not_satisfied' },
     }).success,
     true,
+  );
+  assert.equal(
+    HypothesisComplianceOutputSchema.parse({
+      ...output,
+      falsificationTest: {
+        ...output.falsificationTest,
+        status: 'deferred_to_evaluation',
+        rationale: 'Repeated frozen-cohort outcomes are measured by the harness after preflight.',
+      },
+    }).status,
+    'passed',
+  );
+  const { codeRegression: _codeRegression, ...legacy } = output;
+  assert.equal(
+    HypothesisComplianceOutputSchema.parse({ ...legacy, schemaVersion: 1 }).schemaVersion,
+    1,
   );
 });

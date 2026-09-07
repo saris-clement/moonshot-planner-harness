@@ -3056,6 +3056,8 @@ export class CampaignOrchestrator {
           mutationContextSha256,
           resultSha256,
           intervention: verified.intervention.status,
+          codeRegression:
+            'codeRegression' in verified ? verified.codeRegression.status : 'legacy_not_recorded',
           falsificationTest: verified.falsificationTest.status,
         },
       );

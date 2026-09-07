@@ -156,7 +156,7 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
       hypothesisComplianceResultHash: `sha256:${'2'.repeat(64)}`,
       hypothesisCompliance: {
         kind: 'ainative-planner-eval/hypothesis-compliance',
-        schemaVersion: 1,
+        schemaVersion: 2,
         interpretationStatus: 'unverified_model_judgment',
         variantId: created.id,
         patchSha256: `sha256:${'1'.repeat(64)}`,
@@ -167,6 +167,11 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
           status: 'satisfied',
           rationale: 'Runtime code changes the cited mechanism.',
           evidence: ['server/src/policy.ts:12'],
+        },
+        codeRegression: {
+          status: 'satisfied',
+          rationale: 'The deterministic boundary has positive and negative coverage.',
+          evidence: ['server/test/policy.test.ts:40'],
         },
         falsificationTest: {
           status: 'satisfied',
@@ -194,6 +199,7 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
     assert.match(report, /## Hypothesis Compliance Preflight/);
     assert.match(report, /unverified model judgment/i);
     assert.match(report, /Runtime code changes the cited mechanism/);
+    assert.match(report, /### Code Regression/);
     assert.match(report, /Cumulative candidate patch hash: `sha256:4444/);
     assert.match(report, /does not contribute to numeric scoring/);
     assert.match(report, /The baseline plan below is harness-authored/);

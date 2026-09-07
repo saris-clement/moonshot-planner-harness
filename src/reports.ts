@@ -241,6 +241,8 @@ ${quote(result.summary)}
 
 ${renderCheck('Intervention', result.intervention)}
 
+${'codeRegression' in result ? renderCheck('Code Regression', result.codeRegression) : '### Code Regression\n\nStatus: `legacy_not_recorded`'}
+
 ${renderCheck('Falsification Test', result.falsificationTest)}
 
 Limitations:
@@ -907,6 +909,10 @@ export async function writeAgentHistory(
         interpretationStatus: variant.hypothesisCompliance?.interpretationStatus ?? null,
         summary: variant.hypothesisCompliance?.summary ?? null,
         intervention: variant.hypothesisCompliance?.intervention ?? null,
+        codeRegression:
+          variant.hypothesisCompliance && 'codeRegression' in variant.hypothesisCompliance
+            ? variant.hypothesisCompliance.codeRegression
+            : null,
         falsificationTest: variant.hypothesisCompliance?.falsificationTest ?? null,
         limitations: variant.hypothesisCompliance?.limitations ?? [],
         error: variant.hypothesisComplianceError,

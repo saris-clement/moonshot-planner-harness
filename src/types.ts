@@ -280,7 +280,7 @@ const HypothesisComplianceCheckSchema = z
   })
   .strict();
 
-const HypothesisFalsificationCheckSchema = z
+const LegacyHypothesisFalsificationCheckSchema = z
   .object({
     status: z.enum(['satisfied', 'not_satisfied', 'uncertain', 'not_applicable']),
     rationale: z.string().min(1).max(4_000),
@@ -288,34 +288,79 @@ const HypothesisFalsificationCheckSchema = z
   })
   .strict();
 
-export const HypothesisComplianceOutputSchema = z
+const HypothesisFalsificationCheckSchema = LegacyHypothesisFalsificationCheckSchema.extend({
+  status: z.enum([
+    'satisfied',
+    'deferred_to_evaluation',
+    'not_satisfied',
+    'uncertain',
+    'not_applicable',
+  ]),
+}).strict();
+
+const HypothesisComplianceFields = {
+  kind: z.literal('ainative-planner-eval/hypothesis-compliance'),
+  interpretationStatus: z.literal('unverified_model_judgment'),
+  variantId: z.string().min(1).max(256),
+  patchSha256: Sha256Schema,
+  mutationContextSha256: Sha256Schema,
+  status: z.enum(['passed', 'failed']),
+  summary: z.string().min(1).max(8_000),
+  intervention: HypothesisComplianceCheckSchema,
+  limitations: z.array(z.string().min(1).max(2_000)).min(1).max(50),
+};
+
+const HypothesisComplianceOutputV1Schema = z
   .object({
-    kind: z.literal('ainative-planner-eval/hypothesis-compliance'),
+    ...HypothesisComplianceFields,
     schemaVersion: z.literal(1),
-    interpretationStatus: z.literal('unverified_model_judgment'),
-    variantId: z.string().min(1).max(256),
-    patchSha256: Sha256Schema,
-    mutationContextSha256: Sha256Schema,
-    status: z.enum(['passed', 'failed']),
-    summary: z.string().min(1).max(8_000),
-    intervention: HypothesisComplianceCheckSchema,
+    falsificationTest: LegacyHypothesisFalsificationCheckSchema,
+  })
+  .strict();
+
+export const HypothesisComplianceOutputV2Schema = z
+  .object({
+    ...HypothesisComplianceFields,
+    schemaVersion: z.literal(2),
+    codeRegression: HypothesisComplianceCheckSchema,
     falsificationTest: HypothesisFalsificationCheckSchema,
-    limitations: z.array(z.string().min(1).max(2_000)).min(1).max(50),
   })
   .strict()
   .superRefine((output, context) => {
     const checksPass =
       output.intervention.status === 'satisfied' &&
-      ['satisfied', 'not_applicable'].includes(output.falsificationTest.status);
+      output.codeRegression.status === 'satisfied' &&
+      ['satisfied', 'deferred_to_evaluation', 'not_applicable'].includes(
+        output.falsificationTest.status,
+      );
     if ((output.status === 'passed') !== checksPass) {
       context.addIssue({
         code: 'custom',
         path: ['status'],
-        message: 'overall compliance status must agree with the intervention and falsification checks',
+        message: 'overall compliance status must agree with all compliance checks',
+      });
+    }
+  });
+
+export const HypothesisComplianceOutputSchema = z
+  .union([HypothesisComplianceOutputV1Schema, HypothesisComplianceOutputV2Schema])
+  .superRefine((output, context) => {
+    const checksPass =
+      output.intervention.status === 'satisfied' &&
+      (output.schemaVersion === 1 || output.codeRegression.status === 'satisfied') &&
+      ['satisfied', 'deferred_to_evaluation', 'not_applicable'].includes(
+        output.falsificationTest.status,
+      );
+    if ((output.status === 'passed') !== checksPass) {
+      context.addIssue({
+        code: 'custom',
+        path: ['status'],
+        message: 'overall compliance status must agree with all compliance checks',
       });
     }
   });
 export type HypothesisComplianceOutput = z.infer<typeof HypothesisComplianceOutputSchema>;
+export type HypothesisComplianceOutputV2 = z.infer<typeof HypothesisComplianceOutputV2Schema>;
 
 export const HypothesisComplianceStatusSchema = z.enum([
   'not_required',

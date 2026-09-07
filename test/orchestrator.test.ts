@@ -1080,7 +1080,7 @@ test('hypothesis compliance preflight persists its patch-bound verdict and fails
     const assessment = async (variant: VariantRecord, status: 'passed' | 'failed') => {
       const result = {
         kind: 'ainative-planner-eval/hypothesis-compliance',
-        schemaVersion: 1,
+        schemaVersion: 2,
         interpretationStatus: 'unverified_model_judgment',
         variantId: variant.id,
         patchSha256,
@@ -1091,6 +1091,11 @@ test('hypothesis compliance preflight persists its patch-bound verdict and fails
           status: 'satisfied',
           rationale: 'Runtime code changes the intended policy.',
           evidence: ['server/src/policy.ts:1'],
+        },
+        codeRegression: {
+          status: 'satisfied',
+          rationale: 'The patch covers its deterministic boundary.',
+          evidence: ['server/test/policy.test.ts:1'],
         },
         falsificationTest: {
           status: status === 'passed' ? 'not_applicable' : 'not_satisfied',
