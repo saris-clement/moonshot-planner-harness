@@ -2134,6 +2134,8 @@ test('incomplete archive mode abandons after collection failure when reattach an
       status: 'running',
       artifactCollectionComplete: false,
     });
+    fixture.database.createTargetExcludedEvaluation(fixture.campaign.id, variant.id);
+    fixture.database.updateTargetExcludedEvaluation(variant.id, { status: 'running' });
     let stopped = false;
     const internal = new CampaignOrchestrator(
       fixture.paths,
@@ -2172,6 +2174,9 @@ test('incomplete archive mode abandons after collection failure when reattach an
     assert.equal(archived.status, 'failed');
     assert.equal(archived.artifactCollectionComplete, false);
     assert.match(archived.error ?? '', /collection failed/);
+    const target = fixture.database.getTargetExcludedEvaluation(variant.id);
+    assert.equal(target?.status, 'failed');
+    assert.match(target?.error ?? '', /archived before target evaluation completed/);
     assert.equal(await readFile(marker, 'utf8'), 'partial archive\n');
   } finally {
     fixture.database.close();

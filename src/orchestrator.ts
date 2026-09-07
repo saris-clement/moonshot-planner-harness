@@ -1257,9 +1257,18 @@ export class CampaignOrchestrator {
           }
         : {}),
     });
-    if (this.database.getTargetExcludedEvaluation(variant.id)) {
+    const targetEvaluation = this.database.getTargetExcludedEvaluation(variant.id);
+    if (targetEvaluation) {
       this.database.updateTargetExcludedEvaluation(variant.id, {
         artifactCollectionComplete: collectionComplete,
+        ...(targetEvaluation.status === 'completed'
+          ? {}
+          : {
+              status: 'failed',
+              error:
+                targetEvaluation.error ??
+                'interrupted integrated stack was archived before target evaluation completed',
+            }),
       });
     }
     if (!abandoned && (failure || !collectionComplete)) {
