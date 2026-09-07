@@ -35,6 +35,10 @@ function signedDelta(value: number | null, baseline: number | null, percent = fa
   return delta > 0 ? `+${rendered}` : rendered;
 }
 
+function usesStandardPrimaryControl(campaign: CampaignRecord): boolean {
+  return campaign.config.targetExcluded?.protocol === 'standard-primary-v2';
+}
+
 function renderAssumptions(variant: VariantRecord, parent?: VariantRecord | null): string {
   if (variant.hypothesis.assumptions.length === 0) {
     return 'No explicit assumptions were captured for this legacy hypothesis.';
@@ -109,15 +113,36 @@ ${metrics
     .join('\n')}`;
 }
 
-function renderArms(variant: VariantRecord, targetExcluded?: TargetExcludedEvaluationRecord | null): string {
+function renderArms(
+  campaign: CampaignRecord,
+  variant: VariantRecord,
+  targetExcluded?: TargetExcludedEvaluationRecord | null,
+): string {
+  const standardPrimaryControl = Boolean(targetExcluded && usesStandardPrimaryControl(campaign));
   const rows: Array<[string, string, VariantRecord['facts']]> = [
-    ['Standard', variant.facts ? 'measured' : 'pending', variant.facts],
+    [
+      standardPrimaryControl ? 'Standard primary (comparison control)' : 'Standard',
+      standardPrimaryControl
+        ? 'reference (standard measurement)'
+        : variant.facts
+          ? 'measured'
+          : 'pending',
+      variant.facts,
+    ],
   ];
   if (targetExcluded) {
-    rows.push(
-      ['Target-safe control', targetExcluded.controlFacts ? 'measured' : targetExcluded.status, targetExcluded.controlFacts],
-      ['Target-excluded', targetExcluded.excludedFacts ? 'measured' : targetExcluded.status, targetExcluded.excludedFacts],
-    );
+    if (!standardPrimaryControl) {
+      rows.push([
+        'Target-safe control',
+        targetExcluded.controlFacts ? 'measured' : targetExcluded.status,
+        targetExcluded.controlFacts,
+      ]);
+    }
+    rows.push([
+      'Target-excluded',
+      targetExcluded.excludedFacts ? 'measured' : targetExcluded.status,
+      targetExcluded.excludedFacts,
+    ]);
   }
   return `| Arm | Status | Units | Build | Reuse | Extend | Defer | Question | Agreement |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -128,7 +153,7 @@ ${rows
     )
     .join('\n')}
 
-${targetExcluded ? 'The control and excluded arms use the same target-safe pack. The excluded arm is a promotion guard, not a fitness reward.' : 'No target-safe control or target-excluded result is available for this experiment.'}`;
+${targetExcluded ? standardPrimaryControl ? 'The standard primary measurement is referenced as comparison normal. No additional control execution was run. The excluded arm is a promotion guard, not a fitness reward.' : 'The control and excluded arms use the same target-safe pack. The excluded arm is a promotion guard, not a fitness reward.' : 'No target-safe control or target-excluded result is available for this experiment.'}`;
 }
 
 function renderConclusion(
@@ -136,6 +161,7 @@ function renderConclusion(
   parent?: VariantRecord | null,
   targetExcluded?: TargetExcludedEvaluationRecord | null,
   labels: readonly LabelRecord[] = [],
+  standardPrimaryControl = false,
 ): string {
   if (!variant.facts) {
     return `Status: \`pending\`\n\nNo measured conclusion is available while the experiment is ${variant.status}.`;
@@ -169,7 +195,9 @@ function renderConclusion(
     statements.push(
       targetExcluded.status === 'completed'
         ? `The target-excluded promotion guard is ${targetExcluded.gate?.status ?? 'pending'}.`
-        : `The target-safe control and target-excluded comparison is ${targetExcluded.status}; the conclusion is incomplete until it finishes.`,
+        : standardPrimaryControl
+          ? `The standard-primary reference and target-excluded comparison is ${targetExcluded.status}; the conclusion is incomplete until it finishes.`
+          : `The target-safe control and target-excluded comparison is ${targetExcluded.status}; the conclusion is incomplete until it finishes.`,
     );
   }
   return `Status: \`${variant.status === 'failed' ? 'failed' : 'measured'}\`\n\n${statements.join('\n\n')}`;
@@ -248,6 +276,77 @@ async function readHumanNotes(filePath: string): Promise<string | null> {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw error;
   }
+}
+
+function renderTargetExcludedGuard(
+  campaign: CampaignRecord,
+  targetExcluded?: TargetExcludedEvaluationRecord | null,
+): string {
+  if (!targetExcluded) return 'Not configured or not run for this variant.';
+  const decisions = (facts: TargetExcludedEvaluationRecord['excludedFacts']): string =>
+    facts
+      ? `build=${facts.decisions.build}, reuse=${facts.decisions.reuse}, extend=${facts.decisions.extend}, defer=${facts.decisions.defer}, question=${facts.decisions.question}`
+      : 'unavailable';
+  const standardPrimaryControl = usesStandardPrimaryControl(campaign);
+  const binding = targetExcluded.normalArmBinding;
+  const comparisonCase = (caseId: string | null): string => caseId ?? 'unavailable';
+  const comparisonCases =
+    targetExcluded.comparisons
+      ?.map(
+        ({ replicate, normalCaseId, excludedCaseId, normalRunId, excludedRunId }) =>
+          `replicate ${replicate}: normal case \`${comparisonCase(normalCaseId)}\` run \`${comparisonCase(normalRunId)}\`, excluded case \`${comparisonCase(excludedCaseId)}\` run \`${comparisonCase(excludedRunId)}\``,
+      )
+      .join('; ') || 'unavailable';
+  const armDetails = standardPrimaryControl
+    ? `Protocol: \`standard-primary-v2\`
+
+Standard primary (comparison control) reference: ${
+        binding
+          ? `benchmark \`${binding.benchmark}\`, resolved artifact \`${binding.resolvedArtifactSha}\`, lineage ${binding.replicates.map(({ replicate, caseId, runId }) => `replicate ${replicate} case \`${caseId}\` run \`${runId}\``).join('; ')}`
+          : 'unavailable'
+      }
+
+No additional control execution was run; the standard primary measurement is reused as comparison normal.
+
+Excluded decisions: ${decisions(targetExcluded.excludedFacts)}`
+    : `Control decisions: ${decisions(targetExcluded.controlFacts)}
+
+Excluded decisions: ${decisions(targetExcluded.excludedFacts)}`;
+  const questions =
+    targetExcluded.questionResolution?.entries
+      .filter((entry) => entry.arm)
+      .map(
+        (entry) =>
+          `- ${entry.arm}: ${markdown(entry.question)} -> ${markdown(entry.answer)} (${entry.resolution})`,
+      )
+      .join('\n') || 'No target-arm runtime question was recorded.';
+  return `Status: \`${targetExcluded.status}\`
+
+Gate: \`${targetExcluded.gate?.status ?? 'pending'}\`
+
+Baseline mean build rate: ${percentage(targetExcluded.gate?.baselineMeanBuildRate ?? null)}
+
+Candidate mean build rate: ${percentage(targetExcluded.gate?.candidateMeanBuildRate ?? null)}
+
+Build-rate drop: ${percentage(targetExcluded.gate?.buildDropRatio ?? null)}
+
+Pair validity: ${targetExcluded.comparisons?.length && targetExcluded.comparisons.every((comparison) => comparison.valid) ? 'valid' : 'invalid or pending'}
+
+Leakage paths: ${targetExcluded.comparisons?.reduce((total, comparison) => total + comparison.leakagePaths.length, 0) ?? 0}
+
+${armDetails}
+
+Comparison lineage: ${comparisonCases}
+
+Comparison mismatches: ${targetExcluded.comparisons?.flatMap((comparison) => comparison.mismatches).join('; ') || 'none'}
+
+Recorded error: ${targetExcluded.error ? `\`${markdown(targetExcluded.error)}\`` : 'none'}
+
+Target-arm questions: ${targetExcluded.questionResolution?.plannerQuestions ?? 0}
+
+${questions}
+
+This arm is a promotion guard, not a fitness reward. Target-blind labels and suggestions remain separate from normal evaluation truth.`;
 }
 
 async function readHistoricalExperiments(experimentsRoot: string): Promise<Array<Record<string, unknown>>> {
@@ -394,6 +493,7 @@ export async function writeVariantReport(
     `${variant.id}.md`,
   );
   const humanNotes = await readHumanNotes(humanNotesPath);
+  const standardPrimaryControl = usesStandardPrimaryControl(campaign);
   const output = `# ${markdown(variant.hypothesis.title)}
 
 ## Goal
@@ -477,11 +577,11 @@ ${decisionRows}
 
 ## Experiment Arms
 
-${renderArms(variant, targetExcluded)}
+${renderArms(campaign, variant, targetExcluded)}
 
 ## Conclusion
 
-${renderConclusion(variant, parent, targetExcluded, labels)}
+${renderConclusion(variant, parent, targetExcluded, labels, standardPrimaryControl)}
 
 ## LLM Suggestion
 
@@ -517,11 +617,13 @@ ${
 | Requirements-agent requests | ${resolution.requirementsAgentRequests} |
 | Requirements-agent answers | ${resolution.requirementsAgentAnswers} |
 | Source fallback answers | ${resolution.sourceFallbackAnswers} |
+| PM-simulation answers | ${resolution.pmSimulationAnswers ?? 0} |
 | Reused campaign answers | ${resolution.reusedAnswers} |
 | Planner questions | ${resolution.plannerQuestions} |
 | Planner requirements-agent requests | ${resolution.plannerRequirementsAgentRequests} |
 | Planner requirements-agent answers | ${resolution.plannerRequirementsAgentAnswers} |
 | Planner source fallback answers | ${resolution.plannerSourceFallbackAnswers} |
+| Planner PM-simulation answers | ${resolution.plannerPmSimulationAnswers ?? 0} |
 | Planner reused answers | ${resolution.plannerReusedAnswers} |
 | Planner human answers | ${resolution.plannerHumanAnswers ?? 0} |
 
@@ -534,7 +636,7 @@ ${
 
 Resolution: \`${entry.resolution}\`
 
-Question:
+${entry.resolution === 'pm_simulation' ? 'Authority: `unverified_pm_simulation`\n\nThis answer is simulated PM input, not human-verified authority.\n\n' : ''}Question:
 ${quote(entry.question)}
 
 Answer:
@@ -565,44 +667,7 @@ ${
 
 ## Target-Excluded Guard
 
-${
-  targetExcluded
-    ? `Status: \`${targetExcluded.status}\`
-
-Gate: \`${targetExcluded.gate?.status ?? 'pending'}\`
-
-Baseline mean build rate: ${percentage(targetExcluded.gate?.baselineMeanBuildRate ?? null)}
-
-Candidate mean build rate: ${percentage(targetExcluded.gate?.candidateMeanBuildRate ?? null)}
-
-Build-rate drop: ${percentage(targetExcluded.gate?.buildDropRatio ?? null)}
-
-Pair validity: ${targetExcluded.comparisons?.length && targetExcluded.comparisons.every((comparison) => comparison.valid) ? 'valid' : 'invalid or pending'}
-
-Leakage paths: ${targetExcluded.comparisons?.reduce((total, comparison) => total + comparison.leakagePaths.length, 0) ?? 0}
-
-Control decisions: ${targetExcluded.controlFacts ? `build=${targetExcluded.controlFacts.decisions.build}, reuse=${targetExcluded.controlFacts.decisions.reuse}, extend=${targetExcluded.controlFacts.decisions.extend}, defer=${targetExcluded.controlFacts.decisions.defer}, question=${targetExcluded.controlFacts.decisions.question}` : 'unavailable'}
-
-Excluded decisions: ${targetExcluded.excludedFacts ? `build=${targetExcluded.excludedFacts.decisions.build}, reuse=${targetExcluded.excludedFacts.decisions.reuse}, extend=${targetExcluded.excludedFacts.decisions.extend}, defer=${targetExcluded.excludedFacts.decisions.defer}, question=${targetExcluded.excludedFacts.decisions.question}` : 'unavailable'}
-
-Comparison mismatches: ${targetExcluded.comparisons?.flatMap((comparison) => comparison.mismatches).join('; ') || 'none'}
-
-Recorded error: ${targetExcluded.error ? `\`${markdown(targetExcluded.error)}\`` : 'none'}
-
-Target-arm questions: ${targetExcluded.questionResolution?.plannerQuestions ?? 0}
-
-${
-  targetExcluded.questionResolution?.entries
-    .filter((entry) => entry.arm)
-    .map(
-      (entry) => `- ${entry.arm}: ${markdown(entry.question)} -> ${markdown(entry.answer)} (${entry.resolution})`,
-    )
-    .join('\n') || 'No target-arm runtime question was recorded.'
-}
-
-This arm is a promotion guard, not a fitness reward. Target-blind labels and suggestions remain separate from normal evaluation truth.`
-    : 'Not configured or not run for this variant.'
-}
+${renderTargetExcludedGuard(campaign, targetExcluded)}
 
 ## Failure
 
@@ -775,14 +840,61 @@ export async function writeAgentHistory(
       ),
       targetExcluded: (() => {
         const evaluation = targetEvaluations.find((item) => item.variantId === variant.id);
-        return evaluation
+        if (!evaluation) return null;
+        return usesStandardPrimaryControl(campaign)
           ? {
+              protocol: 'standard-primary-v2' as const,
               status: evaluation.status,
               artifactCollectionComplete: evaluation.artifactCollectionComplete,
               gate: evaluation.gate,
               comparisons: evaluation.comparisons?.map(
-                ({ replicate, valid, mismatches, leakagePaths, reportHash }) => ({
+                ({
                   replicate,
+                  normalCaseId,
+                  excludedCaseId,
+                  normalRunId,
+                  excludedRunId,
+                  valid,
+                  mismatches,
+                  leakagePaths,
+                  reportHash,
+                }) => ({
+                  replicate,
+                  normalCaseId: normalCaseId ?? null,
+                  excludedCaseId: excludedCaseId ?? null,
+                  normalRunId: normalRunId ?? null,
+                  excludedRunId: excludedRunId ?? null,
+                  valid,
+                  mismatches,
+                  leakagePaths,
+                  reportHash,
+                }),
+              ),
+              normalArmBinding: evaluation.normalArmBinding,
+              excludedDecisions: evaluation.excludedFacts?.decisions ?? null,
+              score: evaluation.score,
+            }
+          : {
+              status: evaluation.status,
+              artifactCollectionComplete: evaluation.artifactCollectionComplete,
+              gate: evaluation.gate,
+              comparisons: evaluation.comparisons?.map(
+                ({
+                  replicate,
+                  normalCaseId,
+                  excludedCaseId,
+                  normalRunId,
+                  excludedRunId,
+                  valid,
+                  mismatches,
+                  leakagePaths,
+                  reportHash,
+                }) => ({
+                  replicate,
+                  normalCaseId: normalCaseId ?? null,
+                  excludedCaseId: excludedCaseId ?? null,
+                  normalRunId: normalRunId ?? null,
+                  excludedRunId: excludedRunId ?? null,
                   valid,
                   mismatches,
                   leakagePaths,
@@ -792,8 +904,7 @@ export async function writeAgentHistory(
               controlDecisions: evaluation.controlFacts?.decisions ?? null,
               excludedDecisions: evaluation.excludedFacts?.decisions ?? null,
               score: evaluation.score,
-            }
-          : null;
+            };
       })(),
       error: variant.error,
     })),

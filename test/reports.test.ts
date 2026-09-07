@@ -7,7 +7,11 @@ import test from 'node:test';
 import { HarnessDatabase } from '../src/db.js';
 import type { HarnessPaths } from '../src/paths.js';
 import { writeAgentHistory, writeVariantReport } from '../src/reports.js';
-import { CampaignConfigSchema, type RunFacts } from '../src/types.js';
+import {
+  CampaignConfigSchema,
+  type RunFacts,
+  type TargetNormalArmBinding,
+} from '../src/types.js';
 
 const runFacts: RunFacts = {
   status: 'completed',
@@ -401,6 +405,346 @@ test('experiment Markdown records the planned change, evidence-backed conclusion
       await readFile(notesPath, 'utf8'),
       '  Reviewer note: inspect the rejected evidence cohort.\n',
     );
+  } finally {
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('reports count PM-simulation answers and preserve their unverified provenance in history', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'planner-reports-pm-simulation-'));
+  const paths: HarnessPaths = {
+    root,
+    database: path.join(root, 'harness.sqlite'),
+    campaigns: path.join(root, 'campaigns'),
+    worktrees: path.join(root, 'worktrees'),
+    artifacts: path.join(root, 'artifacts'),
+    reports: path.join(root, 'reports'),
+  };
+  await Promise.all([mkdir(paths.reports), mkdir(paths.campaigns)]);
+  const database = new HarnessDatabase(paths.database);
+  try {
+    const config = CampaignConfigSchema.parse({
+      id: 'report-pm-simulation',
+      goal: 'Keep synthetic PM answers distinct from human-verified planning authority.',
+      plannerRepo: root,
+      workflowsRepo: root,
+      environmentFile: path.join(root, 'environment.env'),
+      seedRevision: 'seed',
+      workflowsRevision: 'workflows',
+      benchmarks: [
+        { name: 'primary-pack', role: 'primary', zipPath: path.join(root, 'primary.zip') },
+        { name: 'holdout-pack', role: 'holdout', zipPath: path.join(root, 'holdout.zip') },
+      ],
+    });
+    const campaign = database.createCampaign(
+      config,
+      'a'.repeat(40),
+      'b'.repeat(40),
+      `sha256:${'c'.repeat(64)}`,
+      'https://example.invalid/workflows.git',
+    );
+    const baseResolution = {
+      derivationVersion: 2 as const,
+      originalArtifactSha: `sha256:${'d'.repeat(64)}`,
+      resolvedArtifactSha: `sha256:${'e'.repeat(64)}`,
+      blockingQuestions: 1,
+      requirementsAgentRequests: 0,
+      requirementsAgentAnswers: 0,
+      sourceFallbackAnswers: 0,
+      reusedAnswers: 0,
+      plannerQuestions: 0,
+      plannerRequirementsAgentRequests: 0,
+      plannerRequirementsAgentAnswers: 0,
+      plannerSourceFallbackAnswers: 0,
+      plannerReusedAnswers: 0,
+    };
+    const pmEntry = {
+      id: 'question-pm-simulation',
+      question: 'Which behavior should this requirement assume?',
+      resolution: 'pm_simulation' as const,
+      answer: 'Assume the user confirms the proposed behavior.',
+      evidence: ['Synthetic PM simulation; not human-reviewed.'],
+    };
+    const variant = database.updateVariant(
+      database.createVariant({
+        id: 'report-pm-simulation-v000',
+        campaignId: campaign.id,
+        parentVariantId: null,
+        round: 0,
+        ordinal: 0,
+        hypothesis: {
+          title: 'Seed',
+          rationale: 'Observe.',
+          instructions: 'Do not edit.',
+          expectedImpact: 'Facts.',
+          risk: 'Variance.',
+          findingIds: [],
+        },
+      }).id,
+      {
+        status: 'review',
+        facts: runFacts,
+        replicateFacts: [runFacts],
+        artifactCollectionComplete: true,
+        questionResolutions: {
+          'primary-pack': {
+            ...baseResolution,
+            benchmark: 'primary-pack',
+            pmSimulationAnswers: 1,
+            entries: [pmEntry],
+          },
+          'holdout-pack': {
+            ...baseResolution,
+            benchmark: 'holdout-pack',
+            entries: [],
+          },
+        },
+      },
+    );
+
+    const report = await readFile(
+      await writeVariantReport(paths, campaign, variant, []),
+      'utf8',
+    );
+    assert.match(report, /### primary-pack[\s\S]*\| PM-simulation answers \| 1 \|/);
+    assert.match(report, /### holdout-pack[\s\S]*\| PM-simulation answers \| 0 \|/);
+    assert.match(report, /Resolution: `pm_simulation`/);
+    assert.match(report, /Authority: `unverified_pm_simulation`/);
+    assert.match(report, /not human-verified authority/);
+
+    const historyPath = path.join(paths.campaigns, 'pm-simulation-history.json');
+    await writeAgentHistory(historyPath, paths.reports, campaign, [variant], []);
+    const history = JSON.parse(await readFile(historyPath, 'utf8')) as {
+      variants: Array<{ questionResolutions: Record<string, unknown> }>;
+    };
+    const questionResolutions = history.variants[0]!.questionResolutions;
+    assert.match(JSON.stringify(questionResolutions), /"resolution":"pm_simulation"/);
+    assert.match(JSON.stringify(questionResolutions), /"pmSimulationAnswers":1/);
+    assert.doesNotMatch(JSON.stringify(questionResolutions), /human_verified/);
+  } finally {
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('target protocol reports and history distinguish dedicated control from standard-primary reuse', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'planner-reports-target-protocol-'));
+  const paths: HarnessPaths = {
+    root,
+    database: path.join(root, 'harness.sqlite'),
+    campaigns: path.join(root, 'campaigns'),
+    worktrees: path.join(root, 'worktrees'),
+    artifacts: path.join(root, 'artifacts'),
+    reports: path.join(root, 'reports'),
+  };
+  await Promise.all([mkdir(paths.reports), mkdir(paths.campaigns)]);
+  const database = new HarnessDatabase(paths.database);
+  try {
+    const createProtocolFixture = (
+      protocol: 'dedicated-control-v1' | 'standard-primary-v2',
+    ) => {
+      const suffix = protocol === 'standard-primary-v2' ? 'v2' : 'v1';
+      const config = CampaignConfigSchema.parse({
+        id: `report-target-${suffix}`,
+        goal: 'Keep target-excluded promotion evidence protocol-aware and non-duplicative.',
+        plannerRepo: root,
+        workflowsRepo: root,
+        environmentFile: path.join(root, 'environment.env'),
+        seedRevision: 'seed',
+        workflowsRevision: 'workflows',
+        evaluation:
+          protocol === 'standard-primary-v2'
+            ? { replicates: 2, replicateConcurrency: 2 }
+            : { replicates: 3, replicateConcurrency: 2 },
+        ...(protocol === 'standard-primary-v2'
+          ? {
+              targetExcluded: {
+                protocol,
+                targetImplementationWorkflow: 'generic/target',
+              },
+            }
+          : {}),
+        benchmarks: [
+          { name: 'primary-pack', role: 'primary', zipPath: path.join(root, 'primary.zip') },
+          { name: 'holdout-pack', role: 'holdout', zipPath: path.join(root, 'holdout.zip') },
+        ],
+      });
+      const campaign = database.createCampaign(
+        config,
+        'a'.repeat(40),
+        'b'.repeat(40),
+        `sha256:${'c'.repeat(64)}`,
+        'https://example.invalid/workflows.git',
+      );
+      const variant = database.updateVariant(
+        database.createVariant({
+          id: `${campaign.id}-v000`,
+          campaignId: campaign.id,
+          parentVariantId: null,
+          round: 0,
+          ordinal: 0,
+          hypothesis: {
+            title: 'Seed',
+            rationale: 'Observe.',
+            instructions: 'Do not edit.',
+            expectedImpact: 'Facts.',
+            risk: 'Variance.',
+            findingIds: [],
+          },
+        }).id,
+        {
+          status: 'review',
+          facts: runFacts,
+          replicateFacts:
+            protocol === 'standard-primary-v2'
+              ? [runFacts, runFacts]
+              : [runFacts, runFacts, runFacts],
+          artifactCollectionComplete: true,
+        },
+      );
+      database.createTargetExcludedEvaluation(campaign.id, variant.id);
+      const normalArmBinding: TargetNormalArmBinding | null =
+        protocol === 'standard-primary-v2'
+          ? {
+              source: 'standard_primary',
+              benchmark: 'primary-pack',
+              resolvedArtifactSha: `sha256:${'d'.repeat(64)}`,
+              replicates: [
+                { replicate: 1, caseId: 'standard-case-1', runId: 'standard-run-1' },
+                { replicate: 2, caseId: 'standard-case-2', runId: 'standard-run-2' },
+              ],
+            }
+          : null;
+      const score = {
+        cohortMismatches: [],
+        verified: { labeled: 1, correct: 1, errors: 0, accuracy: 1 },
+        provisional: { labeled: 0, correct: 0, errors: 0, accuracy: null },
+        decisionErrors: { build: 0, reuse: 0, extend: 0, defer: 0, question: 0 },
+      };
+      const gate = {
+        status: 'passed' as const,
+        baselineMeanBuildRate: 1,
+        candidateMeanBuildRate: 1,
+        buildDropRatio: 0,
+        reasons: [],
+      };
+      const targetExcluded = database.updateTargetExcludedEvaluation(variant.id, {
+        status: 'completed',
+        controlFacts: protocol === 'dedicated-control-v1' ? runFacts : null,
+        controlReplicateFacts:
+          protocol === 'dedicated-control-v1' ? [runFacts, runFacts] : null,
+        excludedFacts: runFacts,
+        excludedReplicateFacts: [runFacts, runFacts],
+        normalArmBinding,
+        score,
+        gate,
+        comparisons: [
+          {
+            replicate: 1,
+            normalCaseId: protocol === 'standard-primary-v2' ? `${suffix}-normal-case-1` : null,
+            excludedCaseId:
+              protocol === 'standard-primary-v2' ? `${suffix}-excluded-case-1` : null,
+            normalRunId: protocol === 'standard-primary-v2' ? `${suffix}-normal-run-1` : null,
+            excludedRunId:
+              protocol === 'standard-primary-v2' ? `${suffix}-excluded-run-1` : null,
+            valid: true,
+            mismatches: [],
+            leakagePaths: [],
+            reportHash: `sha256:${'e'.repeat(64)}`,
+          },
+        ],
+        artifactCollectionComplete: true,
+      });
+      return { campaign, variant, targetExcluded, normalArmBinding, score, gate };
+    };
+
+    const v1 = createProtocolFixture('dedicated-control-v1');
+    const v2 = createProtocolFixture('standard-primary-v2');
+    const v1Report = await readFile(
+      await writeVariantReport(paths, v1.campaign, v1.variant, [], v1.targetExcluded),
+      'utf8',
+    );
+    const v2Report = await readFile(
+      await writeVariantReport(paths, v2.campaign, v2.variant, [], v2.targetExcluded),
+      'utf8',
+    );
+
+    assert.match(v1Report, /\| Standard \| measured \|/);
+    assert.match(v1Report, /\| Target-safe control \| measured \|/);
+    assert.match(v1Report, /\| Target-excluded \| measured \|/);
+    assert.match(v1Report, /Control decisions: build=1/);
+    assert.match(v1Report, /The control and excluded arms use the same target-safe pack/);
+    assert.match(
+      v1Report,
+      /Comparison lineage: replicate 1: normal case `unavailable` run `unavailable`, excluded case `unavailable` run `unavailable`/,
+    );
+    assert.doesNotMatch(v1Report, /undefined/);
+
+    assert.match(
+      v2Report,
+      /\| Standard primary \(comparison control\) \| reference \(standard measurement\) \|/,
+    );
+    assert.match(v2Report, /\| Target-excluded \| measured \|/);
+    assert.doesNotMatch(v2Report, /\| Target-safe control \|/);
+    assert.doesNotMatch(v2Report, /Control decisions:/);
+    assert.match(v2Report, /No additional control execution was run/);
+    assert.match(v2Report, /Standard primary \(comparison control\) reference:/);
+    assert.match(v2Report, new RegExp(v2.normalArmBinding!.resolvedArtifactSha));
+    assert.match(v2Report, /v2-normal-case-1/);
+    assert.match(v2Report, /v2-excluded-case-1/);
+    assert.match(v2Report, /v2-normal-run-1/);
+    assert.match(v2Report, /v2-excluded-run-1/);
+
+    const v1HistoryPath = path.join(paths.campaigns, 'history-v1.json');
+    const v2HistoryPath = path.join(paths.campaigns, 'history-v2.json');
+    await writeAgentHistory(
+      v1HistoryPath,
+      paths.reports,
+      v1.campaign,
+      [v1.variant],
+      [],
+      [v1.targetExcluded],
+    );
+    await writeAgentHistory(
+      v2HistoryPath,
+      paths.reports,
+      v2.campaign,
+      [v2.variant],
+      [],
+      [v2.targetExcluded],
+    );
+    const v1History = JSON.parse(await readFile(v1HistoryPath, 'utf8')) as {
+      variants: Array<{ targetExcluded: Record<string, unknown> }>;
+    };
+    const v2History = JSON.parse(await readFile(v2HistoryPath, 'utf8')) as {
+      variants: Array<{ targetExcluded: Record<string, unknown> }>;
+    };
+    const v1Target = v1History.variants[0]!.targetExcluded;
+    const v2Target = v2History.variants[0]!.targetExcluded;
+    assert.deepEqual(v1Target.controlDecisions, runFacts.decisions);
+    assert.equal(Object.hasOwn(v1Target, 'protocol'), false);
+    assert.equal(Object.hasOwn(v2Target, 'controlDecisions'), false);
+    assert.equal(v2Target.protocol, 'standard-primary-v2');
+    assert.deepEqual(v2Target.normalArmBinding, v2.normalArmBinding);
+    assert.deepEqual(v1Target.comparisons, v1.targetExcluded.comparisons);
+    assert.deepEqual(v1Target.comparisons, [
+      {
+        replicate: 1,
+        normalCaseId: null,
+        excludedCaseId: null,
+        normalRunId: null,
+        excludedRunId: null,
+        valid: true,
+        mismatches: [],
+        leakagePaths: [],
+        reportHash: `sha256:${'e'.repeat(64)}`,
+      },
+    ]);
+    assert.doesNotMatch(JSON.stringify(v1Target), /undefined/);
+    assert.deepEqual(v2Target.comparisons, v2.targetExcluded.comparisons);
+    assert.deepEqual(v2Target.score, v2.score);
+    assert.deepEqual(v2Target.gate, v2.gate);
   } finally {
     database.close();
     await rm(root, { recursive: true, force: true });

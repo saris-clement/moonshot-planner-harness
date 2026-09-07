@@ -51,7 +51,7 @@ Risk: The matrix could overcompose unrelated fragments and create unsupported re
 | Variant | trumark-deceased-accounts-pr45c-v002 |
 | Parent | trumark-deceased-accounts-pr45c-v000 |
 | Round | 1 |
-| Status | starting |
+| Status | running |
 | Planner seed | `a0dac3ec7b416b27dd3b4260717cdfea7dd8232a` |
 | Workflows source | `27634f5226176003153c6ec2a3e1c579072ff7be` |
 | Environment | `sha256:24e705dace7c21ce1569d4cec477a5a392264b0f174c8f84929b98e475d3ff8d` |
@@ -112,14 +112,16 @@ Risk: The matrix could overcompose unrelated fragments and create unsupported re
 | Arm | Status | Units | Build | Reuse | Extend | Defer | Question | Agreement |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Standard | pending | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |
+| Target-safe control | waiting_for_input | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |
+| Target-excluded | waiting_for_input | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |
 
-No target-safe control or target-excluded result is available for this experiment.
+The control and excluded arms use the same target-safe pack. The excluded arm is a promotion guard, not a fitness reward.
 
 ## Conclusion
 
 Status: `pending`
 
-No measured conclusion is available while the experiment is starting.
+No measured conclusion is available while the experiment is running.
 
 ## LLM Suggestion
 
@@ -201,7 +203,35 @@ Not run for this variant.
 
 ## Target-Excluded Guard
 
-Not configured or not run for this variant.
+Status: `waiting_for_input`
+
+Gate: `pending`
+
+Baseline mean build rate: unscored
+
+Candidate mean build rate: unscored
+
+Build-rate drop: unscored
+
+Pair validity: invalid or pending
+
+Leakage paths: 0
+
+Control decisions: unavailable
+
+Excluded decisions: unavailable
+
+Comparison lineage: unavailable
+
+Comparison mismatches: none
+
+Recorded error: none
+
+Target-arm questions: 0
+
+No target-arm runtime question was recorded.
+
+This arm is a promotion guard, not a fitness reward. Target-blind labels and suggestions remain separate from normal evaluation truth.
 
 ## Failure
 
@@ -214,6 +244,7 @@ None recorded.
 | Frozen campaign inputs | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/campaigns/trumark-deceased-accounts-pr45c/campaign.json` | hash-pinned |
 | Current measured facts | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr45c/trumark-deceased-accounts-pr45c-v002/deceased-account/facts.json` | unavailable |
 | Parent measured facts | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr45c/trumark-deceased-accounts-pr45c-v000/deceased-account/facts.json` | archived |
+| Target-excluded comparisons | `deterministic_reconstruction` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr45c/trumark-deceased-accounts-pr45c-v002/target-excluded/comparisons/` | waiting_for_input |
 | Human labels | `human_verified` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/harness.sqlite` | 0 verified |
 
 ## Human Notes

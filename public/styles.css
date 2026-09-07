@@ -230,10 +230,13 @@ textarea { padding: 8px; resize: vertical; }
 .campaign-form .wide { grid-column: 1 / -1; }
 .campaign-form input, .campaign-form textarea { width: 100%; }
 .campaign-form textarea { min-height: 92px; }
+.field-help { color: var(--tertiary-foreground); font-size: 9px; font-weight: 500; line-height: 1.45; }
 .form-section { grid-column: 1 / -1; margin: 15px 0 -3px; padding-bottom: 6px; border-bottom: 1px solid var(--border); color: var(--foreground); font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
 .campaign-form .checkbox { display: flex; grid-template-columns: auto 1fr; align-items: center; padding-top: 9px; color: var(--foreground); }
 .campaign-form .checkbox input { width: 16px; min-height: 16px; }
 .form-actions { display: flex; justify-content: flex-end; gap: 7px; padding-top: 9px; border-top: 1px solid var(--border); }
+.target-run-table tbody .target-run-row-heading { position: static; padding: 8px 9px; border-bottom: 1px solid var(--border); background: var(--background); color: var(--foreground); font-size: 11px; letter-spacing: 0; text-transform: none; }
+.counterfactual-protocol-note { margin: -5px 0 16px; }
 
 .ledger-layout { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 24px; align-items: start; }
 .filter-rail { position: sticky; top: 64px; display: grid; gap: 10px; padding-right: 17px; border-right: 1px solid var(--border); }

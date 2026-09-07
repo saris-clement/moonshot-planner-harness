@@ -112,6 +112,7 @@ export function plannerQuestionsFromResponse(
       resolution:
         audit?.resolution === 'requirements_agent' ||
         audit?.resolution === 'source_fallback' ||
+        audit?.resolution === 'pm_simulation' ||
         audit?.resolution === 'reused_source_answer' ||
         audit?.resolution === 'human_answer'
           ? audit.resolution

@@ -10,8 +10,34 @@ const SlugSchema = z
   .max(64)
   .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
 
+const WorkflowKeySchema = z
+  .string()
+  .min(3)
+  .max(512)
+  .regex(/^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)+$/);
+
+const Sha256Schema = z.string().regex(/^sha256:[a-f0-9]{64}$/);
+
 export const DecisionSchema = z.enum(['build', 'reuse', 'extend', 'defer', 'question']);
 export type Decision = z.infer<typeof DecisionSchema>;
+
+export const TargetExcludedAnswerInputSchema = z
+  .object({
+    answer: z.string().min(1).max(20_000),
+    selectedOptionId: z.string().min(1).max(256).optional(),
+    benchmark: z.string().min(1).max(512).optional(),
+    replicate: z.number().int().positive().max(10).optional(),
+  })
+  .strict()
+  .superRefine((input, context) => {
+    if ((input.benchmark === undefined) !== (input.replicate === undefined)) {
+      context.addIssue({
+        code: 'custom',
+        message: 'benchmark and replicate must be supplied together',
+      });
+    }
+  });
+export type TargetExcludedAnswerInput = z.infer<typeof TargetExcludedAnswerInputSchema>;
 
 export const BenchmarkSchema = z.object({
   name: SlugSchema,
@@ -42,6 +68,13 @@ export const CampaignConfigSchema = z
       .refine((values) => new Set(values.map((value) => value.name)).size === values.length, {
         message: 'benchmark names must be unique',
       }),
+    targetExcluded: z
+      .object({
+        protocol: z.literal('standard-primary-v2'),
+        targetImplementationWorkflow: WorkflowKeySchema,
+      })
+      .strict()
+      .optional(),
     mode: z.enum(['supervised', 'automatic']).default('supervised'),
     evaluation: z
       .object({
@@ -55,7 +88,7 @@ export const CampaignConfigSchema = z
         concurrency: z.number().int().min(1).max(3).default(3),
         maxVariants: z.number().int().min(1).max(50).default(9),
         noImprovementRounds: z.number().int().min(1).max(10).default(2),
-        phase2TimeoutMs: z.number().int().min(60_000).default(36_000_000),
+        phase2TimeoutMs: z.number().int().min(60_000).default(43_200_000),
         stackReadyTimeoutMs: z.number().int().min(10_000).default(300_000),
         maxChangedFiles: z.number().int().min(1).default(20),
         maxChangedLines: z.number().int().min(1).default(2_000),
@@ -65,7 +98,7 @@ export const CampaignConfigSchema = z
         concurrency: 3,
         maxVariants: 9,
         noImprovementRounds: 2,
-        phase2TimeoutMs: 36_000_000,
+        phase2TimeoutMs: 43_200_000,
         stackReadyTimeoutMs: 300_000,
         maxChangedFiles: 20,
         maxChangedLines: 2_000,
@@ -138,28 +171,52 @@ export const CampaignConfigSchema = z
         allowedPathPrefixes: ['server/src/', 'server/test/'],
       }),
   })
-  .strict();
+  .strict()
+  .superRefine((config, context) => {
+    if (config.targetExcluded && config.evaluation.replicates !== 2) {
+      context.addIssue({
+        code: 'custom',
+        path: ['evaluation', 'replicates'],
+        message: 'standard-primary-v2 target exclusion requires exactly two evaluation replicates',
+      });
+    }
+  });
 export type CampaignConfigInput = z.input<typeof CampaignConfigSchema>;
 export type CampaignConfig = z.output<typeof CampaignConfigSchema>;
 
-const WorkflowKeySchema = z
-  .string()
-  .min(3)
-  .max(512)
-  .regex(/^[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)+$/);
+const TargetExcludedConfigFields = {
+  targetImplementationWorkflow: WorkflowKeySchema,
+  baselineVariantId: z.string().min(1).max(256),
+  comparatorImage: Sha256Schema,
+  configuredAt: z.string().datetime(),
+  replicates: z.literal(2).default(2),
+  concurrency: z.literal(2).default(2),
+  warningBuildDropRatio: z.literal(0.08).default(0.08),
+  blockBuildDropRatio: z.literal(0.15).default(0.15),
+};
 
-export const TargetExcludedConfigSchema = z
+const DedicatedControlV1ConfigSchema = z
   .object({
-    targetImplementationWorkflow: WorkflowKeySchema,
-    baselineVariantId: z.string().min(1).max(256),
-    comparatorImage: z.string().regex(/^sha256:[a-f0-9]{64}$/),
-    configuredAt: z.string().datetime(),
-    replicates: z.literal(2).default(2),
-    concurrency: z.literal(2).default(2),
-    warningBuildDropRatio: z.literal(0.08).default(0.08),
-    blockBuildDropRatio: z.literal(0.15).default(0.15),
+    protocol: z.literal('dedicated-control-v1').optional(),
+    ...TargetExcludedConfigFields,
+  })
+  .strict()
+  .transform((config) => ({ ...config, protocol: 'dedicated-control-v1' as const }));
+
+const StandardPrimaryV2ConfigSchema = z
+  .object({
+    protocol: z.literal('standard-primary-v2'),
+    normalArmSource: z.literal('standard_primary'),
+    primaryResolvedArtifactSha: Sha256Schema,
+    ...TargetExcludedConfigFields,
   })
   .strict();
+
+export const TargetExcludedConfigSchema = z.union([
+  DedicatedControlV1ConfigSchema,
+  StandardPrimaryV2ConfigSchema,
+]);
+export type TargetExcludedConfigInput = z.input<typeof TargetExcludedConfigSchema>;
 export type TargetExcludedConfig = z.output<typeof TargetExcludedConfigSchema>;
 
 export const HypothesisSchema = z
@@ -197,7 +254,6 @@ export const HypothesisSchema = z
 export type HypothesisInput = z.input<typeof HypothesisSchema>;
 export type Hypothesis = z.infer<typeof HypothesisSchema>;
 
-const Sha256Schema = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const RelativeArtifactPathSchema = z
   .string()
   .min(1)
@@ -368,6 +424,7 @@ export const DiagnosisInputSchema = z
           ),
         targetExcludedProtocol: z
           .object({
+            protocol: z.enum(['dedicated-control-v1', 'standard-primary-v2']).optional(),
             targetImplementationWorkflow: WorkflowKeySchema,
             baselineVariantId: z.string().min(1).max(256),
             comparatorImage: Sha256Schema,
@@ -376,6 +433,31 @@ export const DiagnosisInputSchema = z
             warningBuildDropRatio: z.literal(0.08),
             blockBuildDropRatio: z.literal(0.15),
             sourceManifestSha256: Sha256Schema.nullable(),
+            normalArmBinding: z
+              .object({
+                source: z.literal('standard_primary'),
+                benchmark: z.string().min(1).max(128),
+                resolvedArtifactSha: Sha256Schema,
+                replicates: z.tuple([
+                  z
+                    .object({
+                      replicate: z.literal(1),
+                      caseId: z.string().min(1).max(256),
+                      runId: z.string().min(1).max(256),
+                    })
+                    .strict(),
+                  z
+                    .object({
+                      replicate: z.literal(2),
+                      caseId: z.string().min(1).max(256),
+                      runId: z.string().min(1).max(256),
+                    })
+                    .strict(),
+                ]),
+              })
+              .strict()
+              .nullable()
+              .optional(),
           })
           .strict()
           .optional(),
@@ -587,8 +669,14 @@ export interface Score {
 export interface QuestionResolutionEntry {
   id: string;
   question: string;
-  resolution: 'requirements_agent' | 'source_fallback' | 'reused_source_answer' | 'human_answer';
+  resolution:
+    | 'requirements_agent'
+    | 'source_fallback'
+    | 'pm_simulation'
+    | 'reused_source_answer'
+    | 'human_answer';
   answer: string;
+  selectedOptionId?: string;
   evidence: string[];
   arm?: 'control' | 'excluded';
 }
@@ -602,11 +690,13 @@ export interface BenchmarkQuestionResolution {
   requirementsAgentRequests: number;
   requirementsAgentAnswers: number;
   sourceFallbackAnswers: number;
+  pmSimulationAnswers?: number;
   reusedAnswers: number;
   plannerQuestions: number;
   plannerRequirementsAgentRequests: number;
   plannerRequirementsAgentAnswers: number;
   plannerSourceFallbackAnswers: number;
+  plannerPmSimulationAnswers?: number;
   plannerReusedAnswers: number;
   plannerHumanAnswers?: number;
   entries: QuestionResolutionEntry[];
@@ -623,7 +713,13 @@ export interface RuntimeQuestionObservation {
   rationale: string;
   status: string;
   answer: string | null;
-  resolution: 'requirements_agent' | 'source_fallback' | 'reused_source_answer' | 'human_answer' | null;
+  resolution:
+    | 'requirements_agent'
+    | 'source_fallback'
+    | 'pm_simulation'
+    | 'reused_source_answer'
+    | 'human_answer'
+    | null;
   evidence: string[];
   createdAt: string | null;
   updatedAt: string | null;
@@ -666,6 +762,10 @@ export type TargetExcludedEvaluationStatus =
 
 export interface TargetExcludedComparison {
   replicate: number;
+  normalCaseId: string | null;
+  excludedCaseId: string | null;
+  normalRunId: string | null;
+  excludedRunId: string | null;
   valid: boolean;
   mismatches: string[];
   leakagePaths: string[];
@@ -679,6 +779,33 @@ export interface TargetExcludedGate {
   buildDropRatio: number | null;
   reasons: string[];
 }
+
+const TargetNormalArmIdSchema = z.string().min(1).max(256);
+
+export const TargetNormalArmBindingSchema = z
+  .object({
+    source: z.literal('standard_primary'),
+    benchmark: z.string().min(1).max(128),
+    resolvedArtifactSha: Sha256Schema,
+    replicates: z.tuple([
+      z
+        .object({
+          replicate: z.literal(1),
+          caseId: TargetNormalArmIdSchema,
+          runId: TargetNormalArmIdSchema,
+        })
+        .strict(),
+      z
+        .object({
+          replicate: z.literal(2),
+          caseId: TargetNormalArmIdSchema,
+          runId: TargetNormalArmIdSchema,
+        })
+        .strict(),
+    ]),
+  })
+  .strict();
+export type TargetNormalArmBinding = z.output<typeof TargetNormalArmBindingSchema>;
 
 export interface CampaignRecord {
   id: string;
@@ -750,6 +877,7 @@ export interface TargetExcludedEvaluationRecord {
   executionState: VariantExecutionState | null;
   comparisons: TargetExcludedComparison[] | null;
   gate: TargetExcludedGate | null;
+  normalArmBinding: TargetNormalArmBinding | null;
   artifactCollectionComplete: boolean;
   error: string | null;
   startedAt: string | null;

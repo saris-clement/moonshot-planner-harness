@@ -8,7 +8,7 @@ import { pipeline } from 'node:stream/promises';
 import { z } from 'zod';
 import type { HarnessDatabase } from './db.js';
 import type { CampaignOrchestrator } from './orchestrator.js';
-import { DecisionSchema } from './types.js';
+import { DecisionSchema, TargetExcludedAnswerInputSchema } from './types.js';
 import { campaignReportDirectory, variantArtifactDirectory } from './paths.js';
 import { renderMarkdown } from './renderMarkdown.js';
 import { parseSourceLineRanges, readFrozenSourceFile, renderSourceViewer } from './sourceViewer.js';
@@ -32,12 +32,34 @@ const TargetExcludedConfigInputSchema = z.object({
 
 const TargetExcludedLabelInputSchema = LabelInputSchema.omit({ benchmark: true });
 
-const TargetExcludedAnswerInputSchema = z.object({
-  answer: z.string().min(1).max(20_000),
-  selectedOptionId: z.string().min(1).max(256).optional(),
-});
-
 const REQUIREMENTS_ZIP_MAX_BYTES = 512 * 1_024 * 1_024;
+const DEFAULT_PLANNER_REVISION = 'a24baf79e777b07a3b55d027dc5ea5a8701e6af8';
+
+export function dashboardDefaults(
+  cwd = process.cwd(),
+  environment: NodeJS.ProcessEnv = process.env,
+): {
+  plannerRepo: string;
+  workflowsRepo: string;
+  environmentFile: string;
+  seedRevision: string;
+  workflowsRevision: string;
+} {
+  const plannerRepo = path.resolve(
+    environment.HARNESS_PLANNER_REPO ?? path.join(cwd, '../ainative-planner'),
+  );
+  return {
+    plannerRepo,
+    workflowsRepo: path.resolve(
+      environment.HARNESS_WORKFLOWS_REPO ?? path.join(cwd, '../workflows'),
+    ),
+    environmentFile: path.resolve(
+      environment.HARNESS_PLANNER_ENV_FILE ?? path.join(plannerRepo, '.env'),
+    ),
+    seedRevision: environment.HARNESS_DEFAULT_PLANNER_REVISION ?? DEFAULT_PLANNER_REVISION,
+    workflowsRevision: environment.HARNESS_DEFAULT_WORKFLOWS_REVISION ?? 'HEAD',
+  };
+}
 
 function sendJson(response: ServerResponse, status: number, value: unknown): void {
   const body = `${JSON.stringify(value)}\n`;
@@ -290,14 +312,7 @@ export function startDashboard(input: {
       }
 
       if (request.method === 'GET' && url.pathname === '/api/defaults') {
-        const plannerRepo = path.resolve(process.cwd(), '../ainative-planner');
-        sendJson(response, 200, {
-          plannerRepo,
-          workflowsRepo: path.resolve(process.cwd(), '../workflows'),
-          environmentFile: path.join(plannerRepo, '.env'),
-          seedRevision: 'a0dac3ec7b416b27dd3b4260717cdfea7dd8232a',
-          workflowsRevision: 'HEAD',
-        });
+        sendJson(response, 200, dashboardDefaults());
         return;
       }
 
@@ -516,6 +531,8 @@ export function startDashboard(input: {
             segments[7],
             answer.answer,
             answer.selectedOptionId,
+            answer.benchmark,
+            answer.replicate,
           );
           sendJson(response, 200, { saved: true });
           return;

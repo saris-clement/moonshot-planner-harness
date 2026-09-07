@@ -13,6 +13,7 @@ import type {
   Score,
   TargetExcludedComparison,
   TargetExcludedConfig,
+  TargetExcludedConfigInput,
   TargetExcludedEvaluationRecord,
   TargetExcludedEvaluationStatus,
   TargetExcludedGate,
@@ -26,6 +27,7 @@ import {
   DiagnosisOutputSchema,
   HypothesisSchema,
   TargetExcludedConfigSchema,
+  TargetNormalArmBindingSchema,
 } from './types.js';
 import { mergeExecutionSnapshot } from './executionState.js';
 
@@ -36,6 +38,27 @@ const now = (): string => new Date().toISOString();
 function parseJson<T>(value: unknown): T {
   if (typeof value !== 'string') throw new Error('expected persisted JSON string');
   return JSON.parse(value) as T;
+}
+
+type PersistedTargetExcludedComparison = Omit<
+  TargetExcludedComparison,
+  'normalCaseId' | 'excludedCaseId' | 'normalRunId' | 'excludedRunId'
+> &
+  Partial<
+    Pick<
+      TargetExcludedComparison,
+      'normalCaseId' | 'excludedCaseId' | 'normalRunId' | 'excludedRunId'
+    >
+  >;
+
+function parseTargetExcludedComparisons(value: unknown): TargetExcludedComparison[] {
+  return parseJson<PersistedTargetExcludedComparison[]>(value).map((comparison) => ({
+    ...comparison,
+    normalCaseId: comparison.normalCaseId ?? null,
+    excludedCaseId: comparison.excludedCaseId ?? null,
+    normalRunId: comparison.normalRunId ?? null,
+    excludedRunId: comparison.excludedRunId ?? null,
+  }));
 }
 
 function campaignFromRow(row: Row): CampaignRecord {
@@ -183,8 +206,12 @@ function targetExcludedEvaluationFromRow(row: Row): TargetExcludedEvaluationReco
     comparisons:
       row.comparisons_json === null
         ? null
-        : parseJson<TargetExcludedComparison[]>(row.comparisons_json),
+        : parseTargetExcludedComparisons(row.comparisons_json),
     gate: row.gate_json === null ? null : parseJson<TargetExcludedGate>(row.gate_json),
+    normalArmBinding:
+      row.normal_arm_binding_json === null
+        ? null
+        : TargetNormalArmBindingSchema.parse(parseJson<unknown>(row.normal_arm_binding_json)),
     artifactCollectionComplete: Boolean(row.artifact_collection_complete),
     error: row.error === null ? null : String(row.error),
     startedAt: row.started_at === null ? null : String(row.started_at),
@@ -297,6 +324,7 @@ export class HarnessDatabase {
         execution_state_json TEXT,
         comparisons_json TEXT,
         gate_json TEXT,
+        normal_arm_binding_json TEXT,
         artifact_collection_complete INTEGER NOT NULL DEFAULT 0,
         error TEXT,
         started_at TEXT,
@@ -351,9 +379,14 @@ export class HarnessDatabase {
     this.ensureColumn('variants', 'phase2_started_at', 'TEXT');
     this.ensureColumn('variants', 'phase2_completed_at', 'TEXT');
     this.ensureColumn('variants', 'phase2_elapsed_ms', 'INTEGER');
+    this.ensureColumn('target_excluded_evaluations', 'normal_arm_binding_json', 'TEXT');
   }
 
-  private ensureColumn(table: 'campaigns' | 'variants', column: string, definition: string): void {
+  private ensureColumn(
+    table: 'campaigns' | 'variants' | 'target_excluded_evaluations',
+    column: string,
+    definition: string,
+  ): void {
     const columns = this.database.prepare(`PRAGMA table_info(${table})`).all() as Array<{
       name: string;
     }>;
@@ -688,7 +721,7 @@ export class HarnessDatabase {
     return rows.map(labelFromRow);
   }
 
-  createTargetExcludedConfig(campaignId: string, input: TargetExcludedConfig): TargetExcludedConfig {
+  createTargetExcludedConfig(campaignId: string, input: TargetExcludedConfigInput): TargetExcludedConfig {
     this.getCampaign(campaignId);
     if (this.getTargetExcludedConfig(campaignId)) {
       throw new Error(`target-excluded protocol is already configured: ${campaignId}`);
@@ -769,6 +802,7 @@ export class HarnessDatabase {
         | 'executionState'
         | 'comparisons'
         | 'gate'
+        | 'normalArmBinding'
         | 'artifactCollectionComplete'
         | 'error'
         | 'startedAt'
@@ -790,6 +824,7 @@ export class HarnessDatabase {
       executionState: 'execution_state_json',
       comparisons: 'comparisons_json',
       gate: 'gate_json',
+      normalArmBinding: 'normal_arm_binding_json',
       artifactCollectionComplete: 'artifact_collection_complete',
       error: 'error',
       startedAt: 'started_at',

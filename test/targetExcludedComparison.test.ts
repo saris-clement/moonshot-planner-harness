@@ -14,15 +14,33 @@ import { canonicalHash } from '../src/metrics.js';
 const digest = `planner-eval@sha256:${'a'.repeat(64)}`;
 const generatedAt = '2026-09-06T12:00:00.000Z';
 
+function comparisonArm(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    valid: true,
+    errors: [],
+    ...overrides,
+  };
+}
+
 function report(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   const value = {
     kind: 'ainative-planner/evidence-visibility-comparison',
     schemaVersion: 1,
+    inputs: {
+      normalCaseId: 'normal-case-1',
+      excludedCaseId: 'excluded-case-1',
+    },
+    arms: {
+      normal: { analysis: { runId: 'normal-run-1' } },
+      excluded: { analysis: { runId: 'excluded-run-1' } },
+    },
     validity: {
       valid: true,
       arms: {
-        normal: { valid: true, errors: [] },
-        excluded: { valid: true, errors: [] },
+        normal: comparisonArm(),
+        excluded: comparisonArm(),
       },
       pair: { valid: true, mismatches: [] },
     },
@@ -133,6 +151,8 @@ test('generated script calls the planner authority with runs and no Phase 3 reso
   assert.match(TARGET_EXCLUDED_COMPARISON_SCRIPT, /analysis-runs\.json/);
   assert.match(TARGET_EXCLUDED_COMPARISON_SCRIPT, /runs: runResponse\.runs/);
   assert.match(TARGET_EXCLUDED_COMPARISON_SCRIPT, /phase3: \[\]/);
+  assert.match(TARGET_EXCLUDED_COMPARISON_SCRIPT, /normalCaseId: caseId\(normal, 'normal'\)/);
+  assert.match(TARGET_EXCLUDED_COMPARISON_SCRIPT, /excludedCaseId: caseId\(excluded, 'excluded'\)/);
   assert.match(TARGET_EXCLUDED_COMPARISON_SCRIPT, /canonicalJson\(comparison\)/);
 });
 
@@ -141,14 +161,14 @@ test('summarizeTargetExcludedComparisonReport describes arm and pair mismatches'
     validity: {
       valid: false,
       arms: {
-        normal: {
+        normal: comparisonArm({
           valid: false,
           errors: [{ code: 'CURRENT_ANALYSIS_INCOMPLETE', path: '$.analysis' }],
-        },
-        excluded: {
+        }),
+        excluded: comparisonArm({
           valid: false,
           errors: [{ code: 'CASE_ID_MISMATCH', path: '$.case.id' }],
-        },
+        }),
       },
       pair: {
         valid: false,
@@ -170,6 +190,10 @@ test('summarizeTargetExcludedComparisonReport describes arm and pair mismatches'
 
   assert.deepEqual(summary, {
     replicate: 2,
+    normalCaseId: 'normal-case-1',
+    excludedCaseId: 'excluded-case-1',
+    normalRunId: 'normal-run-1',
+    excludedRunId: 'excluded-run-1',
     valid: false,
     mismatches: [
       'normal CURRENT_ANALYSIS_INCOMPLETE at $.analysis',
@@ -179,6 +203,246 @@ test('summarizeTargetExcludedComparisonReport describes arm and pair mismatches'
     leakagePaths: ['$.analysis.analysis.adjudications[0].sourceRefs[0].path'],
     reportHash: value.hash,
   });
+});
+
+test('summarizeTargetExcludedComparisonReport requires component validity booleans', () => {
+  for (const validity of [
+    {
+      valid: true,
+      arms: {
+        normal: comparisonArm({ valid: undefined }),
+        excluded: comparisonArm(),
+      },
+      pair: { valid: true, mismatches: [] },
+    },
+    {
+      valid: true,
+      arms: {
+        normal: comparisonArm(),
+        excluded: comparisonArm({ valid: 'yes' }),
+      },
+      pair: { valid: true, mismatches: [] },
+    },
+    {
+      valid: true,
+      arms: {
+        normal: comparisonArm(),
+        excluded: comparisonArm(),
+      },
+      pair: { mismatches: [] },
+    },
+  ]) {
+    assert.throws(
+      () => summarizeTargetExcludedComparisonReport(1, report({ validity })),
+      /comparison report \$\.validity\.(arms\.(normal|excluded)|pair)\.valid must be a boolean/,
+    );
+  }
+});
+
+test('summarizeTargetExcludedComparisonReport rejects contradictory validity', () => {
+  const error = { code: 'INVALID_ARM', path: '$.analysis' };
+  const mismatch = { category: 'renderer', path: '$.rendererVersion' };
+  const contradictions = [
+    {
+      valid: false,
+      arms: {
+        normal: comparisonArm({ errors: [error] }),
+        excluded: comparisonArm(),
+      },
+      pair: { valid: true, mismatches: [] },
+    },
+    {
+      valid: false,
+      arms: {
+        normal: comparisonArm({ valid: false }),
+        excluded: comparisonArm(),
+      },
+      pair: { valid: true, mismatches: [] },
+    },
+    {
+      valid: false,
+      arms: {
+        normal: comparisonArm(),
+        excluded: comparisonArm({ errors: [error] }),
+      },
+      pair: { valid: true, mismatches: [] },
+    },
+    {
+      valid: false,
+      arms: {
+        normal: comparisonArm(),
+        excluded: comparisonArm({ valid: false }),
+      },
+      pair: { valid: true, mismatches: [] },
+    },
+    {
+      valid: false,
+      arms: {
+        normal: comparisonArm(),
+        excluded: comparisonArm(),
+      },
+      pair: { valid: true, mismatches: [mismatch] },
+    },
+    {
+      valid: false,
+      arms: {
+        normal: comparisonArm(),
+        excluded: comparisonArm(),
+      },
+      pair: { valid: false, mismatches: [] },
+    },
+    {
+      valid: true,
+      arms: {
+        normal: comparisonArm({ valid: false, errors: [error] }),
+        excluded: comparisonArm(),
+      },
+      pair: { valid: true, mismatches: [] },
+    },
+    {
+      valid: false,
+      arms: {
+        normal: comparisonArm(),
+        excluded: comparisonArm(),
+      },
+      pair: { valid: true, mismatches: [] },
+    },
+  ];
+
+  for (const validity of contradictions) {
+    assert.throws(
+      () => summarizeTargetExcludedComparisonReport(1, report({ validity })),
+      /comparison report validity is internally inconsistent/,
+    );
+  }
+});
+
+test('summarizeTargetExcludedComparisonReport requires valid leakage metadata', () => {
+  for (const leakage of [
+    { count: 0, paths: [] },
+    { detected: 'no', count: 0, paths: [] },
+    { detected: false, paths: [] },
+    { detected: false, count: -1, paths: [] },
+    { detected: false, count: 0.5, paths: [] },
+  ]) {
+    assert.throws(
+      () => summarizeTargetExcludedComparisonReport(1, report({ leakage })),
+      /comparison report \$\.leakage\.(detected must be a boolean|count must be a nonnegative integer)/,
+    );
+  }
+});
+
+test('summarizeTargetExcludedComparisonReport rejects contradictory leakage metadata', () => {
+  for (const leakage of [
+    { detected: true, count: 0, paths: [] },
+    { detected: false, count: 1, paths: ['$.analysis'] },
+    { detected: true, count: 2, paths: ['$.analysis'] },
+  ]) {
+    assert.throws(
+      () => summarizeTargetExcludedComparisonReport(1, report({ leakage })),
+      /comparison report leakage metadata is internally inconsistent/,
+    );
+  }
+});
+
+test('summarizeTargetExcludedComparisonReport requires non-empty case IDs', () => {
+  for (const inputs of [
+    {},
+    { normalCaseId: 'normal-case-1' },
+    { normalCaseId: 42, excludedCaseId: 'excluded-case-1' },
+    { normalCaseId: 'normal-case-1', excludedCaseId: '' },
+  ]) {
+    assert.throws(
+      () => summarizeTargetExcludedComparisonReport(1, report({ inputs })),
+      /comparison report \$\.inputs\.(normalCaseId|excludedCaseId) must be a non-empty string/,
+    );
+  }
+});
+
+test('summarizeTargetExcludedComparisonReport rejects a same-case pair', () => {
+  assert.throws(
+    () =>
+      summarizeTargetExcludedComparisonReport(
+        1,
+        report({
+          inputs: {
+            normalCaseId: 'same-case',
+            excludedCaseId: 'same-case',
+          },
+        }),
+      ),
+    /comparison report case IDs must be different/,
+  );
+});
+
+test('summarizeTargetExcludedComparisonReport requires non-empty arm run IDs', () => {
+  for (const arms of [
+    {
+      normal: { analysis: {} },
+      excluded: { analysis: { runId: 'excluded-run-1' } },
+    },
+    {
+      normal: { analysis: { runId: 42 } },
+      excluded: { analysis: { runId: 'excluded-run-1' } },
+    },
+    {
+      normal: { analysis: { runId: 'normal-run-1' } },
+      excluded: { analysis: {} },
+    },
+    {
+      normal: { analysis: { runId: 'normal-run-1' } },
+      excluded: { analysis: { runId: '' } },
+    },
+  ]) {
+    assert.throws(
+      () =>
+        summarizeTargetExcludedComparisonReport(
+          1,
+          report({ arms }),
+        ),
+      /comparison report \$\.arms\.(normal|excluded)\.analysis\.runId must be a non-empty string/,
+    );
+  }
+});
+
+test('summarizeTargetExcludedComparisonReport rejects a same-run pair', () => {
+  assert.throws(
+    () =>
+      summarizeTargetExcludedComparisonReport(
+        1,
+        report({
+          arms: {
+            normal: { analysis: { runId: 'same-run' } },
+            excluded: { analysis: { runId: 'same-run' } },
+          },
+        }),
+      ),
+    /comparison report run IDs must be different/,
+  );
+});
+
+test('summarizeTargetExcludedComparisonReport rejects content tampered after hashing', () => {
+  const value = report();
+  const inputs = value.inputs as Record<string, unknown>;
+  inputs.normalCaseId = 'tampered-normal-case';
+
+  assert.throws(
+    () => summarizeTargetExcludedComparisonReport(1, value),
+    /comparison report hash does not bind its canonical content/,
+  );
+});
+
+test('summarizeTargetExcludedComparisonReport rejects a run ID tampered after hashing', () => {
+  const value = report();
+  const arms = value.arms as Record<string, unknown>;
+  const normal = arms.normal as Record<string, unknown>;
+  const analysis = normal.analysis as Record<string, unknown>;
+  analysis.runId = 'tampered-normal-run';
+
+  assert.throws(
+    () => summarizeTargetExcludedComparisonReport(1, value),
+    /comparison report hash does not bind its canonical content/,
+  );
 });
 
 test('runTargetExcludedComparison mounts a generated read-only script and returns its summary', async () => {
@@ -234,6 +498,10 @@ test('runTargetExcludedComparison mounts a generated read-only script and return
 
     assert.deepEqual(summary, {
       replicate: 1,
+      normalCaseId: 'normal-case-1',
+      excludedCaseId: 'excluded-case-1',
+      normalRunId: 'normal-run-1',
+      excludedRunId: 'excluded-run-1',
       valid: true,
       mismatches: [],
       leakagePaths: [],

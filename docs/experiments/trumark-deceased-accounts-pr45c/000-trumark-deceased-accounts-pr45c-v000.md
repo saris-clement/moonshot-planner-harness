@@ -343,6 +343,8 @@ Control decisions: build=82, reuse=2, extend=25, defer=16, question=0
 
 Excluded decisions: build=102, reuse=0, extend=7, defer=16, question=0
 
+Comparison lineage: replicate 1: normal case `unavailable` run `unavailable`, excluded case `unavailable` run `unavailable`; replicate 2: normal case `unavailable` run `unavailable`, excluded case `unavailable` run `unavailable`
+
 Comparison mismatches: none
 
 Recorded error: none

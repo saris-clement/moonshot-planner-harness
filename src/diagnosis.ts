@@ -3,6 +3,7 @@ import { lstat, mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promis
 import path from 'node:path';
 import { sha256File } from './config.js';
 import { LangfuseReadClient, type LangfuseCollection } from './langfuse.js';
+import { isV2TargetIdentitySourceCandidate } from './targetExcludedSource.js';
 import {
   DiagnosisInputSchema,
   DiagnosisManifestSchema,
@@ -216,8 +217,23 @@ function unitKeyMap(facts: RunFacts | null): Map<string, string> {
   return new Map((facts?.units ?? []).map((unit) => [unit.id, unit.key]));
 }
 
-function targetRunFacts(target: TargetExcludedEvaluationRecord | null | undefined): RunFacts[] {
+function isStandardPrimaryV2(input: AssembleDiagnosisInput): boolean {
+  return (
+    input.targetExcludedConfig?.protocol === 'standard-primary-v2' ||
+    input.campaign.config.targetExcluded?.protocol === 'standard-primary-v2'
+  );
+}
+
+function targetRunFacts(
+  target: TargetExcludedEvaluationRecord | null | undefined,
+  standardPrimaryV2 = false,
+): RunFacts[] {
   if (!target) return [];
+  if (standardPrimaryV2) {
+    return [target.excludedFacts, ...(target.excludedReplicateFacts ?? [])].filter(
+      (facts): facts is RunFacts => facts !== null,
+    );
+  }
   return [
     target.controlFacts,
     ...(target.controlReplicateFacts ?? []),
@@ -232,11 +248,12 @@ function selectFocusUnits(input: AssembleDiagnosisInput): {
   keys: Set<string>;
   candidateCount: number;
 } {
+  const standardPrimaryV2 = isStandardPrimaryV2(input);
   const standardMeasured = new Map(
     (input.variant.facts?.units ?? []).map((unit) => [unit.key, unit]),
   );
   const targetMeasured = new Map(
-    targetRunFacts(input.targetExcluded).flatMap((facts) =>
+    targetRunFacts(input.targetExcluded, standardPrimaryV2).flatMap((facts) =>
       facts.units.map((unit) => [unit.key, unit] as const),
     ),
   );
@@ -276,7 +293,7 @@ function selectFocusUnits(input: AssembleDiagnosisInput): {
   }
   for (const cohort of [
     input.variant.replicateFacts ?? [],
-    input.targetExcluded?.controlReplicateFacts ?? [],
+    ...(standardPrimaryV2 ? [] : [input.targetExcluded?.controlReplicateFacts ?? []]),
     input.targetExcluded?.excludedReplicateFacts ?? [],
   ]) {
     const decisions = new Map<string, Set<string>>();
@@ -456,6 +473,7 @@ export async function verifyDiagnosisArtifacts(
 
 export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Promise<AssembledDiagnosis> {
   const artifactRoot = path.resolve(input.artifactDirectory);
+  const standardPrimaryV2 = isStandardPrimaryV2(input);
   const targetExcludedSourceManifestSha256 = input.targetExcludedSourceManifestPath &&
     (await stat(input.targetExcludedSourceManifestPath).catch(() => null))?.isFile()
     ? await sha256File(input.targetExcludedSourceManifestPath)
@@ -529,13 +547,23 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
     (filePath) =>
       !safeRelativePath(artifactRoot, filePath).startsWith('target-excluded-attempts/'),
   );
+  const primaryBenchmarkName =
+    input.campaign.config.benchmarks.find((benchmark) => benchmark.role === 'primary')?.name ??
+    'primary';
   const replicateDirectories = [
     ...new Set(
       artifactFiles
         .map((filePath) => path.dirname(filePath))
         .filter((directory) => /^replicate-\d+$/.test(path.basename(directory))),
     ),
-  ].sort();
+  ]
+    .filter((directory) => {
+      if (!standardPrimaryV2) return true;
+      const { arm } = artifactLineageArm(safeRelativePath(artifactRoot, directory));
+      if (arm === 'control') return false;
+      return arm === 'standard' || path.basename(path.dirname(directory)) === primaryBenchmarkName;
+    })
+    .sort();
 
   for (const directory of replicateDirectories) {
     const relativeDirectory = safeRelativePath(artifactRoot, directory);
@@ -929,12 +957,14 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
           ? replicates.length
           : input.campaign.config.evaluation.replicates;
     };
-    addReplicateEvidence(
-      `target-excluded/control/${primary}`,
-      target.controlReplicateFacts,
-      targetExpectedReplicates('control', target.controlFacts, target.controlReplicateFacts),
-      true,
-    );
+    if (!standardPrimaryV2) {
+      addReplicateEvidence(
+        `target-excluded/control/${primary}`,
+        target.controlReplicateFacts,
+        targetExpectedReplicates('control', target.controlFacts, target.controlReplicateFacts),
+        true,
+      );
+    }
     addReplicateEvidence(
       `target-excluded/excluded/${primary}`,
       target.excludedReplicateFacts,
@@ -1436,7 +1466,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
     ...(input.variant.replicateFacts ?? []),
     ...Object.values(input.variant.holdoutFacts ?? {}),
     ...Object.values(input.variant.holdoutReplicateFacts ?? {}).flat(),
-    ...targetRunFacts(input.targetExcluded),
+    ...targetRunFacts(input.targetExcluded, standardPrimaryV2),
   ].filter((facts): facts is RunFacts => facts !== null);
   for (const facts of allFacts) {
     for (const unit of facts.units) {
@@ -1444,6 +1474,10 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
     }
   }
   let capturedSources = 0;
+  let filteredTargetLeakSources = 0;
+  const targetWorkflow =
+    input.targetExcludedConfig?.targetImplementationWorkflow ??
+    input.campaign.config.targetExcluded?.targetImplementationWorkflow;
   for (const rawCandidate of [...sourceCandidates].sort().slice(0, MAX_SOURCE_REFS)) {
     const candidate = normalizedSourceCandidate(rawCandidate);
     if (!candidate) continue;
@@ -1452,6 +1486,18 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
     const details = await lstat(filePath).catch(() => null);
     if (!details?.isFile() || details.isSymbolicLink() || details.size > MAX_SOURCE_BYTES) continue;
     const bytes = await readFile(filePath);
+    if (
+      standardPrimaryV2 &&
+      targetWorkflow &&
+      isV2TargetIdentitySourceCandidate({
+        relativePath: candidate,
+        text: bytes.toString('utf8'),
+        targetWorkflow,
+      })
+    ) {
+      filteredTargetLeakSources += 1;
+      continue;
+    }
     const excerpt = bytes.subarray(0, MAX_SOURCE_EXCERPT_BYTES).toString('utf8');
     addEvidence(`frozen-source|${candidate}`, {
       kind: 'frozen_source_reference',
@@ -1497,7 +1543,12 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
       ...(sourceCandidates.size > MAX_SOURCE_REFS
         ? [`Frozen source references were capped at ${MAX_SOURCE_REFS}.`]
         : []),
-      ...(sourceCandidates.size > 0 && capturedSources === 0
+      ...(filteredTargetLeakSources > 0
+        ? [
+            `Filtered ${filteredTargetLeakSources} frozen-source candidate${filteredTargetLeakSources === 1 ? '' : 's'} containing the standard-primary-v2 excluded target identity.`,
+          ]
+        : []),
+      ...(sourceCandidates.size > filteredTargetLeakSources && capturedSources === 0
         ? ['No cited source path could be safely resolved in the frozen checkout.']
         : []),
     ],
@@ -1505,11 +1556,49 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
 
   const comparisonArtifactHashes: Array<{
     replicate: number;
+    normalCaseId: string | null;
+    excludedCaseId: string | null;
+    normalRunId: string | null;
+    excludedRunId: string | null;
     reportHash: string | null;
     artifactSha256: string;
   }> = [];
   if (input.targetExcluded) {
     const target = input.targetExcluded;
+    const pmSimulationAnswers =
+      target.questionResolution?.pmSimulationAnswers ??
+      target.questionResolution?.entries.filter(({ resolution }) => resolution === 'pm_simulation')
+        .length ??
+      0;
+    if (standardPrimaryV2) {
+      const binding = target.normalArmBinding;
+      addEvidence(`target-normal-arm-binding|${target.variantId}`, {
+        kind: 'target_normal_arm_binding',
+        summary:
+          'The standard primary physical measurement is reused as the comparison normal arm; no additional control execution is represented.',
+        affectedUnitKeys: [],
+        provenance: {
+          classification: 'deterministic_reconstruction',
+          source: 'harness',
+          artifactPath: null,
+          artifactSha256: binding?.resolvedArtifactSha ?? null,
+          integrity: binding ? 'hash_only' : 'unavailable',
+          caseId: null,
+          runId: null,
+          unitKey: null,
+          limitation: binding
+            ? null
+            : 'The standard-primary normal-arm case/run binding was not captured.',
+        },
+        data: boundedJson({
+          protocol: 'standard-primary-v2',
+          physicalMeasurement: 'standard_primary',
+          comparisonArm: 'normal',
+          additionalControlExecution: false,
+          normalArmBinding: binding,
+        }),
+      });
+    }
     const comparisonsByReplicate = new Map(
       (target.comparisons ?? []).map((comparison) => [comparison.replicate, comparison]),
     );
@@ -1550,13 +1639,17 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
       });
       comparisonArtifactHashes.push({
         replicate,
+        normalCaseId: comparison.normalCaseId ?? null,
+        excludedCaseId: comparison.excludedCaseId ?? null,
+        normalRunId: comparison.normalRunId ?? null,
+        excludedRunId: comparison.excludedRunId ?? null,
         reportHash: comparison.reportHash,
         artifactSha256: report.sha256,
       });
     }
     addEvidence(`target-excluded|${target.variantId}`, {
       kind: 'target_excluded_summary',
-      summary: `Target-excluded guard status is ${target.status} with gate ${target.gate?.status ?? 'pending'}; it is a guard, not a fitness reward.`,
+      summary: `Target-excluded guard status is ${target.status} with gate ${target.gate?.status ?? 'pending'}; it is a guard, not a fitness reward.${pmSimulationAnswers > 0 ? ` It includes ${pmSimulationAnswers} unverified PM-simulation answer${pmSimulationAnswers === 1 ? '' : 's'}, not human-verified authority.` : ''}`,
       affectedUnitKeys: target.excludedFacts?.units.map((unit) => unit.key).slice(0, 500) ?? [],
       provenance: {
         classification: 'deterministic_reconstruction',
@@ -1567,7 +1660,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
         caseId: null,
         runId: null,
         unitKey: null,
-        limitation: 'Target-excluded output and labels remain separate from normal measured facts.',
+        limitation: `Target-excluded output and labels remain separate from normal measured facts.${pmSimulationAnswers > 0 ? ' PM-simulation answers are unverified synthetic input, not human-verified authority.' : ''}`,
       },
       data: boundedJson({
         status: target.status,
@@ -1583,7 +1676,12 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
           (left, right) => left.replicate - right.replicate,
         ),
         excludedDecisions: target.excludedFacts?.decisions,
-        controlDecisions: target.controlFacts?.decisions,
+        ...(!standardPrimaryV2
+          ? { controlDecisions: target.controlFacts?.decisions }
+          : {
+              protocol: 'standard-primary-v2',
+              normalArmBinding: target.normalArmBinding,
+            }),
         score: target.score,
       }),
     });
@@ -1702,6 +1800,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
       ...(input.targetExcludedConfig
         ? {
             targetExcludedProtocol: {
+              protocol: input.targetExcludedConfig.protocol,
               targetImplementationWorkflow:
                 input.targetExcludedConfig.targetImplementationWorkflow,
               baselineVariantId: input.targetExcludedConfig.baselineVariantId,
@@ -1711,6 +1810,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
               warningBuildDropRatio: input.targetExcludedConfig.warningBuildDropRatio,
               blockBuildDropRatio: input.targetExcludedConfig.blockBuildDropRatio,
               sourceManifestSha256: targetExcludedSourceManifestSha256,
+              normalArmBinding: input.targetExcluded?.normalArmBinding ?? null,
             },
           }
         : {}),

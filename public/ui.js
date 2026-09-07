@@ -160,6 +160,11 @@ function rowState(row) {
 
 export function replicateTable(campaign, variant, options = {}) {
   const body = element('tbody');
+  const targetConfig = campaign.targetExcludedConfig;
+  const usesStandardPrimaryControl = Boolean(
+    options.includeTargetExcluded &&
+      (targetConfig?.protocol ?? campaign.config.targetExcluded?.protocol) === 'standard-primary-v2',
+  );
   const appendRow = (row, group) => {
     const traceCell = element('td');
     if (row.traceUrl) {
@@ -206,7 +211,12 @@ export function replicateTable(campaign, variant, options = {}) {
     );
   };
   for (const row of replicateMatrix(campaign, variant)) {
-    appendRow(row, 'standard');
+    appendRow(
+      usesStandardPrimaryControl && row.role === 'primary'
+        ? { ...row, role: 'primary · comparison control' }
+        : row,
+      'standard',
+    );
   }
   const targetRows = options.includeTargetExcluded
     ? targetExcludedReplicateMatrix(campaign, variant)
@@ -226,7 +236,9 @@ export function replicateTable(campaign, variant, options = {}) {
             statusLabel(evaluation?.status ?? 'pending'),
             element('span', {
               className: 'replicate-group-note',
-              text: 'Control + policy-hidden greenfield · Excluded from totals',
+              text: usesStandardPrimaryControl
+                ? 'Standard primary runs are the control; target-excluded planner usage is excluded from standard totals.'
+                : 'Dedicated control + policy-hidden target · Excluded from totals',
             }),
           ]),
         ]),

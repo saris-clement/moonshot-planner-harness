@@ -1,0 +1,291 @@
+# Normalize retrieval hits before hydration
+
+## Goal
+
+Improve the generic accuracy, evidence quality, and repeatability of Phase 2 requirement-unit adjudication.
+
+In normal target-present runs, the frozen workflows source already contains substantial behavior matching the reviewed requirements, yet the planner still classifies many units as build. The objective is to reduce false build and false extend decisions by improving generic source discovery, evidence hydration, evidence retention and composition, callable-boundary verification, and model interpretation.
+
+There is no target build count. A lower build count is not itself an improvement. Build remains correct when required behavior is genuinely absent. Extend remains correct for partial, private, or incomplete implementations. Reuse requires complete, eligible, source-backed behavior through a verified callable or registered boundary. Explicit binding exclusions should remain defer, and unresolved requirements should remain question rather than being forced into another disposition.
+
+Treat this campaign as a new campaign-local baseline. Freeze the exact requirements packs, planner revision, workflows revision, environment, model, prompts, budgets, source policy, and knowledge snapshot. Previous v14 and PR45 results are historical context only and must not be treated as directly comparable scores. Establish repeated baseline measurements before generating mutations.
+
+Freeze the target workflow identity at campaign creation. Resolve the primary requirements pack once using target-safe question resolution. The normal target-present and target-excluded executions must use the exact same resolved pack bytes and SHA.
+
+Evaluate every baseline and candidate through three safeguards:
+
+1. Run the deceased-account primary benchmark with the target implementation present. This normal primary run is also the comparison control. Measure requirement-level accuracy, evidence quality, decision agreement, source references, question handling, and run stability. Do not execute a redundant second control cohort.
+
+2. Run an unrelated workflow holdout with identical planner policy. Reject candidates that improve the primary benchmark by introducing customer, workflow, requirement-text, capability-ID, alias, or fixed-source-path specialization, or that otherwise regress the holdout.
+
+3. Run the deceased-account target-excluded counterfactual using the exact same frozen and resolved primary requirement pack after removing the target implementation and its direct registration references. The result must contain no target leakage and must continue to make evidence-backed greenfield decisions. It must not claim reuse or extension from the removed target source, but may still reuse or extend independently eligible shared or other-workflow source. Its build rate is a diagnostic and regression guard, not a fitness reward; a high build count alone does not prove greenfield correctness.
+
+Measured planner output is authoritative for what the planner actually did. Human-reviewed labels are authority for correctness. These remain distinct. Blind-judge suggestions, diagnoses, and strategist hypotheses are unverified model interpretations. Use provisional scores only to screen candidates. Before claiming improvement, human-review the changed units and a fixed representative sample covering build, reuse, extend, defer, and question decisions where present.
+
+Each mutation must address one observed, source-backed causal mechanism from the current parent diagnosis and remain bounded and attributable. Preserve supporting evidence, counterevidence, limitations, and a falsification test. Prior retrieval, evidence-composition, and boundary-visibility hypotheses are research leads, not established causes.
+
+Promote a candidate only when requirement-level reviewed accuracy improves, repeated runs remain sufficiently stable, the unrelated holdout does not regress, the target-excluded guard remains valid, and all immutable pins and cohorts match. Record regressions, uncertainties, costs, latency, token usage, and decision changes even when the hypothesis fails.
+
+The selected seed includes PR47’s six-slot execution capacity only to improve evaluation throughput. Capacity is not the experimental fitness axis. The primary, holdout, and target-excluded cohorts may execute concurrently, but faster execution must not outrank correctness, alter budgets or cohorts, weaken persistence and transcript integrity, or be interpreted as evidence of better adjudication.
+
+## Base Assumptions
+
+These assumptions were recorded before execution. They are model-generated and unverified.
+
+- Unverified: malformed hits consume or block meaningful hydration capacity often enough to affect outcomes.
+- Unverified: hit locations can be normalized deterministically without source-specific rules.
+- Unverified: inconsistent source admission, rather than adjudicator interpretation, materially contributes to observed variance.
+
+## Observed Issues
+
+### finding-ranked-hydration-amplifies-retrieval-variance: evidence_hydration
+
+Authority: `unverified_model_judgment`
+
+> Hydration admitted evidence in rank order under bounded file, byte, role, visibility, and path constraints. Durable receipts record malformed-hit and exhausted-slot rejection. For the same requirement, one replicate selected relevant committed declarations and chose extend while another completed two searches, read no source, selected nothing, and chose build.
+
+Proposed generic intervention: Normalize hit structure before ranking and allocate evidence capacity using semantic relevance and source role rather than rank order alone; record availability separately from final model selection.
+
+Supporting evidence: `evidence-8d75fc31a29101ca`, `evidence-d7c6c8ea3cf6aab4`, `evidence-0054d4c8fbd44df6`
+
+Counterevidence: `evidence-470bf9e1be24f22f`, `evidence-024190cc32639718`, `evidence-2028c2d0e4cb9ed7`
+
+Falsification: Replay affected units with repaired hit structure and identical enlarged or relevance-aware evidence allocations. If source admission rises without reducing decision variance, hydration is incidental and adjudicator interpretation is the stronger mechanism.
+
+Limitations: Slot exhaustion also occurred in successful reuse or extend decisions, so it is an amplifier rather than a sufficient cause.; One supporting adjudication comes from the separate target-excluded guard and does not establish normal-run truth.
+
+## Planned Change
+
+The plan below is model-generated and remains unverified. It is recorded before execution so the result can be evaluated against the original intervention.
+
+> The unverified diagnosis records malformed-hit and exhausted-slot rejections during rank-ordered hydration, with relevant declarations admitted in one replicate but not another. Supporting evidence is evidence-8d75fc31a29101ca, evidence-d7c6c8ea3cf6aab4, and evidence-0054d4c8fbd44df6; counterevidence shows slot exhaustion also occurred in successful decisions. Hydration is therefore only a suspected amplifier, not a sufficient cause.
+
+Implementation instructions:
+> Change only hit normalization before ranking: canonicalize valid hit locations and reject malformed entries without consuming hydration slots. Preserve query generation, ranking scores, file and byte budgets, ordering, adjudicator inputs, and selection policy. Record pre-normalization hits, normalization outcomes, and admitted declarations. Falsify the hypothesis if normalization does not increase relevant source admission or reduce replicate variance.
+
+Expected impact: Prevent structurally malformed results from consuming bounded evidence capacity while retaining the same retrieval and adjudication policies.
+
+Risk: Normalization defects could merge distinct locations, admit invalid evidence, or alter effective ranking despite unchanged scores.
+
+## Provenance
+
+| Field | Value |
+| --- | --- |
+| Campaign | trumark-deceased-accounts-pr47-3 |
+| Variant | trumark-deceased-accounts-pr47-3-v003 |
+| Parent | trumark-deceased-accounts-pr47-3-v001 |
+| Round | 1 |
+| Status | failed |
+| Planner seed | `a24baf79e777b07a3b55d027dc5ea5a8701e6af8` |
+| Workflows source | `140ec306bff8c20aa9eccde3cc2f4647ce790655` |
+| Environment | `sha256:24e705dace7c21ce1569d4cec477a5a392264b0f174c8f84929b98e475d3ff8d` |
+| Primary pack | `sha256:1b264a17073c8d4218d950b3b6b7712a933f52b542fe1897f7f3feff6c8b2520` |
+| Patch | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr47-3/trumark-deceased-accounts-pr47-3-v003/variant.patch` |
+| Image | `ainative-planner-eval:trumark-deceased-accounts-pr47-3-9c00fe3066-3` |
+| Artifact collection | complete |
+
+## Baseline Metrics
+
+| Metric | Parent | Observed | Delta |
+| --- | ---: | ---: | ---: |
+| Build units | 83 | unavailable | unavailable |
+| Reuse units | 1 | unavailable | unavailable |
+| Extend units | 25 | unavailable | unavailable |
+| Defer units | 16 | unavailable | unavailable |
+| Question units | 0 | unavailable | unavailable |
+| Decision agreement | 83.2% | unavailable | unavailable |
+| Selected source references | 40 | unavailable | unavailable |
+| Verified accuracy | unavailable | unavailable | unavailable |
+| Provisional accuracy | 24.8% | unavailable | unavailable |
+
+## Actual Facts
+
+| Decision | Count |
+| --- | ---: |
+| unavailable | unavailable |
+
+| Metric | Value |
+| --- | ---: |
+| Requirement units | unavailable |
+| Replicates | unavailable |
+| Unanimous unit decisions | unavailable |
+| Empty shortlists | unavailable |
+| Candidate occurrences | unavailable |
+| Discovered evidence | unavailable |
+| Selected source references | unavailable |
+| Model calls | unavailable |
+| Total tokens | unavailable |
+| Cost USD | unavailable |
+| Model duration ms | unavailable |
+
+## Evaluation
+
+| Metric | Value |
+| --- | ---: |
+| Human-verified labels | 0 |
+| Verified errors | 0 |
+| Verified accuracy | unscored |
+| Provisional labels | 0 |
+| Provisional errors | 0 |
+| Provisional accuracy | unscored |
+| Persisted labels | 241 |
+| Cohort pin mismatches | none |
+
+## Experiment Arms
+
+| Arm | Status | Units | Build | Reuse | Extend | Defer | Question | Agreement |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Standard primary (comparison control) | reference (standard measurement) | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |
+| Target-excluded | failed | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |
+
+The standard primary measurement is referenced as comparison normal. No additional control execution was run. The excluded arm is a promotion guard, not a fitness reward.
+
+## Conclusion
+
+Status: `pending`
+
+No measured conclusion is available while the experiment is failed.
+
+## LLM Suggestion
+
+This section is model-generated interpretation, not verified fact. Per-unit suggestions require human review in the dashboard.
+
+> No blind-judge result is available.
+
+## Model-Generated Diagnosis
+
+This diagnosis is unverified model interpretation. It is shown separately from measured output, blind-judge suggestions, and human labels, and it does not contribute to numeric scoring.
+
+Status: `not_started`
+
+Input hash: unavailable
+
+Result hash: unavailable
+
+> No model-generated diagnosis is available.
+
+No diagnosis findings are available.
+
+## Requirements Questions
+
+### deceased-account
+
+| Metric | Count |
+| --- | ---: |
+| Blocking questions | 1 |
+| Requirements-agent requests | 0 |
+| Requirements-agent answers | 0 |
+| Source fallback answers | 0 |
+| PM-simulation answers | 1 |
+| Reused campaign answers | 1 |
+| Planner questions | 0 |
+| Planner requirements-agent requests | 0 |
+| Planner requirements-agent answers | 0 |
+| Planner source fallback answers | 0 |
+| Planner PM-simulation answers | 0 |
+| Planner reused answers | 0 |
+| Planner human answers | 0 |
+
+#### 01M1Q2R1VHAKDZHSQ7TQDBA8B2
+
+Resolution: `pm_simulation`
+
+Authority: `unverified_pm_simulation`
+
+This answer is simulated PM input, not human-verified authority.
+
+Question:
+> What is the approved Symitar connection endpoint/environment (e.g., production vs. test region) and the specific read-only credential scope (member, death, deposit, non-mortgage consumer-loan, Visa external-loan, and Tracking 50/51/52/53 records) that this workflow must be provisioned against for production enablement?
+
+Answer:
+> The production target is TruMark’s live environment, but the exact Symitar endpoint/region and required read-only credential grant are not yet approved. Treat this as a production-enablement gap and do not enable go-live until access to the specified data is validated with no write permissions.
+
+Evidence:
+- tools/deploy/config.json:29-35
+- src/customers/trumark/deceased-accounts/README.md:3-6
+- src/modules/shared/api/symitar/client.ts:89-127
+- src/modules/shared/api/symitar/types/endpoints/setup-config.ts:1-6
+
+### catalyst-cheque
+
+| Metric | Count |
+| --- | ---: |
+| Blocking questions | 0 |
+| Requirements-agent requests | 0 |
+| Requirements-agent answers | 0 |
+| Source fallback answers | 0 |
+| PM-simulation answers | 0 |
+| Reused campaign answers | 0 |
+| Planner questions | 0 |
+| Planner requirements-agent requests | 0 |
+| Planner requirements-agent answers | 0 |
+| Planner source fallback answers | 0 |
+| Planner PM-simulation answers | 0 |
+| Planner reused answers | 0 |
+| Planner human answers | 0 |
+
+No blocking question required an answer.
+
+## Holdout
+
+Not run for this variant.
+
+## Target-Excluded Guard
+
+Status: `failed`
+
+Gate: `pending`
+
+Baseline mean build rate: unscored
+
+Candidate mean build rate: unscored
+
+Build-rate drop: unscored
+
+Pair validity: invalid or pending
+
+Leakage paths: 0
+
+Protocol: `standard-primary-v2`
+
+Standard primary (comparison control) reference: unavailable
+
+No additional control execution was run; the standard primary measurement is reused as comparison normal.
+
+Excluded decisions: unavailable
+
+Comparison lineage: unavailable
+
+Comparison mismatches: none
+
+Recorded error: `standard evaluation failed: fetch failed`
+
+Target-arm questions: 0
+
+No target-arm runtime question was recorded.
+
+This arm is a promotion guard, not a fitness reward. Target-blind labels and suggestions remain separate from normal evaluation truth.
+
+## Failure
+
+`fetch failed`
+
+## Evidence Ledger
+
+| Evidence | Authority | Locator | Integrity/status |
+| --- | --- | --- | --- |
+| Frozen campaign inputs | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/campaigns/trumark-deceased-accounts-pr47-3/campaign.json` | hash-pinned |
+| Current measured facts | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr47-3/trumark-deceased-accounts-pr47-3-v003/deceased-account/facts.json` | unavailable |
+| Parent measured facts | `observed_durable` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr47-3/trumark-deceased-accounts-pr47-3-v001/deceased-account/facts.json` | archived |
+| Target-excluded comparisons | `deterministic_reconstruction` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/artifacts/trumark-deceased-accounts-pr47-3/trumark-deceased-accounts-pr47-3-v003/target-excluded/comparisons/` | failed |
+| Human labels | `human_verified` | `/Users/cflodrops/Documents/dev/playground/test-bootstrap/bootstrap/services/ainative-planner-eval-harness/.data/harness.sqlite` | 0 verified |
+
+## Human Notes
+
+Human-authored notes are contextual and do not become verified scoring truth unless they are also saved as reviewed labels.
+
+No human-authored notes have been added.
+
+## Artifacts
+
+Raw artifacts, prompts, logs, source excerpts, and model events remain in the ignored local data directory for this variant.

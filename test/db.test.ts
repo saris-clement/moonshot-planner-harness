@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { HarnessDatabase } from '../src/db.js';
-import { CampaignConfigSchema } from '../src/types.js';
+import { CampaignConfigSchema, type TargetNormalArmBinding } from '../src/types.js';
 
 test('database persists campaign lineage, labels, and ordered events', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'planner-eval-db-'));
@@ -104,9 +105,19 @@ test('database persists campaign lineage, labels, and ordered events', async () 
       blockBuildDropRatio: 0.15,
     });
     const targetEvaluation = database.createTargetExcludedEvaluation(config.id, variant.id);
+    const normalArmBinding: TargetNormalArmBinding = {
+      source: 'standard_primary',
+      benchmark: 'primary-pack',
+      resolvedArtifactSha: `sha256:${'f'.repeat(64)}`,
+      replicates: [
+        { replicate: 1, caseId: 'case-primary-1', runId: 'run-primary-1' },
+        { replicate: 2, caseId: 'case-primary-2', runId: 'run-primary-2' },
+      ],
+    };
     database.updateTargetExcludedEvaluation(variant.id, {
       status: 'running',
       artifactCollectionComplete: false,
+      normalArmBinding,
     });
     database.upsertTargetExcludedLabel({
       campaignId: config.id,
@@ -124,9 +135,14 @@ test('database persists campaign lineage, labels, and ordered events', async () 
     database.releaseLease(config.id, 'owner-a');
     assert.equal(database.acquireLease(config.id, 'owner-b', 60_000), true);
     assert.equal(database.listLabels(config.id)[0]?.status, 'verified');
+    assert.equal(targetConfig.protocol, 'dedicated-control-v1');
     assert.equal(targetConfig.replicates, 2);
     assert.equal(targetEvaluation.variantId, variant.id);
-    assert.equal(database.getTargetExcludedEvaluation(variant.id)?.status, 'running');
+    const persistedTargetEvaluation = database.getTargetExcludedEvaluation(variant.id);
+    assert.equal(persistedTargetEvaluation?.status, 'running');
+    assert.deepEqual(persistedTargetEvaluation?.normalArmBinding, normalArmBinding);
+    assert.equal(persistedTargetEvaluation?.controlFacts, null);
+    assert.equal(persistedTargetEvaluation?.controlReplicateFacts, null);
     assert.equal(database.listTargetExcludedLabels(config.id)[0]?.expectedDecision, 'build');
     assert.throws(
       () => database.createTargetExcludedConfig(config.id, targetConfig),
@@ -189,6 +205,150 @@ test('database persists campaign lineage, labels, and ordered events', async () 
       events.map((event) => event.id),
       [...events.map((event) => event.id)].sort((left, right) => left - right),
     );
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('database additively migrates target-excluded evaluations and reads legacy config JSON as v1', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'planner-eval-db-legacy-'));
+  const filePath = path.join(directory, 'test.sqlite');
+  const legacyDatabase = new DatabaseSync(filePath);
+  legacyDatabase.exec(`
+    CREATE TABLE target_excluded_evaluations (
+      variant_id TEXT PRIMARY KEY,
+      campaign_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      control_facts_json TEXT,
+      control_replicate_facts_json TEXT,
+      holdout_facts_json TEXT,
+      holdout_replicate_facts_json TEXT,
+      excluded_facts_json TEXT,
+      excluded_replicate_facts_json TEXT,
+      judgment_json TEXT,
+      score_json TEXT,
+      question_resolution_json TEXT,
+      execution_state_json TEXT,
+      comparisons_json TEXT,
+      gate_json TEXT,
+      artifact_collection_complete INTEGER NOT NULL DEFAULT 0,
+      error TEXT,
+      started_at TEXT,
+      completed_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(campaign_id, variant_id)
+    );
+    INSERT INTO target_excluded_evaluations
+      (variant_id, campaign_id, status, created_at, updated_at)
+    VALUES
+      ('legacy-variant', 'legacy-campaign', 'queued', '2026-09-06T12:00:00.000Z', '2026-09-06T12:00:00.000Z');
+  `);
+  const legacyComparisons = [
+    {
+      replicate: 1,
+      valid: true,
+      mismatches: [],
+      leakagePaths: [],
+      reportHash: null,
+    },
+  ];
+  legacyDatabase
+    .prepare(
+      `UPDATE target_excluded_evaluations
+       SET comparisons_json = ?
+       WHERE variant_id = 'legacy-variant'`,
+    )
+    .run(JSON.stringify(legacyComparisons));
+  legacyDatabase.close();
+
+  const database = new HarnessDatabase(filePath);
+  try {
+    const columns = database.database.prepare('PRAGMA table_info(target_excluded_evaluations)').all() as Array<{
+      name: string;
+    }>;
+    assert.ok(columns.some((column) => column.name === 'normal_arm_binding_json'));
+    const legacyEvaluation = database.getTargetExcludedEvaluation('legacy-variant');
+    assert.equal(legacyEvaluation?.normalArmBinding, null);
+    assert.deepEqual(legacyEvaluation?.comparisons, [
+      {
+        ...legacyComparisons[0],
+        normalCaseId: null,
+        excludedCaseId: null,
+        normalRunId: null,
+        excludedRunId: null,
+      },
+    ]);
+    const storedLegacyComparisons = database.database
+      .prepare(
+        `SELECT comparisons_json
+         FROM target_excluded_evaluations
+         WHERE variant_id = 'legacy-variant'`,
+      )
+      .get() as { comparisons_json: string };
+    assert.deepEqual(JSON.parse(storedLegacyComparisons.comparisons_json), legacyComparisons);
+    database.database
+      .prepare(
+        `UPDATE target_excluded_evaluations
+         SET normal_arm_binding_json = ?
+         WHERE variant_id = 'legacy-variant'`,
+      )
+      .run(
+        JSON.stringify({
+          source: 'standard_primary',
+          benchmark: 'primary-pack',
+          resolvedArtifactSha: `sha256:${'f'.repeat(64)}`,
+          replicates: [
+            { replicate: 2, caseId: 'case-2', runId: 'run-2' },
+            { replicate: 1, caseId: 'case-1', runId: 'run-1' },
+          ],
+        }),
+      );
+    assert.throws(() => database.getTargetExcludedEvaluation('legacy-variant'));
+
+    const config = CampaignConfigSchema.parse({
+      id: 'persisted-legacy-config',
+      goal: 'Verify legacy target-excluded configuration remains readable without rewriting it.',
+      plannerRepo: '/tmp/planner',
+      workflowsRepo: '/tmp/workflows',
+      environmentFile: '/tmp/planner.env',
+      seedRevision: 'seed',
+      workflowsRevision: 'source',
+      benchmarks: [
+        { name: 'primary-pack', role: 'primary', zipPath: '/tmp/primary.zip' },
+        { name: 'holdout-pack', role: 'holdout', zipPath: '/tmp/holdout.zip' },
+      ],
+    });
+    database.createCampaign(
+      config,
+      'a'.repeat(40),
+      'b'.repeat(40),
+      `sha256:${'c'.repeat(64)}`,
+      'https://github.com/Saris-AI/workflows.git',
+    );
+    const legacyConfig = {
+      targetImplementationWorkflow: 'trumark/deceased-accounts',
+      baselineVariantId: 'persisted-legacy-config-v000',
+      comparatorImage: `sha256:${'d'.repeat(64)}`,
+      configuredAt: '2026-09-06T12:00:00.000Z',
+      replicates: 2,
+      concurrency: 2,
+      warningBuildDropRatio: 0.08,
+      blockBuildDropRatio: 0.15,
+    };
+    database.database
+      .prepare(
+        `INSERT INTO target_excluded_configs (campaign_id, config_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(config.id, JSON.stringify(legacyConfig), legacyConfig.configuredAt, legacyConfig.configuredAt);
+
+    assert.equal(database.getTargetExcludedConfig(config.id)?.protocol, 'dedicated-control-v1');
+    const stored = database.database
+      .prepare('SELECT config_json FROM target_excluded_configs WHERE campaign_id = ?')
+      .get(config.id) as { config_json: string };
+    assert.equal('protocol' in JSON.parse(stored.config_json), false);
   } finally {
     database.close();
     await rm(directory, { recursive: true, force: true });

@@ -440,13 +440,33 @@ ${JSON.stringify({ units: repairUnits })}`;
     },
     workflowsSource: string,
     artifactDirectory: string,
+    options: { mode?: 'source-grounded' | 'pm-simulation' } = {},
   ): Promise<SourceQuestionAnswer> {
-    const prompt = `Answer one blocking requirements question for an evaluation run by inspecting the exact frozen workflows source.
+    const sourceBoundaryEnvironment = {
+      ...process.env,
+      GIT_CEILING_DIRECTORIES: path.dirname(path.resolve(workflowsSource)),
+    };
+    const prompt =
+      options.mode === 'pm-simulation'
+        ? `Answer one blocking requirements question for an evaluation run by simulating the product manager responsible for the frozen implementation.
 
 Question:
 ${JSON.stringify(input, null, 2)}
 
-Use only behavior and deployment facts proven by source. Keep the answer concise and directly usable as a requirements answer. Do not invent endpoint URLs, credentials, customer policy, or production configuration absent from source. If source proves the environment, access surface, and read/write boundary but leaves an exact endpoint or secret to deployment configuration, return answered with those proven facts and explicitly say the remaining value is deployment-provided. Return unresolved only when source cannot establish the implementation's operational behavior or a safe read/write boundary at all.
+Inspect the full frozen implementation as private context. Act like a real PM supplying the intended product or operational decision, informed by what the product actually implements and operates. Return a concise human answer with a maximum of 3 sentences. When source proves the environment role, access surface, and read/write boundary but intentionally leaves an exact endpoint, profile, service identity, or secret to deployment configuration, answer with the proven boundary and explicitly say the exact value is deployment-provided; do not return unresolved merely because that deployment value is absent. Return unresolved only when no defensible intended behavior or safe operational boundary can be determined.
+
+The answer is planner-visible. Do not put source paths, symbols, capability IDs, workflow identity, or implementation narration in the answer. The evidence field remains required and may cite exact source paths for harness-only audit. Evidence is never planner-visible.
+
+Return JSON only:
+{"resolution":"answered","answer":"...","selectedOptionId":"only when selecting one supplied option","evidence":["path:line or exact source fact"]}
+or
+{"resolution":"unresolved","reason":"...","evidence":["path:line or exact source fact"]}`
+        : `Answer one blocking requirements question for an evaluation run by inspecting the exact frozen workflows source.
+
+Question:
+${JSON.stringify(input, null, 2)}
+
+Treat the current working directory as a hard source boundary. Do not inspect parent, sibling, or external paths. Use only behavior and deployment facts proven by source within that boundary. Keep the answer concise and directly usable as a requirements answer. Do not invent endpoint URLs, credentials, customer policy, or production configuration absent from source. If source proves the environment, access surface, and read/write boundary but leaves an exact endpoint or secret to deployment configuration, return answered with those proven facts and explicitly say the remaining value is deployment-provided. Return unresolved only when source cannot establish the implementation's operational behavior or a safe read/write boundary at all.
 
 Return JSON only:
 {"resolution":"answered","answer":"...","selectedOptionId":"only when selecting one supplied option","evidence":["path:line or exact source fact"]}
@@ -457,6 +477,7 @@ or
       this.argumentsFor(prompt, `${this.campaign.id} upstream source answer`, [], workflowsSource),
       {
         cwd: workflowsSource,
+        env: sourceBoundaryEnvironment,
         timeoutMs: 1_800_000,
         logPath: path.join(artifactDirectory, `source-answer-${input.id}.jsonl`),
       },
@@ -474,6 +495,7 @@ or
         ),
         {
           cwd: workflowsSource,
+          env: sourceBoundaryEnvironment,
           timeoutMs: 1_800_000,
           logPath: path.join(artifactDirectory, `source-answer-${input.id}-repair.jsonl`),
         },

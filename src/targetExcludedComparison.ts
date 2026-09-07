@@ -183,6 +183,27 @@ function entries(value: unknown, name: string): unknown[] {
   return value;
 }
 
+function nonEmptyString(value: unknown, name: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`comparison report ${name} must be a non-empty string`);
+  }
+  return value;
+}
+
+function booleanValue(value: unknown, name: string): boolean {
+  if (typeof value !== 'boolean') {
+    throw new Error(`comparison report ${name} must be a boolean`);
+  }
+  return value;
+}
+
+function nonnegativeInteger(value: unknown, name: string): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new Error(`comparison report ${name} must be a nonnegative integer`);
+  }
+  return value;
+}
+
 function descriptionFields(
   value: unknown,
   name: string,
@@ -208,17 +229,51 @@ export function summarizeTargetExcludedComparisonReport(
   ) {
     throw new Error('comparison report kind or schema version is invalid');
   }
-  const validity = record(report.validity, '$.validity');
-  if (typeof validity.valid !== 'boolean') {
-    throw new Error('comparison report $.validity.valid must be a boolean');
+  const inputs = record(report.inputs, '$.inputs');
+  const normalCaseId = nonEmptyString(inputs.normalCaseId, '$.inputs.normalCaseId');
+  const excludedCaseId = nonEmptyString(inputs.excludedCaseId, '$.inputs.excludedCaseId');
+  if (normalCaseId === excludedCaseId) {
+    throw new Error('comparison report case IDs must be different');
   }
-  const arms = record(validity.arms, '$.validity.arms');
-  const normal = record(arms.normal, '$.validity.arms.normal');
-  const excluded = record(arms.excluded, '$.validity.arms.excluded');
+  const validity = record(report.validity, '$.validity');
+  const valid = booleanValue(validity.valid, '$.validity.valid');
+  const reportArms = record(report.arms, '$.arms');
+  const normalReport = record(reportArms.normal, '$.arms.normal');
+  const excludedReport = record(reportArms.excluded, '$.arms.excluded');
+  const validityArms = record(validity.arms, '$.validity.arms');
+  const normal = record(validityArms.normal, '$.validity.arms.normal');
+  const excluded = record(validityArms.excluded, '$.validity.arms.excluded');
   const pair = record(validity.pair, '$.validity.pair');
+  const normalAnalysis = record(normalReport.analysis, '$.arms.normal.analysis');
+  const excludedAnalysis = record(excludedReport.analysis, '$.arms.excluded.analysis');
+  const normalRunId = nonEmptyString(
+    normalAnalysis.runId,
+    '$.arms.normal.analysis.runId',
+  );
+  const excludedRunId = nonEmptyString(
+    excludedAnalysis.runId,
+    '$.arms.excluded.analysis.runId',
+  );
+  if (normalRunId === excludedRunId) {
+    throw new Error('comparison report run IDs must be different');
+  }
+  const normalValid = booleanValue(normal.valid, '$.validity.arms.normal.valid');
+  const excludedValid = booleanValue(excluded.valid, '$.validity.arms.excluded.valid');
+  const pairValid = booleanValue(pair.valid, '$.validity.pair.valid');
+  const normalErrors = entries(normal.errors, '$.validity.arms.normal.errors');
+  const excludedErrors = entries(excluded.errors, '$.validity.arms.excluded.errors');
+  const pairMismatches = entries(pair.mismatches, '$.validity.pair.mismatches');
+  if (
+    normalValid !== (normalErrors.length === 0) ||
+    excludedValid !== (excludedErrors.length === 0) ||
+    pairValid !== (pairMismatches.length === 0) ||
+    valid !== (normalValid && excludedValid && pairValid)
+  ) {
+    throw new Error('comparison report validity is internally inconsistent');
+  }
 
   const mismatches = [
-    ...entries(normal.errors, '$.validity.arms.normal.errors').map((error, index) => {
+    ...normalErrors.map((error, index) => {
       const item = descriptionFields(
         error,
         `$.validity.arms.normal.errors[${index}]`,
@@ -226,7 +281,7 @@ export function summarizeTargetExcludedComparisonReport(
       );
       return `normal ${item.first} at ${item.path}`;
     }),
-    ...entries(excluded.errors, '$.validity.arms.excluded.errors').map((error, index) => {
+    ...excludedErrors.map((error, index) => {
       const item = descriptionFields(
         error,
         `$.validity.arms.excluded.errors[${index}]`,
@@ -234,16 +289,21 @@ export function summarizeTargetExcludedComparisonReport(
       );
       return `excluded ${item.first} at ${item.path}`;
     }),
-    ...entries(pair.mismatches, '$.validity.pair.mismatches').map((mismatch, index) => {
+    ...pairMismatches.map((mismatch, index) => {
       const item = descriptionFields(mismatch, `$.validity.pair.mismatches[${index}]`, 'category');
       return `${item.first} mismatch at ${item.path}`;
     }),
   ];
 
   const leakage = record(report.leakage, '$.leakage');
+  const leakageDetected = booleanValue(leakage.detected, '$.leakage.detected');
+  const leakageCount = nonnegativeInteger(leakage.count, '$.leakage.count');
   const leakagePaths = entries(leakage.paths, '$.leakage.paths');
   if (leakagePaths.some((candidate) => typeof candidate !== 'string')) {
     throw new Error('comparison report $.leakage.paths must contain strings');
+  }
+  if (leakageDetected !== (leakagePaths.length > 0) || leakageCount !== leakagePaths.length) {
+    throw new Error('comparison report leakage metadata is internally inconsistent');
   }
   if (typeof report.hash !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(report.hash)) {
     throw new Error('comparison report hash is invalid');
@@ -255,7 +315,11 @@ export function summarizeTargetExcludedComparisonReport(
 
   return {
     replicate,
-    valid: validity.valid,
+    normalCaseId,
+    excludedCaseId,
+    normalRunId,
+    excludedRunId,
+    valid,
     mismatches,
     leakagePaths: leakagePaths as string[],
     reportHash: hash,

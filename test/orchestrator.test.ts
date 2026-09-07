@@ -1,19 +1,36 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { HarnessDatabase } from '../src/db.js';
-import { CampaignOrchestrator } from '../src/orchestrator.js';
+import {
+  CampaignOrchestrator,
+  targetExcludedControlHoldoutDirectory,
+  targetExcludedComparisonDirectories,
+  targetExcludedLiveStackDirectory,
+  targetExcludedProtocolPlan,
+  targetSafeJudgeOutput,
+  withRuntimeQuestions,
+} from '../src/orchestrator.js';
 import type { HarnessPaths } from '../src/paths.js';
+import { resolveCampaignConfig } from '../src/config.js';
 import { runCommand } from '../src/process.js';
+import type { PlannerQuestionRecord } from '../src/plannerClient.js';
+import { canonicalHash, computeTargetExcludedGate } from '../src/metrics.js';
+import { summarizeTargetExcludedComparisonReport } from '../src/targetExcludedComparison.js';
 import {
   CampaignConfigSchema,
+  TargetExcludedAnswerInputSchema,
+  TargetExcludedConfigSchema,
   type Benchmark,
+  type BenchmarkQuestionResolution,
   type CampaignRecord,
+  type Phase2RunSnapshot,
   type RunFacts,
+  type TargetExcludedConfig,
   type VariantRecord,
 } from '../src/types.js';
 
@@ -43,6 +60,367 @@ async function gitFixture(directory: string, withRemote = false): Promise<string
     );
   }
   return (await runCommand('git', ['rev-parse', 'HEAD'], { cwd: directory })).stdout.trim();
+}
+
+function completedFacts(key = 'unit-a'): RunFacts {
+  return {
+    status: 'completed',
+    sampleSize: 1,
+    decisionAgreement: 1,
+    unitCount: 1,
+    decisions: { build: 1, reuse: 0, extend: 0, defer: 0, question: 0 },
+    shortlist: { empty: 1, nonempty: 0, candidates: 0 },
+    evidence: { discovered: 0, selectedSourceRefs: 0 },
+    usage: {
+      calls: 1,
+      inputTokens: 1,
+      outputTokens: 1,
+      totalTokens: 2,
+      costUsd: 0,
+      durationMs: 1,
+    },
+    pins: { model: 'test-model' },
+    units: [
+      {
+        id: key,
+        key,
+        ref: { entity: 'solution/main', anchor: key },
+        kind: 'field',
+        semantics: 'A field.',
+        decision: 'build',
+        confidence: 'high',
+        rationale: 'No reusable source evidence.',
+        selectedCandidateIds: [],
+        sourceRefs: [],
+        discoveredEvidenceCount: 0,
+        shortlistCandidateCount: 0,
+        uncoveredSemantics: ['field'],
+      },
+    ],
+  };
+}
+
+function completedSnapshot(caseId: string, runId: string): Phase2RunSnapshot {
+  return {
+    caseId,
+    runId,
+    status: 'completed',
+    stage: 'completed',
+    progress: { completedUnits: 1, totalUnits: 1 },
+    decisions: { build: 1, reuse: 0, extend: 0, defer: 0, question: 0 },
+    questions: [],
+    completedAt: '2026-09-06T00:00:00.000Z',
+    elapsedMs: 1,
+    usage: completedFacts().usage,
+    updatedAt: '2026-09-06T00:00:00.000Z',
+  };
+}
+
+function resolution(benchmark: string, resolvedArtifactSha: string): BenchmarkQuestionResolution {
+  return {
+    derivationVersion: 2,
+    benchmark,
+    originalArtifactSha: `sha256:${'d'.repeat(64)}`,
+    resolvedArtifactSha,
+    blockingQuestions: 0,
+    requirementsAgentRequests: 0,
+    requirementsAgentAnswers: 0,
+    sourceFallbackAnswers: 0,
+    reusedAnswers: 0,
+    plannerQuestions: 0,
+    plannerRequirementsAgentRequests: 0,
+    plannerRequirementsAgentAnswers: 0,
+    plannerSourceFallbackAnswers: 0,
+    plannerReusedAnswers: 0,
+    plannerHumanAnswers: 0,
+    entries: [],
+  };
+}
+
+function validComparisonReport(
+  normalCaseId: string,
+  excludedCaseId: string,
+  normalRunId: string,
+  excludedRunId: string,
+): Record<string, unknown> {
+  const report = {
+    kind: 'ainative-planner/evidence-visibility-comparison',
+    schemaVersion: 1,
+    inputs: { normalCaseId, excludedCaseId },
+    arms: {
+      normal: { analysis: { runId: normalRunId } },
+      excluded: { analysis: { runId: excludedRunId } },
+    },
+    validity: {
+      valid: true,
+      arms: {
+        normal: { valid: true, errors: [] },
+        excluded: { valid: true, errors: [] },
+      },
+      pair: { valid: true, mismatches: [] },
+    },
+    leakage: { detected: false, count: 0, paths: [] },
+  };
+  return { ...report, hash: canonicalHash(report) };
+}
+
+function imageInspectCommand(imageId: string): typeof runCommand {
+  return async (command, args) => ({
+    command,
+    args: [...args],
+    exitCode: 0,
+    stdout: `${imageId}\n`,
+    stderr: '',
+    durationMs: 0,
+  });
+}
+
+async function v2LifecycleFixture(id: string): Promise<{
+  root: string;
+  paths: HarnessPaths;
+  database: HarnessDatabase;
+  campaign: CampaignRecord;
+  variant: VariantRecord;
+  targetConfig: TargetExcludedConfig;
+}> {
+  const root = await mkdtemp(path.join(os.tmpdir(), `planner-eval-${id}-`));
+  const data = path.join(root, 'data');
+  const campaignRoot = path.join(data, 'campaigns', id);
+  const artifactRoot = path.join(data, 'artifacts', id, `${id}-v000`);
+  await Promise.all([
+    mkdir(data, { recursive: true }),
+    mkdir(path.join(campaignRoot, 'resolved-packs'), { recursive: true }),
+    mkdir(path.join(artifactRoot, 'primary'), { recursive: true }),
+    mkdir(path.join(artifactRoot, 'holdout'), { recursive: true }),
+  ]);
+  const paths: HarnessPaths = {
+    root: data,
+    database: path.join(data, 'harness.sqlite'),
+    campaigns: path.join(data, 'campaigns'),
+    worktrees: path.join(data, 'worktrees'),
+    artifacts: path.join(data, 'artifacts'),
+    reports: path.join(root, 'reports'),
+  };
+  const database = new HarnessDatabase(paths.database);
+  const resolvedBytes = Buffer.from('canonical resolved primary');
+  const resolvedArtifactSha = `sha256:${createHash('sha256').update(resolvedBytes).digest('hex')}`;
+  const config = CampaignConfigSchema.parse({
+    id,
+    goal: 'Exercise target-excluded V2 baseline lifecycle recovery boundaries.',
+    plannerRepo: root,
+    workflowsRepo: root,
+    environmentFile: path.join(root, 'environment.env'),
+    seedRevision: 'seed',
+    workflowsRevision: 'workflows',
+    evaluation: { replicates: 2, replicateConcurrency: 2 },
+    targetExcluded: {
+      protocol: 'standard-primary-v2',
+      targetImplementationWorkflow: 'trumark/deceased-accounts',
+    },
+    benchmarks: [
+      { name: 'primary', role: 'primary', zipPath: path.join(campaignRoot, 'packs/primary.zip') },
+      { name: 'holdout', role: 'holdout', zipPath: path.join(campaignRoot, 'packs/holdout.zip') },
+    ],
+  });
+  const campaign = database.createCampaign(
+    config,
+    'a'.repeat(40),
+    'b'.repeat(40),
+    `sha256:${'c'.repeat(64)}`,
+    'https://github.com/Saris-AI/workflows.git',
+  );
+  const created = database.createVariant({
+    id: `${id}-v000`,
+    campaignId: id,
+    parentVariantId: null,
+    round: 0,
+    ordinal: 0,
+    hypothesis: baselineHypothesisForTest,
+  });
+  const facts = completedFacts();
+  const variant = database.updateVariant(created.id, {
+    status: 'review',
+    worktreePath: root,
+    imageTag: `planner-test:${id}`,
+    artifactCollectionComplete: true,
+    facts,
+    replicateFacts: [facts, facts],
+    holdoutFacts: { holdout: facts },
+    holdoutReplicateFacts: { holdout: [facts, facts] },
+    questionResolutions: {
+      primary: resolution('primary', resolvedArtifactSha),
+      holdout: resolution('holdout', `sha256:${'d'.repeat(64)}`),
+    },
+    executionState: {
+      executions: [1, 2].map((replicate) => ({
+        benchmark: 'primary',
+        role: 'primary' as const,
+        replicate,
+        replicateCount: 2,
+        ...completedSnapshot(`normal-case-${replicate}`, `normal-run-${replicate}`),
+      })),
+    },
+  });
+  await Promise.all([
+    writeFile(path.join(campaignRoot, 'resolved-packs/primary.zip'), resolvedBytes),
+    ...['primary', 'holdout'].flatMap((benchmark) => [
+      writeFile(path.join(artifactRoot, benchmark, 'facts.json'), `${JSON.stringify(facts)}\n`),
+      writeFile(
+        path.join(artifactRoot, benchmark, 'replicates.json'),
+        `${JSON.stringify([facts, facts])}\n`,
+      ),
+    ]),
+  ]);
+  const targetConfig = TargetExcludedConfigSchema.parse({
+    protocol: 'standard-primary-v2',
+    targetImplementationWorkflow: 'trumark/deceased-accounts',
+    baselineVariantId: variant.id,
+    comparatorImage: `sha256:${'f'.repeat(64)}`,
+    configuredAt: '2026-09-06T00:00:00.000Z',
+    normalArmSource: 'standard_primary',
+    primaryResolvedArtifactSha: resolvedArtifactSha,
+  });
+  return { root, paths, database, campaign, variant, targetConfig };
+}
+
+async function targetSnapshotFixture(id: string): Promise<{
+  fixture: Awaited<ReturnType<typeof v2LifecycleFixture>>;
+  sourceRoot: string;
+  destination: string;
+  manifestPath: string;
+  ensure: () => Promise<string>;
+}> {
+  const fixture = await v2LifecycleFixture(id);
+  const sourceRoot = path.join(fixture.root, 'frozen-workflows');
+  await mkdir(path.join(sourceRoot, 'src/customers/trumark/deceased-accounts'), {
+    recursive: true,
+  });
+  await Promise.all([
+    writeFile(path.join(sourceRoot, 'README.md'), 'shared source\n'),
+    writeFile(
+      path.join(sourceRoot, 'src/customers/trumark/deceased-accounts/index.ts'),
+      'export const target = true;\n',
+    ),
+  ]);
+  const internal = new CampaignOrchestrator(
+    fixture.paths,
+    fixture.database,
+  ) as unknown as {
+    ensureFrozenWorkflowsSource: () => Promise<string>;
+    ensureTargetExcludedWorkflowsSource: (
+      campaign: CampaignRecord,
+      targetWorkflow: string,
+    ) => Promise<string>;
+  };
+  internal.ensureFrozenWorkflowsSource = async () => sourceRoot;
+  return {
+    fixture,
+    sourceRoot,
+    destination: path.join(
+      fixture.paths.worktrees,
+      fixture.campaign.id,
+      'target-excluded-workflows',
+    ),
+    manifestPath: path.join(
+      fixture.paths.campaigns,
+      fixture.campaign.id,
+      'target-excluded-source-manifest.json',
+    ),
+    ensure: async () =>
+      await internal.ensureTargetExcludedWorkflowsSource(
+        fixture.campaign,
+        fixture.targetConfig.targetImplementationWorkflow,
+      ),
+  };
+}
+
+async function legacyTargetSnapshotFixture(id: string): Promise<{
+  root: string;
+  paths: HarnessPaths;
+  database: HarnessDatabase;
+  campaign: CampaignRecord;
+  targetConfig: TargetExcludedConfig;
+  destination: string;
+  manifestPath: string;
+  ensure: () => Promise<string>;
+}> {
+  const root = await mkdtemp(path.join(os.tmpdir(), `planner-eval-${id}-`));
+  const data = path.join(root, 'data');
+  const campaignRoot = path.join(data, 'campaigns', id);
+  const sourceRoot = path.join(root, 'frozen-workflows');
+  await Promise.all([
+    mkdir(campaignRoot, { recursive: true }),
+    mkdir(path.join(sourceRoot, 'src/customers/trumark/deceased-accounts'), {
+      recursive: true,
+    }),
+  ]);
+  await Promise.all([
+    writeFile(path.join(sourceRoot, 'README.md'), 'shared source\n'),
+    writeFile(
+      path.join(sourceRoot, 'src/customers/trumark/deceased-accounts/index.ts'),
+      'export const target = true;\n',
+    ),
+  ]);
+  const paths: HarnessPaths = {
+    root: data,
+    database: path.join(data, 'harness.sqlite'),
+    campaigns: path.join(data, 'campaigns'),
+    worktrees: path.join(data, 'worktrees'),
+    artifacts: path.join(data, 'artifacts'),
+    reports: path.join(root, 'reports'),
+  };
+  const database = new HarnessDatabase(paths.database);
+  const config = CampaignConfigSchema.parse({
+    id,
+    goal: 'Verify legacy target-excluded source policy compatibility.',
+    plannerRepo: root,
+    workflowsRepo: root,
+    environmentFile: path.join(root, 'environment.env'),
+    seedRevision: 'seed',
+    workflowsRevision: 'workflows',
+    benchmarks: [
+      { name: 'primary', role: 'primary', zipPath: path.join(root, 'primary.zip') },
+      { name: 'holdout', role: 'holdout', zipPath: path.join(root, 'holdout.zip') },
+    ],
+  });
+  const campaign = database.createCampaign(
+    config,
+    'a'.repeat(40),
+    'b'.repeat(40),
+    `sha256:${'c'.repeat(64)}`,
+    'https://github.com/Saris-AI/workflows.git',
+  );
+  const targetConfig = database.createTargetExcludedConfig(campaign.id, {
+    protocol: 'dedicated-control-v1',
+    targetImplementationWorkflow: 'trumark/deceased-accounts',
+    baselineVariantId: `${id}-v000`,
+    comparatorImage: `sha256:${'f'.repeat(64)}`,
+    configuredAt: '2026-09-06T00:00:00.000Z',
+  });
+  const internal = new CampaignOrchestrator(paths, database) as unknown as {
+    ensureFrozenWorkflowsSource: () => Promise<string>;
+    ensureTargetExcludedWorkflowsSource: (
+      campaign: CampaignRecord,
+      targetWorkflow: string,
+    ) => Promise<string>;
+  };
+  internal.ensureFrozenWorkflowsSource = async () => sourceRoot;
+  const destination = path.join(paths.worktrees, campaign.id, 'target-excluded-workflows');
+  const manifestPath = path.join(campaignRoot, 'target-excluded-source-manifest.json');
+  return {
+    root,
+    paths,
+    database,
+    campaign,
+    targetConfig,
+    destination,
+    manifestPath,
+    ensure: async () =>
+      await internal.ensureTargetExcludedWorkflowsSource(
+        campaign,
+        'trumark/deceased-accounts',
+      ),
+  };
 }
 
 test('campaign initialization freezes environment and pack bytes', async () => {
@@ -96,7 +474,7 @@ test('campaign initialization freezes environment and pack bytes', async () => {
     assert.equal(campaign.config.environmentFile, path.join(data, 'campaigns/freeze-test/environment.env'));
     assert.match(
       await readFile(campaign.config.environmentFile, 'utf8'),
-      /PLANNER_ANALYSIS_TIMEOUT_MS=36000000/,
+      /PLANNER_ANALYSIS_TIMEOUT_MS=43200000/,
     );
     assert.match(
       await readFile(campaign.config.environmentFile, 'utf8'),
@@ -115,6 +493,241 @@ test('campaign initialization freezes environment and pack bytes', async () => {
     database.close();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('campaign initialization rejects benchmark mutation before creating campaign state', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'planner-eval-init-race-'));
+  const plannerRepo = path.join(root, 'planner');
+  const workflowsRepo = path.join(root, 'workflows');
+  const [seedSha, workflowsSha] = await Promise.all([
+    gitFixture(plannerRepo),
+    gitFixture(workflowsRepo, true),
+  ]);
+  const environmentFile = path.join(root, 'planner.env');
+  const primary = path.join(root, 'primary.zip');
+  const holdout = path.join(root, 'holdout.zip');
+  await Promise.all([
+    writeFile(environmentFile, ''),
+    writeFile(primary, 'resolved primary bytes'),
+    writeFile(holdout, 'resolved holdout bytes'),
+  ]);
+  const resolved = await resolveCampaignConfig({
+    id: 'init-race-test',
+    goal: 'Reject mutable benchmark bytes after campaign configuration resolution.',
+    plannerRepo,
+    workflowsRepo,
+    environmentFile,
+    seedRevision: seedSha,
+    workflowsRevision: workflowsSha,
+    benchmarks: [
+      { name: 'primary', role: 'primary', zipPath: primary },
+      { name: 'holdout', role: 'holdout', zipPath: holdout },
+    ],
+  });
+  await writeFile(primary, 'mutated after resolution');
+  const data = path.join(root, 'data');
+  await mkdir(data);
+  const paths: HarnessPaths = {
+    root: data,
+    database: path.join(data, 'harness.sqlite'),
+    campaigns: path.join(data, 'campaigns'),
+    worktrees: path.join(data, 'worktrees'),
+    artifacts: path.join(data, 'artifacts'),
+    reports: path.join(root, 'reports'),
+  };
+  const database = new HarnessDatabase(paths.database);
+  try {
+    const internal = new CampaignOrchestrator(paths, database) as unknown as {
+      initializeResolved: (input: typeof resolved) => Promise<CampaignRecord>;
+    };
+    await assert.rejects(
+      internal.initializeResolved(resolved),
+      /primary SHA mismatch during frozen copy/,
+    );
+    assert.deepEqual(database.listCampaigns(), []);
+    assert.equal(
+      await stat(path.join(paths.campaigns, resolved.config.id)).catch(() => null),
+      null,
+    );
+  } finally {
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('V2 campaign initialization checks the target index at the pinned workflows commit', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'planner-eval-target-pin-'));
+  const plannerRepo = path.join(root, 'planner');
+  const workflowsRepo = path.join(root, 'workflows');
+  const targetIndex = path.join(
+    workflowsRepo,
+    'src/customers/trumark/deceased-accounts/index.ts',
+  );
+  const [seedSha, workflowsSha] = await Promise.all([
+    gitFixture(plannerRepo),
+    gitFixture(workflowsRepo, true),
+  ]);
+  const environmentFile = path.join(root, 'planner.env');
+  const primary = path.join(root, 'primary.zip');
+  const holdout = path.join(root, 'holdout.zip');
+  const data = path.join(root, 'data');
+  await Promise.all([
+    mkdir(path.dirname(targetIndex), { recursive: true }),
+    mkdir(data),
+    writeFile(environmentFile, ''),
+    writeFile(primary, 'primary bytes'),
+    writeFile(holdout, 'holdout bytes'),
+  ]);
+  await writeFile(targetIndex, 'export const workingTreeOnly = true;\n');
+  const paths: HarnessPaths = {
+    root: data,
+    database: path.join(data, 'harness.sqlite'),
+    campaigns: path.join(data, 'campaigns'),
+    worktrees: path.join(data, 'worktrees'),
+    artifacts: path.join(data, 'artifacts'),
+    reports: path.join(root, 'reports'),
+  };
+  const database = new HarnessDatabase(paths.database);
+  try {
+    await assert.rejects(
+      new CampaignOrchestrator(paths, database).initializeFromInput({
+        id: 'target-pin-test',
+        goal: 'Reject a target that is visible only in mutable working tree bytes.',
+        plannerRepo,
+        workflowsRepo,
+        environmentFile,
+        seedRevision: seedSha,
+        workflowsRevision: workflowsSha,
+        evaluation: { replicates: 2, replicateConcurrency: 2 },
+        targetExcluded: {
+          protocol: 'standard-primary-v2',
+          targetImplementationWorkflow: 'trumark/deceased-accounts',
+        },
+        benchmarks: [
+          { name: 'primary', role: 'primary', zipPath: primary },
+          { name: 'holdout', role: 'holdout', zipPath: holdout },
+        ],
+      }),
+      /target implementation is not present at the pinned workflows revision/,
+    );
+    assert.deepEqual(database.listCampaigns(), []);
+    assert.equal(await stat(path.join(paths.campaigns, 'target-pin-test')).catch(() => null), null);
+  } finally {
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('V2 campaign initialization accepts a pinned target after its working-tree file is removed', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'planner-eval-target-pin-present-'));
+  const plannerRepo = path.join(root, 'planner');
+  const workflowsRepo = path.join(root, 'workflows');
+  const targetIndex = path.join(workflowsRepo, 'src/customers/trumark/deceased-accounts/index.ts');
+  const seedSha = await gitFixture(plannerRepo);
+  await gitFixture(workflowsRepo, true);
+  await mkdir(path.dirname(targetIndex), { recursive: true });
+  await writeFile(targetIndex, 'export const pinned = true;\n');
+  await runCommand('git', ['add', '.'], { cwd: workflowsRepo });
+  await runCommand(
+    'git',
+    [
+      '-c',
+      'user.name=Harness Test',
+      '-c',
+      'user.email=harness@example.invalid',
+      'commit',
+      '-m',
+      'add target',
+    ],
+    { cwd: workflowsRepo },
+  );
+  const workflowsSha = (
+    await runCommand('git', ['rev-parse', 'HEAD'], { cwd: workflowsRepo })
+  ).stdout.trim();
+  await rm(targetIndex);
+  const environmentFile = path.join(root, 'planner.env');
+  const primary = path.join(root, 'primary.zip');
+  const holdout = path.join(root, 'holdout.zip');
+  const data = path.join(root, 'data');
+  await Promise.all([
+    mkdir(data),
+    writeFile(environmentFile, ''),
+    writeFile(primary, 'primary bytes'),
+    writeFile(holdout, 'holdout bytes'),
+  ]);
+  const paths: HarnessPaths = {
+    root: data,
+    database: path.join(data, 'harness.sqlite'),
+    campaigns: path.join(data, 'campaigns'),
+    worktrees: path.join(data, 'worktrees'),
+    artifacts: path.join(data, 'artifacts'),
+    reports: path.join(root, 'reports'),
+  };
+  const database = new HarnessDatabase(paths.database);
+  try {
+    const campaign = await new CampaignOrchestrator(paths, database).initializeFromInput({
+      id: 'target-pin-present',
+      goal: 'Accept target identity frozen in the pinned workflows commit only.',
+      plannerRepo,
+      workflowsRepo,
+      environmentFile,
+      seedRevision: seedSha,
+      workflowsRevision: workflowsSha,
+      evaluation: { replicates: 2, replicateConcurrency: 2 },
+      targetExcluded: {
+        protocol: 'standard-primary-v2',
+        targetImplementationWorkflow: 'trumark/deceased-accounts',
+      },
+      benchmarks: [
+        { name: 'primary', role: 'primary', zipPath: primary },
+        { name: 'holdout', role: 'holdout', zipPath: holdout },
+      ],
+    });
+    assert.equal(campaign.workflowsSha, workflowsSha);
+  } finally {
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('target-excluded protocol planning preserves V1 paths and selects canonical standard V2 paths', () => {
+  const v1 = TargetExcludedConfigSchema.parse({
+    targetImplementationWorkflow: 'trumark/deceased-accounts',
+    baselineVariantId: 'campaign-v000',
+    comparatorImage: `sha256:${'a'.repeat(64)}`,
+    configuredAt: '2026-09-06T00:00:00.000Z',
+  });
+  assert.equal(v1.protocol, 'dedicated-control-v1');
+  assert.deepEqual(
+    targetExcludedComparisonDirectories('/artifacts/variant', 'primary', 2, v1.protocol),
+    {
+      normalArtifactDirectory: '/artifacts/variant/target-excluded/control/primary/replicate-2',
+      excludedArtifactDirectory: '/artifacts/variant/target-excluded/excluded/primary/replicate-2',
+    },
+  );
+
+  const campaign = {
+    config: {
+      targetExcluded: {
+        protocol: 'standard-primary-v2' as const,
+        targetImplementationWorkflow: 'trumark/deceased-accounts',
+      },
+    },
+  } as CampaignRecord;
+  const plan = targetExcludedProtocolPlan(campaign, null);
+  assert.deepEqual(plan, {
+    protocol: 'standard-primary-v2',
+    targetImplementationWorkflow: 'trumark/deceased-accounts',
+    targetSafePrimary: true,
+    integrated: true,
+  });
+  assert.deepEqual(
+    targetExcludedComparisonDirectories('/artifacts/variant', 'primary', 2, plan!.protocol),
+    {
+      normalArtifactDirectory: '/artifacts/variant/primary/replicate-2',
+      excludedArtifactDirectory: '/artifacts/variant/target-excluded/excluded/primary/replicate-2',
+    },
+  );
 });
 
 test('diagnosis failure preserves measured facts, score, artifact completeness, and review state', async () => {
@@ -396,5 +1009,2524 @@ test('replicate wall-clock timing is initialized before health and finalized on 
     );
     database.close();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('V2 replicate options share target-safe answers without applying exclusion to standard primary', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'planner-eval-v2-options-'));
+  const data = path.join(root, 'data');
+  const artifacts = path.join(root, 'artifacts');
+  await Promise.all([
+    mkdir(data),
+    mkdir(path.join(artifacts, 'primary'), { recursive: true }),
+    mkdir(path.join(artifacts, 'target-excluded/excluded/primary'), { recursive: true }),
+  ]);
+  const paths: HarnessPaths = {
+    root: data,
+    database: path.join(data, 'harness.sqlite'),
+    campaigns: path.join(data, 'campaigns'),
+    worktrees: path.join(data, 'worktrees'),
+    artifacts: path.join(data, 'artifacts'),
+    reports: path.join(root, 'reports'),
+  };
+  const database = new HarnessDatabase(paths.database);
+  try {
+    const config = CampaignConfigSchema.parse({
+      id: 'v2-option-test',
+      goal: 'Keep target-filtered answer sourcing independent from planner case exclusion.',
+      plannerRepo: root,
+      workflowsRepo: root,
+      environmentFile: path.join(root, 'environment.env'),
+      seedRevision: 'seed',
+      workflowsRevision: 'workflows',
+      evaluation: { replicates: 2, replicateConcurrency: 2 },
+      targetExcluded: {
+        protocol: 'standard-primary-v2',
+        targetImplementationWorkflow: 'trumark/deceased-accounts',
+      },
+      benchmarks: [
+        { name: 'primary', role: 'primary', zipPath: path.join(root, 'primary.zip') },
+        { name: 'holdout', role: 'holdout', zipPath: path.join(root, 'holdout.zip') },
+      ],
+    });
+    const campaign = database.createCampaign(
+      config,
+      'a'.repeat(40),
+      'b'.repeat(40),
+      `sha256:${'c'.repeat(64)}`,
+      'https://github.com/Saris-AI/workflows.git',
+    );
+    const variant = database.createVariant({
+      id: 'v2-option-test-v000',
+      campaignId: campaign.id,
+      parentVariantId: null,
+      round: 0,
+      ordinal: 0,
+      hypothesis: baselineHypothesisForTest,
+    });
+    const orchestrator = new CampaignOrchestrator(paths, database);
+    const observed: Array<{ source: string; cache: Map<string, unknown>; excluded?: string }> = [];
+    const internal = orchestrator as unknown as {
+      ensureTargetExcludedWorkflowsSource: () => Promise<string>;
+      runBenchmark: (
+        campaign: CampaignRecord,
+        variant: VariantRecord,
+        stack: { artifactDirectory: string },
+        benchmark: Benchmark,
+        token: string | undefined,
+        replicate: number,
+        workflowsSource: string,
+        answerCache: Map<string, unknown>,
+        options: { excludedTargetWorkflow?: string },
+      ) => Promise<{ caseId: string; runId: string; status: string; facts: RunFacts; questions: [] }>;
+      runBenchmarkReplicates: (
+        campaign: CampaignRecord,
+        variant: VariantRecord,
+        stack: { artifactDirectory: string },
+        benchmark: Benchmark,
+        token: string | undefined,
+        options: Record<string, unknown>,
+      ) => Promise<unknown>;
+    };
+    internal.ensureTargetExcludedWorkflowsSource = async () => '/target-filtered-source';
+    internal.runBenchmark = async (
+      _campaign,
+      _variant,
+      _stack,
+      _benchmark,
+      _token,
+      replicate,
+      workflowsSource,
+      answerCache,
+      options,
+    ) => {
+      observed.push({
+        source: workflowsSource,
+        cache: answerCache,
+        ...(options.excludedTargetWorkflow
+          ? { excluded: options.excludedTargetWorkflow }
+          : {}),
+      });
+      return {
+        caseId: `case-${replicate}`,
+        runId: `run-${replicate}`,
+        status: 'completed',
+        facts: completedFacts(),
+        questions: [],
+      };
+    };
+    const answerCache = new Map<string, unknown>();
+    await Promise.all([
+      internal.runBenchmarkReplicates(
+        campaign,
+        variant,
+        { artifactDirectory: artifacts },
+        config.benchmarks[0]!,
+        undefined,
+        {
+          replicateCount: 2,
+          answerSourceTargetWorkflow: 'trumark/deceased-accounts',
+          answerCache,
+        },
+      ),
+      internal.runBenchmarkReplicates(
+        campaign,
+        variant,
+        { artifactDirectory: artifacts },
+        config.benchmarks[0]!,
+        undefined,
+        {
+          replicateCount: 2,
+          scope: 'target-excluded/excluded',
+          answerSourceTargetWorkflow: 'trumark/deceased-accounts',
+          excludedTargetWorkflow: 'trumark/deceased-accounts',
+          answerCache,
+        },
+      ),
+    ]);
+
+    assert.equal(observed.length, 4);
+    assert.ok(observed.every(({ source, cache }) => source === '/target-filtered-source' && cache === answerCache));
+    assert.equal(observed.filter(({ excluded }) => excluded).length, 2);
+  } finally {
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('V2 primary resolution uses full-source PM simulation while preserving excluded snapshot isolation', async () => {
+  const fixture = await v2LifecycleFixture('v2-pm-primary-resolution');
+  try {
+    const primary = fixture.campaign.config.benchmarks[0]!;
+    const fullSource = path.join(fixture.root, 'full-frozen-workflows');
+    const excludedSource = path.join(fixture.root, 'target-excluded-workflows');
+    await Promise.all([mkdir(fullSource), mkdir(excludedSource)]);
+    let snapshotEnsured = 0;
+    let resolverSource: string | null = null;
+    let resolverMode: string | null = null;
+    const summary: BenchmarkQuestionResolution = {
+      ...resolution('primary', `sha256:${'9'.repeat(64)}`),
+      sourceFallbackAnswers: 0,
+      pmSimulationAnswers: 1,
+      entries: [
+        {
+          id: 'pm-question',
+          question: 'Which behavior should requirements specify?',
+          resolution: 'pm_simulation',
+          answer: 'Specify the observed account workflow behavior without naming its implementation.',
+          evidence: ['src/customers/trumark/deceased-accounts/index.ts:42'],
+        },
+      ],
+    };
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      ensureTargetExcludedWorkflowsSource: () => Promise<string>;
+      ensureFrozenWorkflowsSource: () => Promise<string>;
+      resolveV2PrimaryBenchmark: (
+        campaign: CampaignRecord,
+        benchmark: Benchmark,
+        targetWorkflow: string,
+        artifactDirectory: string,
+        dependencies: {
+          resolveBenchmarkQuestions: (input: {
+            benchmark: Benchmark;
+            workflowsSource: string;
+            sourceAnswerMode?: string;
+            answerAllowed?: (candidate: {
+              answer: string;
+              evidence: string[];
+              resolution: 'pm_simulation';
+            }) => boolean;
+          }) => Promise<{ benchmark: Benchmark; summary: BenchmarkQuestionResolution }>;
+        },
+      ) => Promise<{ benchmark: Benchmark; summary: BenchmarkQuestionResolution }>;
+      runBaseline: (campaignId: string) => Promise<VariantRecord>;
+      hasCompleteEvaluationArtifacts: () => Promise<boolean>;
+      recoverEvaluation: (campaign: CampaignRecord, variant: VariantRecord) => Promise<VariantRecord>;
+      prepareAutomaticV2Config: () => Promise<TargetExcludedConfig>;
+      persistAutomaticV2Config: (
+        campaign: CampaignRecord,
+        config: TargetExcludedConfig,
+      ) => Promise<TargetExcludedConfig>;
+      targetExcludedEvaluationReady: () => boolean;
+      finalizeBaseline: (campaignId: string, variant: VariantRecord) => Promise<VariantRecord>;
+      runVariant: () => Promise<VariantRecord>;
+      refreshReports: () => Promise<void>;
+    };
+    internal.ensureTargetExcludedWorkflowsSource = async () => {
+      snapshotEnsured += 1;
+      return excludedSource;
+    };
+    internal.ensureFrozenWorkflowsSource = async () => fullSource;
+    const resolved = await internal.resolveV2PrimaryBenchmark(
+      fixture.campaign,
+      primary,
+      fixture.targetConfig.targetImplementationWorkflow,
+      path.join(fixture.root, 'pack-questions'),
+      {
+        resolveBenchmarkQuestions: async (input) => {
+          resolverSource = input.workflowsSource;
+          resolverMode = input.sourceAnswerMode ?? null;
+          assert.equal(
+            input.answerAllowed?.({
+              answer: 'Specify the observed behavior.',
+              evidence: ['src/customers/trumark/deceased-accounts/index.ts:42'],
+              resolution: 'pm_simulation',
+            }),
+            true,
+          );
+          assert.equal(
+            input.answerAllowed?.({
+              answer: 'Use src/customers/trumark/deceased-accounts/index.ts directly.',
+              evidence: ['harness-only PM rationale'],
+              resolution: 'pm_simulation',
+            }),
+            false,
+          );
+          return {
+            benchmark: {
+              ...input.benchmark,
+              zipPath: path.join(fixture.root, 'resolved-primary.zip'),
+              sha256: summary.resolvedArtifactSha,
+            },
+            summary,
+          };
+        },
+      },
+    );
+
+    assert.equal(snapshotEnsured, 1);
+    assert.equal(resolverSource, fullSource);
+    assert.equal(resolverMode, 'pm-simulation');
+    assert.deepEqual(resolved.summary.entries[0]?.evidence, [
+      'src/customers/trumark/deceased-accounts/index.ts:42',
+    ]);
+    assert.equal(resolved.benchmark.zipPath, path.join(fixture.root, 'resolved-primary.zip'));
+
+    fixture.database.updateVariant(fixture.variant.id, {
+      status: 'failed',
+      questionResolutions: {
+        ...fixture.variant.questionResolutions,
+        primary: resolved.summary,
+      },
+    });
+    internal.hasCompleteEvaluationArtifacts = async () => true;
+    internal.recoverEvaluation = async (_campaign, variant) =>
+      fixture.database.updateVariant(variant.id, { status: 'review', error: null });
+    internal.prepareAutomaticV2Config = async () => fixture.targetConfig;
+    internal.persistAutomaticV2Config = async (_campaign, config) => {
+      if (!fixture.database.getTargetExcludedConfig(fixture.campaign.id)) {
+        fixture.database.createTargetExcludedConfig(fixture.campaign.id, config);
+      }
+      return config;
+    };
+    internal.targetExcludedEvaluationReady = () => true;
+    internal.finalizeBaseline = async (_campaignId, variant) =>
+      fixture.database.updateVariant(variant.id, { status: 'completed' });
+    internal.runVariant = async () => {
+      throw new Error('created a replacement after successful PM resolution');
+    };
+    internal.refreshReports = async () => undefined;
+
+    const recovered = await internal.runBaseline(fixture.campaign.id);
+    assert.equal(recovered.id, fixture.variant.id);
+    assert.equal(fixture.database.listVariants(fixture.campaign.id).length, 1);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('target-bound runtime questions use full-source PM simulation without exposing evidence', async () => {
+  const fixture = await v2LifecycleFixture('v2-runtime-pm-answer');
+  try {
+    const fullSource = path.join(fixture.root, 'full-frozen-workflows');
+    let observedSource: string | null = null;
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      ensureFrozenWorkflowsSource: () => Promise<string>;
+      answerRuntimeQuestionFromImplementation: (
+        campaign: CampaignRecord,
+        question: PlannerQuestionRecord,
+        workflowsSource: string,
+        artifactDirectory: string,
+      ) => Promise<{
+        resolution: 'answered';
+        answer: string;
+        evidence: string[];
+      }>;
+      answerRuntimeQuestion: (
+        campaign: CampaignRecord,
+        question: PlannerQuestionRecord,
+        consultations: unknown[],
+        workflowsSource: string,
+        artifactDirectory: string,
+        answerCache: Map<string, unknown>,
+        targetContext: {
+          targetWorkflow: string;
+          variantId: string;
+          benchmark: string;
+          replicate: number;
+        },
+      ) => Promise<{
+        answer: string;
+        resolution: string;
+        evidence: string[];
+        requirementsAgentRequests: number;
+      }>;
+    };
+    internal.ensureFrozenWorkflowsSource = async () => fullSource;
+    internal.answerRuntimeQuestionFromImplementation = async (
+      _campaign,
+      _question,
+      workflowsSource,
+    ) => {
+      observedSource = workflowsSource;
+      return {
+        resolution: 'answered',
+        answer: 'Use the implementation-backed keyable row format.',
+        evidence: ['src/customers/trumark/deceased-accounts/summary-block.ts:197-204'],
+      };
+    };
+    const question: PlannerQuestionRecord = {
+      id: 'runtime-pm-question',
+      createdByRunId: 'runtime-pm-run',
+      responseKind: 'free_text',
+      prompt: 'Which keyable row format should be used?',
+      rationale: 'The reviewed text leaves the exact format unresolved.',
+      context: {},
+      status: 'open',
+    };
+
+    const answer = await internal.answerRuntimeQuestion(
+      fixture.campaign,
+      question,
+      [],
+      path.join(fixture.root, 'target-safe-source'),
+      path.join(fixture.root, 'runtime-question'),
+      new Map(),
+      {
+        targetWorkflow: fixture.targetConfig.targetImplementationWorkflow,
+        variantId: fixture.variant.id,
+        benchmark: 'primary:excluded',
+        replicate: 1,
+      },
+    );
+
+    assert.equal(observedSource, fullSource);
+    assert.equal(answer.resolution, 'pm_simulation');
+    assert.deepEqual(answer.evidence, [
+      'PM simulation evidence is retained in the immutable harness agent transcript.',
+    ]);
+    assert.equal(answer.requirementsAgentRequests, 0);
+    const summary = withRuntimeQuestions(resolution('primary', `sha256:${'8'.repeat(64)}`), [
+      {
+        questionId: question.id,
+        prompt: question.prompt,
+        answer: answer.answer,
+        resolution: 'pm_simulation',
+        evidence: answer.evidence,
+        requirementsAgentRequests: answer.requirementsAgentRequests,
+      },
+    ]);
+    assert.equal(summary.plannerPmSimulationAnswers, 1);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('target-blind judgment persists generic evidence instead of an excluded source path', () => {
+  const judgment = targetSafeJudgeOutput(
+    {
+      summary: 'The target implementation is absent.',
+      verdicts: [
+        {
+          unitKey: 'unit-a',
+          expectedDecision: 'build',
+          classification: 'real_gap',
+          confidence: 'high',
+          rationale: 'No eligible source was present.',
+          evidence: [
+            'No src/customers/trumark/deceased-accounts implementation exists in the frozen checkout',
+            'Shared search returned no eligible declaration.',
+          ],
+        },
+      ],
+    },
+    'trumark/deceased-accounts',
+  );
+
+  assert.deepEqual(judgment.verdicts[0]?.evidence, [
+    'Target implementation is absent from the target-excluded source snapshot.',
+    'Shared search returned no eligible declaration.',
+  ]);
+});
+
+test('automatic promotion skips candidates rejected by holdout validation', async () => {
+  const fixture = await v2LifecycleFixture('automatic-holdout-rejection');
+  try {
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      promoteUnlocked: (campaignId: string, variantId: string) => Promise<VariantRecord>;
+      promoteFirstEligibleAutomaticCandidate: (
+        campaignId: string,
+        eligible: readonly VariantRecord[],
+      ) => Promise<boolean>;
+    };
+    internal.promoteUnlocked = async (_campaignId, variantId) => {
+      fixture.database.updateVariant(variantId, {
+        status: 'rejected',
+        error: 'holdout regression: holdout',
+      });
+      throw new Error('variant regressed holdout benchmarks: holdout');
+    };
+
+    assert.equal(
+      await internal.promoteFirstEligibleAutomaticCandidate(fixture.campaign.id, [fixture.variant]),
+      false,
+    );
+    assert.equal(fixture.database.getVariant(fixture.variant.id).status, 'rejected');
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+const baselineHypothesisForTest = {
+  title: 'Seed',
+  rationale: 'Observe the seed.',
+  instructions: 'Do not modify the planner.',
+  expectedImpact: 'Produce reference facts.',
+  risk: 'Fixture only.',
+  findingIds: [],
+};
+
+test('V2 readiness requires a valid binding to standard primary execution and artifacts', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'planner-eval-v2-ready-'));
+  const data = path.join(root, 'data');
+  await mkdir(data);
+  const paths: HarnessPaths = {
+    root: data,
+    database: path.join(data, 'harness.sqlite'),
+    campaigns: path.join(data, 'campaigns'),
+    worktrees: path.join(data, 'worktrees'),
+    artifacts: path.join(data, 'artifacts'),
+    reports: path.join(root, 'reports'),
+  };
+  const database = new HarnessDatabase(paths.database);
+  try {
+    const resolvedArtifactSha = `sha256:${'e'.repeat(64)}`;
+    const campaignConfig = CampaignConfigSchema.parse({
+      id: 'v2-ready-test',
+      goal: 'Require exact standard execution lineage before target promotion.',
+      plannerRepo: root,
+      workflowsRepo: root,
+      environmentFile: path.join(root, 'environment.env'),
+      seedRevision: 'seed',
+      workflowsRevision: 'workflows',
+      evaluation: { replicates: 2, replicateConcurrency: 2 },
+      targetExcluded: {
+        protocol: 'standard-primary-v2',
+        targetImplementationWorkflow: 'trumark/deceased-accounts',
+      },
+      benchmarks: [
+        { name: 'primary', role: 'primary', zipPath: path.join(root, 'primary.zip') },
+        { name: 'holdout', role: 'holdout', zipPath: path.join(root, 'holdout.zip') },
+      ],
+    });
+    const campaign = database.createCampaign(
+      campaignConfig,
+      'a'.repeat(40),
+      'b'.repeat(40),
+      `sha256:${'c'.repeat(64)}`,
+      'https://github.com/Saris-AI/workflows.git',
+    );
+    const created = database.createVariant({
+      id: 'v2-ready-test-v000',
+      campaignId: campaign.id,
+      parentVariantId: null,
+      round: 0,
+      ordinal: 0,
+      hypothesis: baselineHypothesisForTest,
+    });
+    const facts = completedFacts();
+    database.updateVariant(created.id, {
+      status: 'completed',
+      artifactCollectionComplete: true,
+      facts,
+      replicateFacts: [facts, facts],
+      holdoutFacts: { holdout: facts },
+      holdoutReplicateFacts: { holdout: [facts, facts] },
+      questionResolutions: { primary: resolution('primary', resolvedArtifactSha) },
+      executionState: {
+        executions: [1, 2].map((replicate) => ({
+          benchmark: 'primary',
+          role: 'primary' as const,
+          replicate,
+          replicateCount: 2,
+          ...completedSnapshot(`normal-case-${replicate}`, `normal-run-${replicate}`),
+        })),
+      },
+    });
+    const targetConfig = database.createTargetExcludedConfig(campaign.id, {
+      protocol: 'standard-primary-v2',
+      targetImplementationWorkflow: 'trumark/deceased-accounts',
+      baselineVariantId: created.id,
+      comparatorImage: `sha256:${'f'.repeat(64)}`,
+      configuredAt: '2026-09-06T00:00:00.000Z',
+      normalArmSource: 'standard_primary',
+      primaryResolvedArtifactSha: resolvedArtifactSha,
+    });
+    database.createTargetExcludedEvaluation(campaign.id, created.id);
+    const judgment = {
+      summary: 'The target-blind result is internally consistent.',
+      verdicts: [
+        {
+          unitKey: 'unit-a',
+          expectedDecision: 'build' as const,
+          classification: 'real_gap' as const,
+          confidence: 'high' as const,
+          rationale: 'No reusable source evidence was visible.',
+          evidence: ['target-filtered source snapshot'],
+        },
+      ],
+    };
+    const score = {
+      cohortMismatches: [],
+      verified: { labeled: 0, correct: 0, errors: 0, accuracy: null },
+      provisional: { labeled: 1, correct: 1, errors: 0, accuracy: 1 },
+      decisionErrors: { build: 0, reuse: 0, extend: 0, defer: 0, question: 0 },
+    };
+    const comparisonReports = [1, 2].map((replicate) =>
+      validComparisonReport(
+        `normal-case-${replicate}`,
+        `excluded-case-${replicate}`,
+        `normal-run-${replicate}`,
+        `excluded-run-${replicate}`,
+      ),
+    );
+    const comparisons = comparisonReports.map((report, index) =>
+      summarizeTargetExcludedComparisonReport(index + 1, report),
+    );
+    const comparisonDirectory = path.join(
+      paths.artifacts,
+      campaign.id,
+      created.id,
+      'target-excluded/comparisons',
+    );
+    await mkdir(comparisonDirectory, { recursive: true });
+    await Promise.all(
+      comparisonReports.map((report, index) =>
+        writeFile(
+          path.join(comparisonDirectory, `replicate-${index + 1}.json`),
+          `${JSON.stringify(report)}\n`,
+        ),
+      ),
+    );
+    const gate = computeTargetExcludedGate([facts, facts], [facts, facts], true, false);
+    database.updateTargetExcludedEvaluation(created.id, {
+      status: 'completed',
+      excludedFacts: facts,
+      excludedReplicateFacts: [facts, facts],
+      judgment,
+      score,
+      questionResolution: resolution('primary', resolvedArtifactSha),
+      executionState: {
+        executions: [1, 2].map((replicate) => ({
+          benchmark: 'primary:excluded',
+          role: 'primary' as const,
+          replicate,
+          replicateCount: 2,
+          ...completedSnapshot(`excluded-case-${replicate}`, `excluded-run-${replicate}`),
+        })),
+      },
+      comparisons,
+      gate,
+      normalArmBinding: {
+        source: 'standard_primary',
+        benchmark: 'primary',
+        resolvedArtifactSha,
+        replicates: [
+          { replicate: 1, caseId: 'normal-case-1', runId: 'normal-run-1' },
+          { replicate: 2, caseId: 'normal-case-2', runId: 'normal-run-2' },
+        ],
+      },
+      artifactCollectionComplete: true,
+    });
+    const orchestrator = new CampaignOrchestrator(paths, database) as unknown as {
+      targetExcludedEvaluationReady: (
+        campaign: CampaignRecord,
+        config: TargetExcludedConfig,
+        evaluation: ReturnType<HarnessDatabase['getTargetExcludedEvaluation']>,
+        baseline: boolean,
+      ) => boolean;
+      reconcileTargetSafeQuestionResolution: (
+        campaign: CampaignRecord,
+        config: TargetExcludedConfig,
+        evaluation: ReturnType<HarnessDatabase['getTargetExcludedEvaluation']>,
+      ) => ReturnType<HarnessDatabase['getTargetExcludedEvaluation']>;
+      verifyArchivedTargetExcludedComparisons: (
+        campaign: CampaignRecord,
+        variantId: string,
+        config: TargetExcludedConfig,
+        evaluation: NonNullable<ReturnType<HarnessDatabase['getTargetExcludedEvaluation']>>,
+      ) => Promise<void>;
+    };
+    assert.equal(
+      orchestrator.targetExcludedEvaluationReady(
+        campaign,
+        targetConfig,
+        database.getTargetExcludedEvaluation(created.id),
+        true,
+      ),
+      true,
+    );
+    const leakyResolution: BenchmarkQuestionResolution = {
+      ...resolution('primary', resolvedArtifactSha),
+      pmSimulationAnswers: 1,
+      entries: [
+        {
+          id: 'pm-question',
+          question: 'Which product behavior is intended?',
+          resolution: 'pm_simulation',
+          answer: 'Use the implementation-backed behavior.',
+          evidence: ['src/customers/trumark/deceased-accounts/index.ts:42'],
+        },
+      ],
+    };
+    const blocked = database.updateTargetExcludedEvaluation(created.id, {
+      questionResolution: leakyResolution,
+      gate: computeTargetExcludedGate([facts, facts], [facts, facts], true, true),
+    });
+    assert.equal(
+      orchestrator.targetExcludedEvaluationReady(campaign, targetConfig, blocked, true),
+      false,
+    );
+    const reconciled = orchestrator.reconcileTargetSafeQuestionResolution(
+      campaign,
+      targetConfig,
+      blocked,
+    );
+    assert.ok(reconciled);
+    assert.equal(
+      orchestrator.targetExcludedEvaluationReady(campaign, targetConfig, reconciled, true),
+      true,
+    );
+    assert.deepEqual(reconciled.questionResolution?.entries[0]?.evidence, [
+      'PM simulation evidence is retained in the immutable harness agent transcript.',
+    ]);
+    await orchestrator.verifyArchivedTargetExcludedComparisons(
+      campaign,
+      created.id,
+      targetConfig,
+      database.getTargetExcludedEvaluation(created.id)!,
+    );
+
+    await writeFile(
+      path.join(comparisonDirectory, 'replicate-1.json'),
+      `${JSON.stringify({ ...comparisonReports[0], hash: `sha256:${'0'.repeat(64)}` })}\n`,
+    );
+    await assert.rejects(
+      orchestrator.verifyArchivedTargetExcludedComparisons(
+        campaign,
+        created.id,
+        targetConfig,
+        database.getTargetExcludedEvaluation(created.id)!,
+      ),
+      /comparison report hash does not bind its canonical content/,
+    );
+    await writeFile(
+      path.join(comparisonDirectory, 'replicate-1.json'),
+      `${JSON.stringify(comparisonReports[1])}\n`,
+    );
+    await assert.rejects(
+      orchestrator.verifyArchivedTargetExcludedComparisons(
+        campaign,
+        created.id,
+        targetConfig,
+        database.getTargetExcludedEvaluation(created.id)!,
+      ),
+      /archived target-excluded comparison differs from persisted summary/,
+    );
+    await writeFile(
+      path.join(comparisonDirectory, 'replicate-1.json'),
+      `${JSON.stringify(comparisonReports[0])}\n`,
+    );
+    await rm(path.join(comparisonDirectory, 'replicate-2.json'));
+    await assert.rejects(
+      orchestrator.verifyArchivedTargetExcludedComparisons(
+        campaign,
+        created.id,
+        targetConfig,
+        database.getTargetExcludedEvaluation(created.id)!,
+      ),
+      /ENOENT/,
+    );
+    await writeFile(
+      path.join(comparisonDirectory, 'replicate-2.json'),
+      `${JSON.stringify(comparisonReports[1])}\n`,
+    );
+
+    database.updateTargetExcludedEvaluation(created.id, {
+      normalArmBinding: {
+        source: 'standard_primary',
+        benchmark: 'primary',
+        resolvedArtifactSha,
+        replicates: [
+          { replicate: 1, caseId: 'wrong-case', runId: 'normal-run-1' },
+          { replicate: 2, caseId: 'normal-case-2', runId: 'normal-run-2' },
+        ],
+      },
+    });
+    assert.equal(
+      orchestrator.targetExcludedEvaluationReady(
+        campaign,
+        targetConfig,
+        database.getTargetExcludedEvaluation(created.id),
+        true,
+      ),
+      false,
+    );
+
+    database.updateTargetExcludedEvaluation(created.id, {
+      normalArmBinding: {
+        source: 'standard_primary',
+        benchmark: 'primary',
+        resolvedArtifactSha,
+        replicates: [
+          { replicate: 1, caseId: 'normal-case-1', runId: 'normal-run-1' },
+          { replicate: 2, caseId: 'normal-case-2', runId: 'normal-run-2' },
+        ],
+      },
+      comparisons: [
+        { ...comparisons[0]!, normalCaseId: 'normal-case-2' },
+        { ...comparisons[1]!, excludedCaseId: 'wrong-excluded-case' },
+      ],
+    });
+    assert.equal(
+      orchestrator.targetExcludedEvaluationReady(
+        campaign,
+        targetConfig,
+        database.getTargetExcludedEvaluation(created.id),
+        true,
+      ),
+      false,
+    );
+
+    database.updateTargetExcludedEvaluation(created.id, {
+      comparisons: [
+        {
+          ...comparisons[0]!,
+          normalRunId: 'normal-run-2',
+        },
+        {
+          ...comparisons[1]!,
+          excludedRunId: 'wrong-excluded-run',
+        },
+      ],
+    });
+    assert.equal(
+      orchestrator.targetExcludedEvaluationReady(
+        campaign,
+        targetConfig,
+        database.getTargetExcludedEvaluation(created.id),
+        true,
+      ),
+      false,
+    );
+  } finally {
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('V2 baseline finalization fails explicitly until target evaluation is ready', async () => {
+  const fixture = await v2LifecycleFixture('v2-finalize-boundary');
+  try {
+    fixture.database.createTargetExcludedConfig(fixture.campaign.id, fixture.targetConfig);
+    fixture.database.createTargetExcludedEvaluation(fixture.campaign.id, fixture.variant.id);
+    fixture.database.updateTargetExcludedEvaluation(fixture.variant.id, {
+      status: 'failed',
+      error: 'excluded arm failed',
+    });
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      targetExcludedEvaluationReady: () => boolean;
+      finalizeBaseline: (campaignId: string, variant: VariantRecord) => Promise<VariantRecord>;
+      refreshReports: () => Promise<void>;
+    };
+    internal.targetExcludedEvaluationReady = () => false;
+    internal.refreshReports = async () => undefined;
+
+    const result = await internal.finalizeBaseline(fixture.campaign.id, fixture.variant);
+
+    assert.equal(result.status, 'review');
+    assert.equal(fixture.database.getCampaign(fixture.campaign.id).status, 'baseline_target_failed');
+    assert.equal(fixture.database.getCampaign(fixture.campaign.id).currentParentVariantId, null);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('runBaseline retries only the excluded arm for its config-bound standard baseline', async () => {
+  const fixture = await v2LifecycleFixture('v2-baseline-retry');
+  try {
+    fixture.database.createTargetExcludedConfig(fixture.campaign.id, fixture.targetConfig);
+    fixture.database.createTargetExcludedEvaluation(fixture.campaign.id, fixture.variant.id);
+    fixture.database.updateTargetExcludedEvaluation(fixture.variant.id, {
+      status: 'failed',
+      error: 'excluded arm failed',
+      artifactCollectionComplete: true,
+    });
+    fixture.database.updateCampaign(fixture.campaign.id, { status: 'baseline_target_failed' });
+    let backfills = 0;
+    const orchestrator = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      targetExcludedEvaluationReady: () => boolean;
+      runTargetExcludedBackfill: () => Promise<ReturnType<HarnessDatabase['getTargetExcludedEvaluation']>>;
+      hasCompleteEvaluationArtifacts: () => Promise<boolean>;
+      runVariant: () => Promise<VariantRecord>;
+      refreshReports: () => Promise<void>;
+      runBaseline: (campaignId: string) => Promise<VariantRecord>;
+      verifyAutomaticV2ComparatorImage: () => Promise<void>;
+    };
+    orchestrator.verifyAutomaticV2ComparatorImage = async () => undefined;
+    orchestrator.targetExcludedEvaluationReady = () => backfills === 1;
+    orchestrator.hasCompleteEvaluationArtifacts = async () => true;
+    orchestrator.runTargetExcludedBackfill = async () => {
+      backfills += 1;
+      const reports = [1, 2].map((replicate) =>
+        validComparisonReport(
+          `normal-case-${replicate}`,
+          `excluded-case-${replicate}`,
+          `normal-run-${replicate}`,
+          `excluded-run-${replicate}`,
+        ),
+      );
+      const comparisonDirectory = path.join(
+        fixture.paths.artifacts,
+        fixture.campaign.id,
+        fixture.variant.id,
+        'target-excluded/comparisons',
+      );
+      await mkdir(comparisonDirectory, { recursive: true });
+      await Promise.all(
+        reports.map((report, index) =>
+          writeFile(
+            path.join(comparisonDirectory, `replicate-${index + 1}.json`),
+            `${JSON.stringify(report)}\n`,
+          ),
+        ),
+      );
+      return fixture.database.updateTargetExcludedEvaluation(fixture.variant.id, {
+        status: 'completed',
+        artifactCollectionComplete: true,
+        comparisons: reports.map((report, index) =>
+          summarizeTargetExcludedComparisonReport(index + 1, report),
+        ),
+        error: null,
+      });
+    };
+    orchestrator.runVariant = async () => {
+      throw new Error('runBaseline created a replacement baseline');
+    };
+    orchestrator.refreshReports = async () => undefined;
+
+    const result = await orchestrator.runBaseline(fixture.campaign.id);
+
+    assert.equal(backfills, 1);
+    assert.equal(result.id, fixture.variant.id);
+    assert.equal(result.status, 'completed');
+    assert.equal(fixture.database.listVariants(fixture.campaign.id).length, 1);
+    assert.equal(fixture.database.getCampaign(fixture.campaign.id).status, 'ready');
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('backfill archives an invalid complete target attempt and regenerates instead of blocking', async () => {
+  const fixture = await v2LifecycleFixture('v2-invalid-complete-retry');
+  try {
+    fixture.database.createTargetExcludedEvaluation(fixture.campaign.id, fixture.variant.id);
+    fixture.database.updateTargetExcludedEvaluation(fixture.variant.id, {
+      status: 'completed',
+      artifactCollectionComplete: true,
+    });
+    const targetDirectory = path.join(
+      fixture.paths.artifacts,
+      fixture.campaign.id,
+      fixture.variant.id,
+      'target-excluded',
+    );
+    await mkdir(targetDirectory, { recursive: true });
+    await writeFile(path.join(targetDirectory, 'old-attempt.txt'), 'invalid archived attempt\n');
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      targetExcludedEvaluationReady: () => boolean;
+      verifyArchivedTargetExcludedComparisons: () => Promise<void>;
+      runTargetExcludedBackfill: (
+        campaign: CampaignRecord,
+        variant: VariantRecord,
+        config: TargetExcludedConfig,
+      ) => Promise<NonNullable<ReturnType<HarnessDatabase['getTargetExcludedEvaluation']>>>;
+      refreshReports: () => Promise<void>;
+    };
+    internal.targetExcludedEvaluationReady = () => true;
+    internal.verifyArchivedTargetExcludedComparisons = async () => {
+      throw new Error('invalid archived comparison bytes');
+    };
+    internal.refreshReports = async () => undefined;
+
+    const result = await internal.runTargetExcludedBackfill(
+      fixture.campaign,
+      fixture.variant,
+      fixture.targetConfig,
+    );
+
+    assert.equal(result.status, 'failed');
+    assert.equal(
+      await readFile(
+        path.join(
+          fixture.paths.artifacts,
+          fixture.campaign.id,
+          fixture.variant.id,
+          'target-excluded-attempts/attempt-001/old-attempt.txt',
+        ),
+        'utf8',
+      ),
+      'invalid archived attempt\n',
+    );
+    assert.ok(
+      fixture.database
+        .listEvents(fixture.campaign.id)
+        .some(({ type }) => type === 'target_excluded.invalid_attempt'),
+    );
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('runBaseline reconciles a config-less integrated stack and reuses its complete baseline', async () => {
+  const fixture = await v2LifecycleFixture('v2-interrupted-reuse');
+  try {
+    const artifactRoot = path.join(
+      fixture.paths.artifacts,
+      fixture.campaign.id,
+      fixture.variant.id,
+    );
+    await writeFile(path.join(artifactRoot, 'stack.env'), 'PLANNER_DDB_TABLE=interrupted\n');
+    fixture.database.updateVariant(fixture.variant.id, {
+      status: 'running',
+      artifactCollectionComplete: false,
+    });
+    let archives = 0;
+    let boundBaselineId: string | null = null;
+    const orchestrator = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      runBaseline: (campaignId: string) => Promise<VariantRecord>;
+      archiveInterruptedIntegratedStack: (
+        campaign: CampaignRecord,
+        variant: VariantRecord,
+        options?: { allowIncomplete?: boolean },
+      ) => Promise<VariantRecord>;
+      hasCompleteEvaluationArtifacts: () => Promise<boolean>;
+      recoverEvaluation: (campaign: CampaignRecord, variant: VariantRecord) => Promise<VariantRecord>;
+      prepareAutomaticV2Config: (
+        campaign: CampaignRecord,
+        variant: VariantRecord,
+      ) => Promise<TargetExcludedConfig>;
+      persistAutomaticV2Config: (
+        campaign: CampaignRecord,
+        config: TargetExcludedConfig,
+      ) => Promise<TargetExcludedConfig>;
+      targetExcludedEvaluationReady: () => boolean;
+      finalizeBaseline: (campaignId: string, variant: VariantRecord) => Promise<VariantRecord>;
+      runVariant: () => Promise<VariantRecord>;
+      refreshReports: () => Promise<void>;
+    };
+    orchestrator.archiveInterruptedIntegratedStack = async (_campaign, variant) => {
+      archives += 1;
+      return fixture.database.updateVariant(variant.id, { artifactCollectionComplete: true });
+    };
+    orchestrator.hasCompleteEvaluationArtifacts = async () => true;
+    orchestrator.recoverEvaluation = async (_campaign, variant) =>
+      fixture.database.updateVariant(variant.id, { status: 'review', error: null });
+    orchestrator.prepareAutomaticV2Config = async (_campaign, variant) => {
+      boundBaselineId = variant.id;
+      return fixture.targetConfig;
+    };
+    orchestrator.persistAutomaticV2Config = async (_campaign, config) => {
+      if (!fixture.database.getTargetExcludedConfig(fixture.campaign.id)) {
+        fixture.database.createTargetExcludedConfig(fixture.campaign.id, config);
+      }
+      return config;
+    };
+    orchestrator.targetExcludedEvaluationReady = () => true;
+    orchestrator.finalizeBaseline = async (_campaignId, variant) =>
+      fixture.database.updateVariant(variant.id, { status: 'completed' });
+    orchestrator.runVariant = async () => {
+      throw new Error('created a replacement before reconciling the interrupted stack');
+    };
+    orchestrator.refreshReports = async () => undefined;
+
+    const result = await orchestrator.runBaseline(fixture.campaign.id);
+
+    assert.equal(archives, 1);
+    assert.equal(boundBaselineId, fixture.variant.id);
+    assert.equal(result.id, fixture.variant.id);
+    assert.equal(fixture.database.listVariants(fixture.campaign.id).length, 1);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('runBaseline archives an unrecoverable config-less stack before creating a replacement', async () => {
+  const fixture = await v2LifecycleFixture('v2-interrupted-replace');
+  try {
+    const artifactRoot = path.join(
+      fixture.paths.artifacts,
+      fixture.campaign.id,
+      fixture.variant.id,
+    );
+    await writeFile(path.join(artifactRoot, 'stack.env'), 'PLANNER_DDB_TABLE=interrupted\n');
+    fixture.database.updateVariant(fixture.variant.id, {
+      status: 'running',
+      artifactCollectionComplete: false,
+      facts: null,
+      replicateFacts: null,
+      holdoutFacts: null,
+      holdoutReplicateFacts: null,
+    });
+    let archived = false;
+    const orchestrator = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      runBaseline: (campaignId: string) => Promise<VariantRecord>;
+      archiveInterruptedIntegratedStack: (
+        campaign: CampaignRecord,
+        variant: VariantRecord,
+        options?: { allowIncomplete?: boolean },
+      ) => Promise<VariantRecord>;
+      hasCompleteEvaluationArtifacts: () => Promise<boolean>;
+      runVariant: (
+        campaign: CampaignRecord,
+        variant: VariantRecord,
+      ) => Promise<VariantRecord>;
+      finalizeBaseline: (campaignId: string, variant: VariantRecord) => Promise<VariantRecord>;
+      refreshReports: () => Promise<void>;
+    };
+    orchestrator.archiveInterruptedIntegratedStack = async (_campaign, variant, options) => {
+      assert.equal(options?.allowIncomplete, true);
+      archived = true;
+      return fixture.database.updateVariant(variant.id, { artifactCollectionComplete: true });
+    };
+    orchestrator.hasCompleteEvaluationArtifacts = async () => false;
+    orchestrator.runVariant = async (_campaign, variant) => {
+      assert.equal(archived, true);
+      return fixture.database.updateVariant(variant.id, { status: 'failed' });
+    };
+    orchestrator.finalizeBaseline = async (_campaignId, variant) => variant;
+    orchestrator.refreshReports = async () => undefined;
+
+    const result = await orchestrator.runBaseline(fixture.campaign.id);
+
+    assert.equal(archived, true);
+    assert.equal(result.id, `${fixture.campaign.id}-v001`);
+    assert.equal(fixture.database.getVariant(fixture.variant.id).status, 'failed');
+    assert.equal(fixture.database.listVariants(fixture.campaign.id).length, 2);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('incomplete archive mode abandons after collection failure when reattach and stop succeed', async () => {
+  const fixture = await v2LifecycleFixture('v2-archive-collection-failure');
+  try {
+    const marker = path.join(
+      fixture.paths.artifacts,
+      fixture.campaign.id,
+      fixture.variant.id,
+      'partial-artifact.txt',
+    );
+    await writeFile(marker, 'partial archive\n');
+    const variant = fixture.database.updateVariant(fixture.variant.id, {
+      status: 'running',
+      artifactCollectionComplete: false,
+    });
+    fixture.database.createTargetExcludedEvaluation(fixture.campaign.id, variant.id);
+    fixture.database.updateTargetExcludedEvaluation(variant.id, { status: 'running' });
+    let stopped = false;
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      ensureFrozenPlannerSource: () => Promise<string>;
+      archiveInterruptedIntegratedStack: (
+        campaign: CampaignRecord,
+        variant: VariantRecord,
+        options: {
+          allowIncomplete: boolean;
+          reattach: () => Promise<unknown>;
+          collect: () => Promise<void>;
+          stop: () => Promise<void>;
+        },
+      ) => Promise<VariantRecord>;
+    };
+    internal.ensureFrozenPlannerSource = async () => fixture.root;
+
+    const archived = await internal.archiveInterruptedIntegratedStack(
+      fixture.campaign,
+      variant,
+      {
+        allowIncomplete: true,
+        reattach: async () => ({}),
+        collect: async () => {
+          throw new Error('collection failed');
+        },
+        stop: async () => {
+          stopped = true;
+        },
+      },
+    );
+
+    assert.equal(stopped, true);
+    assert.equal(archived.status, 'failed');
+    assert.equal(archived.artifactCollectionComplete, false);
+    assert.match(archived.error ?? '', /collection failed/);
+    const target = fixture.database.getTargetExcludedEvaluation(variant.id);
+    assert.equal(target?.status, 'failed');
+    assert.match(target?.error ?? '', /archived before target evaluation completed/);
+    assert.equal(await readFile(marker, 'utf8'), 'partial archive\n');
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('incomplete archive mode remains fail-closed when stack reattach fails', async () => {
+  const fixture = await v2LifecycleFixture('v2-archive-reattach-failure');
+  try {
+    const variant = fixture.database.updateVariant(fixture.variant.id, {
+      status: 'running',
+      artifactCollectionComplete: false,
+    });
+    let stopped = false;
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      ensureFrozenPlannerSource: () => Promise<string>;
+      archiveInterruptedIntegratedStack: (
+        campaign: CampaignRecord,
+        variant: VariantRecord,
+        options: {
+          allowIncomplete: boolean;
+          reattach: () => Promise<unknown>;
+          collect: () => Promise<void>;
+          stop: () => Promise<void>;
+        },
+      ) => Promise<VariantRecord>;
+    };
+    internal.ensureFrozenPlannerSource = async () => fixture.root;
+
+    await assert.rejects(
+      internal.archiveInterruptedIntegratedStack(fixture.campaign, variant, {
+        allowIncomplete: true,
+        reattach: async () => {
+          throw new Error('reattach failed');
+        },
+        collect: async () => undefined,
+        stop: async () => {
+          stopped = true;
+        },
+      }),
+      /reattach failed/,
+    );
+    assert.equal(stopped, false);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('incomplete archive mode remains fail-closed when stack stop fails', async () => {
+  const fixture = await v2LifecycleFixture('v2-archive-stop-failure');
+  try {
+    const variant = fixture.database.updateVariant(fixture.variant.id, {
+      status: 'running',
+      artifactCollectionComplete: false,
+    });
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      ensureFrozenPlannerSource: () => Promise<string>;
+      archiveInterruptedIntegratedStack: (
+        campaign: CampaignRecord,
+        variant: VariantRecord,
+        options: {
+          allowIncomplete: boolean;
+          reattach: () => Promise<unknown>;
+          collect: () => Promise<void>;
+          stop: () => Promise<void>;
+        },
+      ) => Promise<VariantRecord>;
+    };
+    internal.ensureFrozenPlannerSource = async () => fixture.root;
+
+    await assert.rejects(
+      internal.archiveInterruptedIntegratedStack(fixture.campaign, variant, {
+        allowIncomplete: true,
+        reattach: async () => ({}),
+        collect: async () => undefined,
+        stop: async () => {
+          throw new Error('stop failed');
+        },
+      }),
+      /stop failed/,
+    );
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('fulfilled V2 standard cohorts are persisted before a sibling cohort failure is raised', async () => {
+  const fixture = await v2LifecycleFixture('v2-cohort-boundary');
+  try {
+    if (fixture.targetConfig.protocol !== 'standard-primary-v2') {
+      throw new Error('fixture target config is not V2');
+    }
+    fixture.database.updateVariant(fixture.variant.id, {
+      facts: null,
+      replicateFacts: null,
+      holdoutFacts: null,
+      holdoutReplicateFacts: null,
+    });
+    const primarySummary = resolution('primary', fixture.targetConfig.primaryResolvedArtifactSha);
+    const holdoutSummary = resolution('holdout', `sha256:${'d'.repeat(64)}`);
+    const result = {
+      facts: completedFacts(),
+      replicates: [completedFacts(), completedFacts()],
+      questions: [
+        {
+          questionId: 'runtime-question',
+          prompt: 'Which shared boundary applies?',
+          answer: 'Use the shared boundary.',
+          resolution: 'source_fallback' as const,
+          evidence: ['shared/source.ts:1'],
+          requirementsAgentRequests: 0,
+        },
+      ],
+    };
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      persistV2StandardOutcomes: (
+        variantId: string,
+        primary: Benchmark,
+        holdouts: Benchmark[],
+        summaries: Record<string, BenchmarkQuestionResolution>,
+        outcomes: PromiseSettledResult<typeof result>[],
+      ) => { failures: unknown[] };
+    };
+
+    const persisted = internal.persistV2StandardOutcomes(
+      fixture.variant.id,
+      fixture.campaign.config.benchmarks[0]!,
+      [fixture.campaign.config.benchmarks[1]!],
+      { primary: primarySummary, holdout: holdoutSummary },
+      [
+        { status: 'fulfilled', value: result },
+        { status: 'rejected', reason: new Error('holdout failed') },
+      ],
+    );
+
+    const variant = fixture.database.getVariant(fixture.variant.id);
+    assert.equal(persisted.failures.length, 1);
+    assert.deepEqual(variant.facts, result.facts);
+    assert.deepEqual(variant.replicateFacts, result.replicates);
+    assert.equal(variant.questionResolutions?.primary?.plannerQuestions, 1);
+    assert.equal(variant.holdoutFacts, null);
+
+    fixture.database.updateVariant(fixture.variant.id, {
+      facts: null,
+      replicateFacts: null,
+      holdoutFacts: null,
+      holdoutReplicateFacts: null,
+    });
+    internal.persistV2StandardOutcomes(
+      fixture.variant.id,
+      fixture.campaign.config.benchmarks[0]!,
+      [fixture.campaign.config.benchmarks[1]!],
+      {
+        primary: resolution('primary', fixture.targetConfig.primaryResolvedArtifactSha),
+        holdout: resolution('holdout', `sha256:${'d'.repeat(64)}`),
+      },
+      [
+        { status: 'rejected', reason: new Error('primary failed') },
+        { status: 'fulfilled', value: result },
+      ],
+    );
+    const holdoutOnly = fixture.database.getVariant(fixture.variant.id);
+    assert.equal(holdoutOnly.facts, null);
+    assert.deepEqual(holdoutOnly.holdoutFacts?.holdout, result.facts);
+    assert.deepEqual(holdoutOnly.holdoutReplicateFacts?.holdout, result.replicates);
+    assert.equal(holdoutOnly.questionResolutions?.holdout?.plannerQuestions, 1);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('automatic V2 config persistence waits for standard cohorts and is atomic before teardown', async () => {
+  const fixture = await v2LifecycleFixture('v2-config-boundary');
+  try {
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      persistAutomaticV2Config: (
+        campaign: CampaignRecord,
+        config: TargetExcludedConfig,
+      ) => Promise<TargetExcludedConfig>;
+    };
+    fixture.database.updateVariant(fixture.variant.id, {
+      facts: null,
+      replicateFacts: null,
+      artifactCollectionComplete: false,
+    });
+    await assert.rejects(
+      internal.persistAutomaticV2Config(fixture.campaign, fixture.targetConfig),
+      /standard baseline facts and artifacts are not durable/,
+    );
+    assert.equal(fixture.database.getTargetExcludedConfig(fixture.campaign.id), null);
+    assert.equal(
+      await stat(path.join(fixture.paths.campaigns, fixture.campaign.id, 'target-excluded.json')).catch(
+        () => null,
+      ),
+      null,
+    );
+
+    const facts = completedFacts();
+    fixture.database.updateVariant(fixture.variant.id, {
+      facts,
+      replicateFacts: [facts, facts],
+    });
+    const persisted = await internal.persistAutomaticV2Config(
+      fixture.campaign,
+      fixture.targetConfig,
+    );
+    assert.deepEqual(persisted, fixture.targetConfig);
+    assert.deepEqual(
+      JSON.parse(
+        await readFile(
+          path.join(fixture.paths.campaigns, fixture.campaign.id, 'target-excluded.json'),
+          'utf8',
+        ),
+      ),
+      fixture.targetConfig,
+    );
+    assert.ok(
+      (await readdir(path.join(fixture.paths.campaigns, fixture.campaign.id))).every(
+        (name) => !name.includes('.tmp-'),
+      ),
+    );
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('automatic V2 config recovers a sidecar-only durable baseline idempotently', async () => {
+  const fixture = await v2LifecycleFixture('v2-sidecar-recovery');
+  try {
+    const sidecar = path.join(fixture.paths.campaigns, fixture.campaign.id, 'target-excluded.json');
+    await writeFile(sidecar, `${JSON.stringify(fixture.targetConfig, null, 2)}\n`, { mode: 0o600 });
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      recoverAutomaticV2Config: (
+        campaign: CampaignRecord,
+        dependencies: { runCommand: typeof runCommand },
+      ) => Promise<TargetExcludedConfig | null>;
+    };
+    const dependencies = { runCommand: imageInspectCommand(fixture.targetConfig.comparatorImage) };
+
+    const first = await internal.recoverAutomaticV2Config(fixture.campaign, dependencies);
+    const second = await internal.recoverAutomaticV2Config(fixture.campaign, dependencies);
+
+    assert.deepEqual(first, fixture.targetConfig);
+    assert.deepEqual(second, fixture.targetConfig);
+    assert.deepEqual(
+      fixture.database.getTargetExcludedConfig(fixture.campaign.id),
+      fixture.targetConfig,
+    );
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('automatic V2 config recovers a DB-only copy after comparator inspection', async () => {
+  const fixture = await v2LifecycleFixture('v2-db-config-recovery');
+  try {
+    fixture.database.createTargetExcludedConfig(fixture.campaign.id, fixture.targetConfig);
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      recoverAutomaticV2Config: (
+        campaign: CampaignRecord,
+        dependencies: { runCommand: typeof runCommand },
+      ) => Promise<TargetExcludedConfig | null>;
+    };
+
+    const recovered = await internal.recoverAutomaticV2Config(fixture.campaign, {
+      runCommand: imageInspectCommand(fixture.targetConfig.comparatorImage),
+    });
+
+    assert.deepEqual(recovered, fixture.targetConfig);
+    assert.deepEqual(
+      JSON.parse(
+        await readFile(
+          path.join(fixture.paths.campaigns, fixture.campaign.id, 'target-excluded.json'),
+          'utf8',
+        ),
+      ),
+      fixture.targetConfig,
+    );
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('DB-only V2 config fails closed on comparator digest mismatch without writing sidecar', async () => {
+  const fixture = await v2LifecycleFixture('v2-db-config-mismatch');
+  try {
+    fixture.database.createTargetExcludedConfig(fixture.campaign.id, fixture.targetConfig);
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      recoverAutomaticV2Config: (
+        campaign: CampaignRecord,
+        dependencies: { runCommand: typeof runCommand },
+      ) => Promise<TargetExcludedConfig | null>;
+    };
+
+    await assert.rejects(
+      internal.recoverAutomaticV2Config(fixture.campaign, {
+        runCommand: imageInspectCommand(`sha256:${'0'.repeat(64)}`),
+      }),
+      /comparator image differs from the bound baseline test image/,
+    );
+    assert.equal(
+      await stat(
+        path.join(fixture.paths.campaigns, fixture.campaign.id, 'target-excluded.json'),
+      ).catch(() => null),
+      null,
+    );
+    assert.deepEqual(
+      fixture.database.getTargetExcludedConfig(fixture.campaign.id),
+      fixture.targetConfig,
+    );
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('sidecar-only V2 config fails closed on comparator mismatch without restoring DB copy', async () => {
+  const fixture = await v2LifecycleFixture('v2-sidecar-config-mismatch');
+  try {
+    const sidecar = path.join(fixture.paths.campaigns, fixture.campaign.id, 'target-excluded.json');
+    await writeFile(sidecar, `${JSON.stringify(fixture.targetConfig, null, 2)}\n`, { mode: 0o600 });
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      recoverAutomaticV2Config: (
+        campaign: CampaignRecord,
+        dependencies: { runCommand: typeof runCommand },
+      ) => Promise<TargetExcludedConfig | null>;
+    };
+
+    await assert.rejects(
+      internal.recoverAutomaticV2Config(fixture.campaign, {
+        runCommand: imageInspectCommand(`sha256:${'0'.repeat(64)}`),
+      }),
+      /comparator image differs from the bound baseline test image/,
+    );
+    assert.equal(fixture.database.getTargetExcludedConfig(fixture.campaign.id), null);
+    assert.deepEqual(JSON.parse(await readFile(sidecar, 'utf8')), fixture.targetConfig);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('live target finalization selects integrated and standalone stack roots', () => {
+  assert.equal(
+    targetExcludedLiveStackDirectory('/artifacts/variant', 'running'),
+    '/artifacts/variant',
+  );
+  assert.equal(
+    targetExcludedLiveStackDirectory('/artifacts/variant', 'review'),
+    '/artifacts/variant/target-excluded',
+  );
+  assert.equal(
+    targetExcludedLiveStackDirectory('/artifacts/variant', 'completed'),
+    '/artifacts/variant/target-excluded',
+  );
+});
+
+test('integrated V1 finalization reads holdouts from the standard variant root', () => {
+  assert.equal(
+    targetExcludedControlHoldoutDirectory('/artifacts/variant', 'holdout', true),
+    '/artifacts/variant/holdout',
+  );
+});
+
+test('standalone V1 finalization reads holdouts from target-excluded control', () => {
+  assert.equal(
+    targetExcludedControlHoldoutDirectory('/artifacts/variant', 'holdout', false),
+    '/artifacts/variant/target-excluded/control/holdout',
+  );
+});
+
+test('target-excluded answer input accepts legacy and scoped requests', () => {
+  assert.deepEqual(TargetExcludedAnswerInputSchema.parse({ answer: 'legacy answer' }), {
+    answer: 'legacy answer',
+  });
+  assert.deepEqual(
+    TargetExcludedAnswerInputSchema.parse({
+      answer: 'scoped answer',
+      benchmark: 'primary:excluded',
+      replicate: 2,
+    }),
+    { answer: 'scoped answer', benchmark: 'primary:excluded', replicate: 2 },
+  );
+});
+
+test('direct scoped waits with the same question ID resolve independently for distinct contexts', async () => {
+  const fixture = await v2LifecycleFixture('v2-question-scope');
+  try {
+    fixture.database.createTargetExcludedEvaluation(fixture.campaign.id, fixture.variant.id);
+    const orchestrator = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      waitForTargetExcludedAnswer: (
+        variantId: string,
+        targetWorkflow: string,
+        benchmark: string,
+        replicate: number,
+        question: PlannerQuestionRecord,
+      ) => Promise<{ answer: string }>;
+      answerTargetExcludedQuestion: (
+        campaignId: string,
+        variantId: string,
+        questionId: string,
+        answer: string,
+        selectedOptionId?: string,
+        benchmark?: string,
+        replicate?: number,
+      ) => void;
+      stop: (campaignId: string) => CampaignRecord;
+    };
+    const question: PlannerQuestionRecord = {
+      id: 'same-question-id',
+      createdByRunId: 'run-a',
+      responseKind: 'free_text',
+      prompt: 'Which shared boundary applies?',
+      rationale: 'The source answer was unavailable.',
+      context: {},
+      status: 'open',
+    };
+    const normal = orchestrator.waitForTargetExcludedAnswer(
+      fixture.variant.id,
+      fixture.targetConfig.targetImplementationWorkflow,
+      'primary',
+      1,
+      question,
+    );
+    const excluded = orchestrator.waitForTargetExcludedAnswer(
+      fixture.variant.id,
+      fixture.targetConfig.targetImplementationWorkflow,
+      'primary:excluded',
+      2,
+      question,
+    );
+
+    assert.throws(
+      () =>
+        orchestrator.answerTargetExcludedQuestion(
+          fixture.campaign.id,
+          fixture.variant.id,
+          question.id,
+          'ambiguous legacy answer',
+        ),
+      /ambiguous target-excluded question.*benchmark and replicate/i,
+    );
+    orchestrator.answerTargetExcludedQuestion(
+      fixture.campaign.id,
+      fixture.variant.id,
+      question.id,
+      'normal answer',
+      undefined,
+      'primary',
+      1,
+    );
+    assert.equal(
+      fixture.database.getTargetExcludedEvaluation(fixture.variant.id)?.status,
+      'waiting_for_input',
+    );
+    orchestrator.answerTargetExcludedQuestion(
+      fixture.campaign.id,
+      fixture.variant.id,
+      question.id,
+      'excluded answer',
+      undefined,
+      'primary:excluded',
+      2,
+    );
+    assert.deepEqual(await Promise.all([normal, excluded]), [
+      { answer: 'normal answer', resolution: 'human_answer', evidence: ['human operator answer'], requirementsAgentRequests: 0 },
+      { answer: 'excluded answer', resolution: 'human_answer', evidence: ['human operator answer'], requirementsAgentRequests: 0 },
+    ]);
+    const waitingEvents = fixture.database
+      .listEvents(fixture.campaign.id)
+      .filter(({ type }) => type === 'target_excluded.question_waiting')
+      .map(({ payload }) => payload as { benchmark: string; replicate: number });
+    assert.deepEqual(
+      waitingEvents.map(({ benchmark, replicate }) => ({ benchmark, replicate })),
+      [
+        { benchmark: 'primary', replicate: 1 },
+        { benchmark: 'primary:excluded', replicate: 2 },
+      ],
+    );
+
+    const stoppedNormal = orchestrator.waitForTargetExcludedAnswer(
+      fixture.variant.id,
+      fixture.targetConfig.targetImplementationWorkflow,
+      'primary',
+      2,
+      { ...question, id: 'stop-question-id' },
+    );
+    const stoppedExcluded = orchestrator.waitForTargetExcludedAnswer(
+      fixture.variant.id,
+      fixture.targetConfig.targetImplementationWorkflow,
+      'primary:excluded',
+      1,
+      { ...question, id: 'stop-question-id' },
+    );
+    orchestrator.stop(fixture.campaign.id);
+    const stopped = await Promise.allSettled([stoppedNormal, stoppedExcluded]);
+    assert.ok(stopped.every(({ status }) => status === 'rejected'));
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('paired semantic runtime questions share one scoped human fallback answer', async () => {
+  const fixture = await v2LifecycleFixture('v2-question-parity');
+  try {
+    fixture.database.createTargetExcludedEvaluation(fixture.campaign.id, fixture.variant.id);
+    const orchestrator = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      answerRuntimeQuestion: (
+        campaign: CampaignRecord,
+        question: PlannerQuestionRecord,
+        consultations: unknown[],
+        workflowsSource: string,
+        artifactDirectory: string,
+        answerCache: Map<string, unknown>,
+        targetContext: {
+          targetWorkflow: string;
+          variantId: string;
+          benchmark: string;
+          replicate: number;
+        },
+      ) => Promise<{
+        answer: string;
+        selectedOptionId?: string;
+        evidence: string[];
+      }>;
+      answerTargetExcludedQuestion: (
+        campaignId: string,
+        variantId: string,
+        questionId: string,
+        answer: string,
+        selectedOptionId?: string,
+        benchmark?: string,
+        replicate?: number,
+      ) => void;
+    };
+    const normalQuestion: PlannerQuestionRecord = {
+      id: 'paired-question-id',
+      createdByRunId: 'run-a',
+      responseKind: 'single_select',
+      prompt: 'Which shared boundary applies?',
+      rationale: 'The source answer was disallowed.',
+      context: {},
+      options: [
+        { id: 'normal-read', label: 'Shared boundary', description: 'Read-only boundary' },
+        { id: 'normal-write', label: 'Shared boundary', description: 'Reviewed write boundary' },
+      ],
+      status: 'open',
+    };
+    const excludedQuestion: PlannerQuestionRecord = {
+      ...normalQuestion,
+      options: [
+        { id: 'excluded-read', label: 'Shared boundary', description: 'Read-only boundary' },
+        { id: 'excluded-write', label: 'Shared boundary', description: 'Reviewed write boundary' },
+      ],
+    };
+    const cacheKey = JSON.stringify({
+      responseKind: normalQuestion.responseKind,
+      prompt: normalQuestion.prompt,
+      type: normalQuestion.type,
+      ownerRole: normalQuestion.ownerRole,
+      coverageIds: normalQuestion.coverageIds,
+      options: normalQuestion.options?.map(({ label, description, consequences }) => ({
+        label,
+        description: description ?? null,
+        consequences: consequences ?? null,
+      })),
+    });
+    const legacyCacheKey = JSON.stringify({
+      responseKind: normalQuestion.responseKind,
+      prompt: normalQuestion.prompt,
+      type: normalQuestion.type,
+      ownerRole: normalQuestion.ownerRole,
+      coverageIds: normalQuestion.coverageIds,
+      options: normalQuestion.options?.map(({ label, description, consequences }) => ({
+        label,
+        description: description ?? consequences ?? '',
+      })),
+    });
+    let resolveAutomated!: (answer: null) => void;
+    const automated = new Promise<null>((resolve) => {
+      resolveAutomated = resolve;
+    });
+    const answerCache = new Map<string, unknown>([
+      [cacheKey, automated],
+      [legacyCacheKey, automated],
+    ]);
+    const normal = orchestrator.answerRuntimeQuestion(
+      fixture.campaign,
+      normalQuestion,
+      [],
+      fixture.root,
+      path.join(fixture.root, 'normal-questions'),
+      answerCache,
+      {
+        targetWorkflow: fixture.targetConfig.targetImplementationWorkflow,
+        variantId: fixture.variant.id,
+        benchmark: 'primary',
+        replicate: 1,
+      },
+    );
+    const excluded = orchestrator.answerRuntimeQuestion(
+      fixture.campaign,
+      excludedQuestion,
+      [],
+      fixture.root,
+      path.join(fixture.root, 'excluded-questions'),
+      answerCache,
+      {
+        targetWorkflow: fixture.targetConfig.targetImplementationWorkflow,
+        variantId: fixture.variant.id,
+        benchmark: 'primary:excluded',
+        replicate: 1,
+      },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    resolveAutomated(null);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const waitingEvents = fixture.database
+      .listEvents(fixture.campaign.id)
+      .filter(({ type }) => type === 'target_excluded.question_waiting');
+    assert.equal(waitingEvents.length, 1);
+    const owner = waitingEvents[0]!.payload as { benchmark: string; replicate: number };
+    const ownerOption = owner.benchmark === 'primary' ? 'normal-write' : 'excluded-write';
+    orchestrator.answerTargetExcludedQuestion(
+      fixture.campaign.id,
+      fixture.variant.id,
+      normalQuestion.id,
+      'This boundary is required by the reviewed operating model.',
+      ownerOption,
+      owner.benchmark,
+      owner.replicate,
+    );
+
+    const answers = await Promise.all([normal, excluded]);
+    assert.deepEqual(
+      answers.map(({ answer, selectedOptionId, evidence }) => ({
+        answer,
+        selectedOptionId,
+        evidence,
+      })),
+      [
+        {
+          answer: 'This boundary is required by the reviewed operating model.',
+          selectedOptionId: 'normal-write',
+          evidence: ['human operator answer'],
+        },
+        {
+          answer: 'This boundary is required by the reviewed operating model.',
+          selectedOptionId: 'excluded-write',
+          evidence: ['human operator answer'],
+        },
+      ],
+    );
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('cached requirements-agent selection remaps semantic labels without exposing cache metadata', async () => {
+  const fixture = await v2LifecycleFixture('v2-consultation-option-remap');
+  try {
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      answerRuntimeQuestion: (
+        campaign: CampaignRecord,
+        question: PlannerQuestionRecord,
+        consultations: unknown[],
+        workflowsSource: string,
+        artifactDirectory: string,
+        answerCache: Map<string, unknown>,
+        targetContext: {
+          targetWorkflow: string;
+          variantId: string;
+          benchmark: string;
+          replicate: number;
+        },
+      ) => Promise<Record<string, unknown>>;
+    };
+    const normalQuestion: PlannerQuestionRecord = {
+      id: 'consultation-question',
+      createdByRunId: 'consultation-run',
+      responseKind: 'single_select',
+      prompt: 'Choose the reviewed operating boundary.',
+      rationale: 'A reviewed answer is required.',
+      context: {},
+      options: [{ id: 'normal-generated-id', label: 'Shared boundary' }],
+      status: 'open',
+    };
+    const excludedQuestion: PlannerQuestionRecord = {
+      ...normalQuestion,
+      options: [{ id: 'excluded-generated-id', label: 'Shared boundary' }],
+    };
+    const answerCache = new Map<string, unknown>();
+    const normal = await internal.answerRuntimeQuestion(
+      fixture.campaign,
+      normalQuestion,
+      [
+        {
+          intent: {
+            origin: { runId: normalQuestion.createdByRunId },
+            request: { ask: normalQuestion.prompt },
+          },
+          outcome: {
+            resolution: 'answered',
+            answer: 'This option follows the reviewed operating model.',
+            selectedOptionId: 'normal-generated-id',
+            citations: [{ entity: 'solution/main', anchor: 'operating-boundary' }],
+          },
+        },
+      ],
+      fixture.root,
+      path.join(fixture.root, 'consultation-normal'),
+      answerCache,
+      {
+        targetWorkflow: fixture.targetConfig.targetImplementationWorkflow,
+        variantId: fixture.variant.id,
+        benchmark: 'primary',
+        replicate: 1,
+      },
+    );
+    const excluded = await internal.answerRuntimeQuestion(
+      fixture.campaign,
+      excludedQuestion,
+      [],
+      fixture.root,
+      path.join(fixture.root, 'consultation-excluded'),
+      answerCache,
+      {
+        targetWorkflow: fixture.targetConfig.targetImplementationWorkflow,
+        variantId: fixture.variant.id,
+        benchmark: 'primary:excluded',
+        replicate: 1,
+      },
+    );
+
+    assert.equal(normal.selectedOptionId, 'normal-generated-id');
+    assert.equal(excluded.selectedOptionId, 'excluded-generated-id');
+    assert.equal(normal.answer, excluded.answer);
+    assert.deepEqual(normal.evidence, excluded.evidence);
+    assert.equal('selectedOptionLabel' in normal, false);
+    assert.equal('selectedOptionLabel' in excluded, false);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('runtime questions differing only in option consequences do not share cache entries', async () => {
+  const fixture = await v2LifecycleFixture('v2-question-consequences');
+  try {
+    fixture.database.createTargetExcludedEvaluation(fixture.campaign.id, fixture.variant.id);
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      answerRuntimeQuestion: (
+        campaign: CampaignRecord,
+        question: PlannerQuestionRecord,
+        consultations: unknown[],
+        workflowsSource: string,
+        artifactDirectory: string,
+        answerCache: Map<string, unknown>,
+        targetContext: {
+          targetWorkflow: string;
+          variantId: string;
+          benchmark: string;
+          replicate: number;
+        },
+      ) => Promise<unknown>;
+      answerTargetExcludedQuestion: (
+        campaignId: string,
+        variantId: string,
+        questionId: string,
+        answer: string,
+        selectedOptionId?: string,
+        benchmark?: string,
+        replicate?: number,
+      ) => void;
+    };
+    const normalQuestion: PlannerQuestionRecord = {
+      id: 'consequence-question',
+      createdByRunId: 'run-a',
+      responseKind: 'free_text',
+      prompt: 'Explain the selected boundary.',
+      rationale: 'The consequences differ by arm.',
+      context: {},
+      options: [
+        {
+          id: 'normal-option',
+          label: 'Shared boundary',
+          description: 'Same description',
+          consequences: 'Normal consequence',
+        },
+      ],
+      status: 'open',
+    };
+    const excludedQuestion: PlannerQuestionRecord = {
+      ...normalQuestion,
+      options: [
+        {
+          id: 'excluded-option',
+          label: 'Shared boundary',
+          description: 'Same description',
+          consequences: 'Excluded consequence',
+        },
+      ],
+    };
+    class NullSeedCache extends Map<string, unknown> {
+      override get(key: string): unknown {
+        if (!super.has(key)) super.set(key, Promise.resolve(null));
+        return super.get(key);
+      }
+    }
+    const answerCache = new NullSeedCache();
+    const normal = internal.answerRuntimeQuestion(
+      fixture.campaign,
+      normalQuestion,
+      [],
+      fixture.root,
+      path.join(fixture.root, 'consequence-normal'),
+      answerCache,
+      {
+        targetWorkflow: fixture.targetConfig.targetImplementationWorkflow,
+        variantId: fixture.variant.id,
+        benchmark: 'primary',
+        replicate: 1,
+      },
+    );
+    const excluded = internal.answerRuntimeQuestion(
+      fixture.campaign,
+      excludedQuestion,
+      [],
+      fixture.root,
+      path.join(fixture.root, 'consequence-excluded'),
+      answerCache,
+      {
+        targetWorkflow: fixture.targetConfig.targetImplementationWorkflow,
+        variantId: fixture.variant.id,
+        benchmark: 'primary:excluded',
+        replicate: 1,
+      },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const waiting = fixture.database
+      .listEvents(fixture.campaign.id)
+      .filter(({ type }) => type === 'target_excluded.question_waiting')
+      .map(({ payload }) => payload as { benchmark: string; replicate: number });
+    assert.equal(waiting.length, 2);
+    for (const scope of waiting) {
+      internal.answerTargetExcludedQuestion(
+        fixture.campaign.id,
+        fixture.variant.id,
+        normalQuestion.id,
+        `${scope.benchmark} rationale`,
+        undefined,
+        scope.benchmark,
+        scope.replicate,
+      );
+    }
+    await Promise.all([normal, excluded]);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('target-safe source rebuilds a snapshot left without its manifest', async () => {
+  const value = await targetSnapshotFixture('v2-snapshot-only');
+  try {
+    await value.ensure();
+    await rm(value.manifestPath);
+
+    assert.equal(await value.ensure(), value.destination);
+    assert.equal(await readFile(path.join(value.destination, 'README.md'), 'utf8'), 'shared source\n');
+    assert.ok((await stat(value.manifestPath)).isFile());
+    assert.equal(
+      (JSON.parse(await readFile(value.manifestPath, 'utf8')) as { policyVersion?: number })
+        .policyVersion,
+      2,
+    );
+  } finally {
+    value.fixture.database.close();
+    await rm(value.fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('target-safe source rebuilds a manifest left without its snapshot', async () => {
+  const value = await targetSnapshotFixture('v2-manifest-only');
+  try {
+    await value.ensure();
+    await rm(value.destination, { recursive: true, force: true });
+
+    assert.equal(await value.ensure(), value.destination);
+    assert.equal(await readFile(path.join(value.destination, 'README.md'), 'utf8'), 'shared source\n');
+    assert.ok((await stat(value.manifestPath)).isFile());
+  } finally {
+    value.fixture.database.close();
+    await rm(value.fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('target-safe source rejects tampering when snapshot and manifest are complete', async () => {
+  const value = await targetSnapshotFixture('v2-snapshot-tamper');
+  try {
+    await value.ensure();
+    const sharedFile = path.join(value.destination, 'README.md');
+    await rm(sharedFile);
+    await writeFile(sharedFile, 'tampered source\n');
+
+    await assert.rejects(value.ensure(), /snapshot failed manifest verification/);
+    assert.equal(await readFile(sharedFile, 'utf8'), 'tampered source\n');
+    assert.ok((await stat(value.manifestPath)).isFile());
+  } finally {
+    value.fixture.database.close();
+    await rm(value.fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('target-safe source verifies a complete pair against the frozen source root', async () => {
+  const value = await targetSnapshotFixture('v2-snapshot-source-drift');
+  try {
+    await value.ensure();
+    await writeFile(path.join(value.sourceRoot, 'README.md'), 'changed frozen source\n');
+
+    await assert.rejects(value.ensure(), /manifest differs from frozen source manifest/);
+    assert.equal(
+      await readFile(path.join(value.destination, 'README.md'), 'utf8'),
+      'shared source\n',
+    );
+  } finally {
+    value.fixture.database.close();
+    await rm(value.fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('legacy target-safe source creates and reuses an unversioned V1 manifest', async () => {
+  const value = await legacyTargetSnapshotFixture('v1-snapshot-policy');
+  try {
+    assert.equal(await value.ensure(), value.destination);
+    const manifest = JSON.parse(await readFile(value.manifestPath, 'utf8')) as {
+      policyVersion?: number;
+    };
+    assert.equal(manifest.policyVersion, undefined);
+
+    assert.equal(await value.ensure(), value.destination);
+    assert.equal(
+      (JSON.parse(await readFile(value.manifestPath, 'utf8')) as { policyVersion?: number })
+        .policyVersion,
+      undefined,
+    );
+  } finally {
+    value.database.close();
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test('legacy archived comparisons tolerate only missing persisted lineage IDs', async () => {
+  const value = await legacyTargetSnapshotFixture('v1-comparison-compatibility');
+  try {
+    const variant = value.database.createVariant({
+      id: value.targetConfig.baselineVariantId,
+      campaignId: value.campaign.id,
+      parentVariantId: null,
+      round: 0,
+      ordinal: 0,
+      hypothesis: baselineHypothesisForTest,
+    });
+    value.database.createTargetExcludedEvaluation(value.campaign.id, variant.id);
+    const reports = [1, 2].map((replicate) =>
+      validComparisonReport(
+        `legacy-normal-${replicate}`,
+        `legacy-excluded-${replicate}`,
+        `legacy-normal-run-${replicate}`,
+        `legacy-excluded-run-${replicate}`,
+      ),
+    );
+    const archivedSummaries = reports.map((report, index) =>
+      summarizeTargetExcludedComparisonReport(index + 1, report),
+    );
+    const persistedSummaries = archivedSummaries.map((summary) => ({
+      ...summary,
+      normalCaseId: null,
+      excludedCaseId: null,
+      normalRunId: null,
+      excludedRunId: null,
+    }));
+    value.database.updateTargetExcludedEvaluation(variant.id, {
+      comparisons: persistedSummaries,
+    });
+    const comparisonDirectory = path.join(
+      value.paths.artifacts,
+      value.campaign.id,
+      variant.id,
+      'target-excluded/comparisons',
+    );
+    await mkdir(comparisonDirectory, { recursive: true });
+    await Promise.all(
+      reports.map((report, index) =>
+        writeFile(
+          path.join(comparisonDirectory, `replicate-${index + 1}.json`),
+          `${JSON.stringify(report)}\n`,
+        ),
+      ),
+    );
+    const internal = new CampaignOrchestrator(
+      value.paths,
+      value.database,
+    ) as unknown as {
+      verifyArchivedTargetExcludedComparisons: (
+        campaign: CampaignRecord,
+        variantId: string,
+        config: TargetExcludedConfig,
+        evaluation: NonNullable<ReturnType<HarnessDatabase['getTargetExcludedEvaluation']>>,
+      ) => Promise<void>;
+    };
+
+    await internal.verifyArchivedTargetExcludedComparisons(
+      value.campaign,
+      variant.id,
+      value.targetConfig,
+      value.database.getTargetExcludedEvaluation(variant.id)!,
+    );
+
+    value.database.updateTargetExcludedEvaluation(variant.id, {
+      comparisons: [
+        { ...persistedSummaries[0]!, mismatches: ['unexpected persisted mismatch'] },
+        persistedSummaries[1]!,
+      ],
+    });
+    await assert.rejects(
+      internal.verifyArchivedTargetExcludedComparisons(
+        value.campaign,
+        variant.id,
+        value.targetConfig,
+        value.database.getTargetExcludedEvaluation(variant.id)!,
+      ),
+      /archived target-excluded comparison differs from persisted summary/,
+    );
+
+    value.database.updateTargetExcludedEvaluation(variant.id, {
+      comparisons: persistedSummaries,
+    });
+    await writeFile(
+      path.join(comparisonDirectory, 'replicate-1.json'),
+      `${JSON.stringify({ ...reports[0], hash: `sha256:${'0'.repeat(64)}` })}\n`,
+    );
+    await assert.rejects(
+      internal.verifyArchivedTargetExcludedComparisons(
+        value.campaign,
+        variant.id,
+        value.targetConfig,
+        value.database.getTargetExcludedEvaluation(variant.id)!,
+      ),
+      /comparison report hash does not bind its canonical content/,
+    );
+  } finally {
+    value.database.close();
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test('campaign-declared V2 blocks rounds when runtime config is missing', async () => {
+  const fixture = await v2LifecycleFixture('v2-round-config-missing');
+  try {
+    const campaign = fixture.database.updateCampaign(fixture.campaign.id, {
+      status: 'ready',
+      currentParentVariantId: fixture.variant.id,
+    });
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      runRoundUnlocked: (campaignId: string) => Promise<VariantRecord[]>;
+    };
+
+    await assert.rejects(
+      internal.runRoundUnlocked(campaign.id),
+      /campaign-declared V2 runtime config is missing/,
+    );
+    assert.equal(fixture.database.getTargetExcludedConfig(campaign.id), null);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('campaign-declared V2 blocks promotion when runtime config is missing', async () => {
+  const fixture = await v2LifecycleFixture('v2-promote-config-missing');
+  try {
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      promoteUnlocked: (campaignId: string, variantId: string) => Promise<VariantRecord>;
+    };
+
+    await assert.rejects(
+      internal.promoteUnlocked(fixture.campaign.id, fixture.variant.id),
+      /campaign-declared V2 runtime config is missing/,
+    );
+    assert.equal(fixture.database.getTargetExcludedConfig(fixture.campaign.id), null);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('round restores sidecar-only V2 config before enforcing baseline readiness', async () => {
+  const fixture = await v2LifecycleFixture('v2-round-sidecar-config');
+  try {
+    await writeFile(
+      path.join(fixture.paths.campaigns, fixture.campaign.id, 'target-excluded.json'),
+      `${JSON.stringify(fixture.targetConfig, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    fixture.database.updateCampaign(fixture.campaign.id, {
+      status: 'ready',
+      currentParentVariantId: fixture.variant.id,
+    });
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      runRoundUnlocked: (campaignId: string) => Promise<VariantRecord[]>;
+      verifyAutomaticV2ComparatorImage: () => Promise<void>;
+    };
+    internal.verifyAutomaticV2ComparatorImage = async () => undefined;
+
+    await assert.rejects(
+      internal.runRoundUnlocked(fixture.campaign.id),
+      /run a valid target-excluded baseline calibration before starting a round/,
+    );
+    assert.deepEqual(
+      fixture.database.getTargetExcludedConfig(fixture.campaign.id),
+      fixture.targetConfig,
+    );
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('constructing another orchestrator does not mutate leased nonterminal evaluation state', async () => {
+  const fixture = await v2LifecycleFixture('v2-constructor-lease');
+  const leaseOwner = 'active-coordinator';
+  try {
+    fixture.database.createTargetExcludedEvaluation(fixture.campaign.id, fixture.variant.id);
+    fixture.database.updateTargetExcludedEvaluation(fixture.variant.id, {
+      status: 'running',
+      startedAt: '2026-09-06T00:00:00.000Z',
+      error: null,
+    });
+    assert.equal(
+      fixture.database.acquireLease(fixture.campaign.id, leaseOwner, 90_000),
+      true,
+    );
+    const before = JSON.stringify({
+      campaign: fixture.database.getCampaign(fixture.campaign.id),
+      variant: fixture.database.getVariant(fixture.variant.id),
+      target: fixture.database.getTargetExcludedEvaluation(fixture.variant.id),
+    });
+
+    new CampaignOrchestrator(fixture.paths, fixture.database);
+
+    const after = JSON.stringify({
+      campaign: fixture.database.getCampaign(fixture.campaign.id),
+      variant: fixture.database.getVariant(fixture.variant.id),
+      target: fixture.database.getTargetExcludedEvaluation(fixture.variant.id),
+    });
+    assert.equal(after, before);
+  } finally {
+    fixture.database.releaseLease(fixture.campaign.id, leaseOwner);
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('baseline archived comparison failure marks its completed target evaluation retryable', async () => {
+  const fixture = await v2LifecycleFixture('v2-baseline-integrity-failure');
+  try {
+    fixture.database.createTargetExcludedConfig(fixture.campaign.id, fixture.targetConfig);
+    fixture.database.createTargetExcludedEvaluation(fixture.campaign.id, fixture.variant.id);
+    fixture.database.updateTargetExcludedEvaluation(fixture.variant.id, {
+      status: 'completed',
+      artifactCollectionComplete: true,
+    });
+    const integrityError = new Error('baseline archived comparison bytes are corrupt');
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      targetExcludedEvaluationReady: () => boolean;
+      verifyArchivedTargetExcludedComparisons: () => Promise<void>;
+      finalizeBaseline: (campaignId: string, variant: VariantRecord) => Promise<VariantRecord>;
+      runTargetExcludedBackfill: (
+        campaign: CampaignRecord,
+        variant: VariantRecord,
+        config: TargetExcludedConfig,
+      ) => Promise<NonNullable<ReturnType<HarnessDatabase['getTargetExcludedEvaluation']>>>;
+      refreshReports: () => Promise<void>;
+    };
+    internal.targetExcludedEvaluationReady = () => true;
+    internal.verifyArchivedTargetExcludedComparisons = async () => {
+      throw integrityError;
+    };
+
+    await assert.rejects(
+      internal.finalizeBaseline(fixture.campaign.id, fixture.variant),
+      (error) => error === integrityError,
+    );
+    const evaluation = fixture.database.getTargetExcludedEvaluation(fixture.variant.id);
+    assert.equal(evaluation?.status, 'failed');
+    assert.match(evaluation?.error ?? '', /comparison integrity failure.*bytes are corrupt/);
+    internal.targetExcludedEvaluationReady = () => false;
+    internal.refreshReports = async () => undefined;
+    const retry = await internal.runTargetExcludedBackfill(
+      fixture.campaign,
+      fixture.variant,
+      fixture.targetConfig,
+    );
+    assert.equal(retry.status, 'failed');
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('round archived comparison failure marks the baseline target evaluation failed', async () => {
+  const fixture = await v2LifecycleFixture('v2-round-integrity-failure');
+  try {
+    fixture.database.createTargetExcludedConfig(fixture.campaign.id, fixture.targetConfig);
+    fixture.database.createTargetExcludedEvaluation(fixture.campaign.id, fixture.variant.id);
+    fixture.database.updateTargetExcludedEvaluation(fixture.variant.id, { status: 'completed' });
+    fixture.database.updateCampaign(fixture.campaign.id, {
+      status: 'ready',
+      currentParentVariantId: fixture.variant.id,
+    });
+    const integrityError = new Error('round archived comparison bytes are missing');
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      recoverAutomaticV2Config: () => Promise<TargetExcludedConfig>;
+      targetExcludedEvaluationReady: () => boolean;
+      verifyArchivedTargetExcludedComparisons: () => Promise<void>;
+      runRoundUnlocked: (campaignId: string) => Promise<VariantRecord[]>;
+    };
+    internal.recoverAutomaticV2Config = async () => fixture.targetConfig;
+    internal.targetExcludedEvaluationReady = () => true;
+    internal.verifyArchivedTargetExcludedComparisons = async () => {
+      throw integrityError;
+    };
+
+    await assert.rejects(
+      internal.runRoundUnlocked(fixture.campaign.id),
+      (error) => error === integrityError,
+    );
+    const evaluation = fixture.database.getTargetExcludedEvaluation(fixture.variant.id);
+    assert.equal(evaluation?.status, 'failed');
+    assert.match(evaluation?.error ?? '', /comparison integrity failure.*bytes are missing/);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('promotion archived comparison failure marks only the candidate target evaluation failed', async () => {
+  const fixture = await v2LifecycleFixture('v2-promotion-integrity-failure');
+  try {
+    fixture.database.createTargetExcludedConfig(fixture.campaign.id, fixture.targetConfig);
+    fixture.database.createTargetExcludedEvaluation(fixture.campaign.id, fixture.variant.id);
+    fixture.database.updateTargetExcludedEvaluation(fixture.variant.id, { status: 'completed' });
+    const other = fixture.database.createVariant({
+      id: `${fixture.campaign.id}-v001`,
+      campaignId: fixture.campaign.id,
+      parentVariantId: null,
+      round: 1,
+      ordinal: 1,
+      hypothesis: baselineHypothesisForTest,
+    });
+    fixture.database.createTargetExcludedEvaluation(fixture.campaign.id, other.id);
+    fixture.database.updateTargetExcludedEvaluation(other.id, { status: 'completed' });
+    const integrityError = new Error('promotion archived comparison bytes were swapped');
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      recoverAutomaticV2Config: () => Promise<TargetExcludedConfig>;
+      targetExcludedEvaluationReady: () => boolean;
+      verifyArchivedTargetExcludedComparisons: () => Promise<void>;
+      promoteUnlocked: (campaignId: string, variantId: string) => Promise<VariantRecord>;
+    };
+    internal.recoverAutomaticV2Config = async () => fixture.targetConfig;
+    internal.targetExcludedEvaluationReady = () => true;
+    internal.verifyArchivedTargetExcludedComparisons = async () => {
+      throw integrityError;
+    };
+
+    await assert.rejects(
+      internal.promoteUnlocked(fixture.campaign.id, fixture.variant.id),
+      (error) => error === integrityError,
+    );
+    assert.equal(
+      fixture.database.getTargetExcludedEvaluation(fixture.variant.id)?.status,
+      'failed',
+    );
+    assert.equal(fixture.database.getTargetExcludedEvaluation(other.id)?.status, 'completed');
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
   }
 });

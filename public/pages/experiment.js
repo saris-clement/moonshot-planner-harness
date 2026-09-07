@@ -345,7 +345,11 @@ export function experimentPage(context, route) {
   const questionCount = scopedQuestions(variant).length;
   const panel = selectedTab === 'runs'
     ? element('section', {}, [
-        sectionHeading('Replicates', 'Configured run matrix', 'Planner totals count each primary and holdout execution exactly once.'),
+        sectionHeading(
+          'Replicates',
+          'Configured run matrix',
+          'Planner totals count standard primary and holdout executions only; target-excluded guard runs are excluded from totals.',
+        ),
         usageSummary(campaign, variant),
         replicateTable(campaign, variant),
       ])

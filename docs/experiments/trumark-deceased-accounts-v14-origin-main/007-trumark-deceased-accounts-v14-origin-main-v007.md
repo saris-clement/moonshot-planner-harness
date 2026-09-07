@@ -366,6 +366,8 @@ Control decisions: unavailable
 
 Excluded decisions: unavailable
 
+Comparison lineage: unavailable
+
 Comparison mismatches: none
 
 Recorded error: `Calibration attempt interrupted after a holdout model-budget failure; partial replicates are not reusable.`
