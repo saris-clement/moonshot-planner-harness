@@ -56,6 +56,14 @@ export const CampaignConfigSchema = z
     environmentFile: AbsolutePathSchema,
     seedRevision: z.string().min(1),
     workflowsRevision: z.string().min(1),
+    researchPaths: z
+      .array(AbsolutePathSchema)
+      .max(20)
+      .refine((values) => new Set(values).size === values.length, {
+        message: 'research paths must be unique',
+      })
+      .default([]),
+    researchSha256: z.array(Sha256Schema).max(20).default([]),
     benchmarks: z
       .array(BenchmarkSchema)
       .min(2)
@@ -173,6 +181,16 @@ export const CampaignConfigSchema = z
   })
   .strict()
   .superRefine((config, context) => {
+    if (
+      config.researchSha256.length > 0 &&
+      config.researchSha256.length !== config.researchPaths.length
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['researchSha256'],
+        message: 'researchSha256 must be empty or align with researchPaths',
+      });
+    }
     if (config.targetExcluded && config.evaluation.replicates !== 2) {
       context.addIssue({
         code: 'custom',
@@ -265,6 +283,56 @@ const RelativeArtifactPathSchema = z
       !value.split('/').some((segment) => segment === '..'),
     { message: 'expected a safe relative artifact path' },
   );
+export const FROZEN_RESEARCH_INTERPRETATION_POLICY =
+  'Frozen research is historical context only. It may inform hypotheses but is not current-run evidence and cannot support claims about this variant.' as const;
+
+export const FrozenResearchManifestSchema = z
+  .object({
+    kind: z.literal('ainative-planner-eval/frozen-research-manifest'),
+    schemaVersion: z.literal(1),
+    materials: z
+      .array(
+        z
+          .object({
+            name: z.string().min(1).max(256),
+            path: RelativeArtifactPathSchema,
+            sha256: Sha256Schema,
+            bytes: z.number().int().nonnegative(),
+          })
+          .strict(),
+      )
+      .max(20),
+  })
+  .strict();
+export type FrozenResearchManifest = z.infer<typeof FrozenResearchManifestSchema>;
+
+export const FrozenResearchContextSchema = z
+  .object({
+    authority: z.literal('historical_context_only'),
+    interpretationPolicy: z.literal(FROZEN_RESEARCH_INTERPRETATION_POLICY),
+    materials: z
+      .array(
+        z
+          .object({
+            name: z.string().min(1).max(256),
+            path: RelativeArtifactPathSchema,
+            sha256: Sha256Schema,
+            bytes: z.number().int().nonnegative(),
+            content: z.string().max(40_000),
+            contentTruncated: z.boolean(),
+          })
+          .strict(),
+      )
+      .max(20),
+  })
+  .strict();
+export type FrozenResearchContext = z.infer<typeof FrozenResearchContextSchema>;
+
+export const EMPTY_FROZEN_RESEARCH_CONTEXT: FrozenResearchContext = {
+  authority: 'historical_context_only',
+  interpretationPolicy: FROZEN_RESEARCH_INTERPRETATION_POLICY,
+  materials: [],
+};
 export type JsonValue = string | number | boolean | null | JsonValue[] | JsonObject;
 export interface JsonObject {
   [key: string]: JsonValue;
@@ -403,7 +471,7 @@ const DiagnosisLineageSchema = z
 export const DiagnosisInputSchema = z
   .object({
     kind: z.literal('ainative-planner-eval/diagnosis-input'),
-    schemaVersion: z.literal(1),
+    schemaVersion: z.union([z.literal(1), z.literal(2)]),
     interpretationPolicy: z.literal(
       'Diagnosis is model-generated, unverified, and excluded from numeric scoring.',
     ),
@@ -472,6 +540,7 @@ export const DiagnosisInputSchema = z
       })
       .strict(),
     lineage: z.array(DiagnosisLineageSchema).max(1_000),
+    researchContext: FrozenResearchContextSchema.default(EMPTY_FROZEN_RESEARCH_CONTEXT),
     completeness: DiagnosisCompletenessSchema,
     evidence: z.array(DiagnosisEvidenceSchema).max(10_000),
     reconstructionSignals: z.array(DiagnosisReconstructionSignalSchema).max(5_000),

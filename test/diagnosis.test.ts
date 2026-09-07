@@ -107,6 +107,111 @@ function armFacts(
   };
 }
 
+function factsForUnits(units: RunFacts['units'], sampleSize = 1): RunFacts {
+  const decisions: RunFacts['decisions'] = {
+    build: 0,
+    reuse: 0,
+    extend: 0,
+    defer: 0,
+    question: 0,
+  };
+  for (const unit of units) decisions[unit.decision] += 1;
+  return {
+    ...facts(),
+    sampleSize,
+    unitCount: units.length,
+    decisions,
+    shortlist: {
+      empty: units.filter((unit) => unit.shortlistCandidateCount === 0).length,
+      nonempty: units.filter((unit) => unit.shortlistCandidateCount > 0).length,
+      candidates: units.reduce((sum, unit) => sum + unit.shortlistCandidateCount, 0),
+    },
+    evidence: {
+      discovered: units.reduce((sum, unit) => sum + unit.discoveredEvidenceCount, 0),
+      selectedSourceRefs: units.reduce((sum, unit) => sum + unit.sourceRefs.length, 0),
+    },
+    units,
+  };
+}
+
+function aggregateFixtureUnit(
+  key: string,
+  decision: RunFacts['units'][number]['decision'],
+  options: { candidates?: number; discovered?: number; selected?: boolean } = {},
+): RunFacts['units'][number] {
+  const id = key.replaceAll(/[^a-z0-9]+/g, '-');
+  return {
+    ...facts().units[0]!,
+    id,
+    key,
+    ref: { entity: 'solution/main', anchor: id },
+    semantics: `Exercise ${key}.`,
+    decision,
+    selectedCandidateIds: options.selected ? [`candidate-${id}`] : [],
+    sourceRefs: options.selected ? [{ path: 'src/right.ts', symbol: 'ExistingAccountAlias' }] : [],
+    discoveredEvidenceCount: options.discovered ?? 0,
+    shortlistCandidateCount: options.candidates ?? 0,
+    uncoveredSemantics: options.selected ? [] : ['fixture behavior'],
+  };
+}
+
+async function writeAggregateAnalysis(
+  directory: string,
+  caseId: string,
+  runId: string,
+  units: RunFacts['units'],
+): Promise<void> {
+  await writeJson(path.join(directory, 'analysis.json'), {
+    metadata: { caseId, runId },
+    analysis: {
+      resolvedInputs: {},
+      requirementUnits: units.map(({ id, ref, kind, semantics }) => ({ id, ref, kind, semantics })),
+      adjudications: units.map((unit) => {
+        const candidates = Array.from({ length: unit.shortlistCandidateCount }, (_, index) => ({
+          id: `${unit.id}-candidate-${index + 1}`,
+        }));
+        const evidenceGrounding =
+          unit.key === 'primary-failure-00' && unit.decision === 'build'
+            ? {
+                searchHitCount: 3,
+                qualifiedPointerCount: 2,
+                hydrationAttemptCount: 2,
+                sourceReadCount: 2,
+                admittedSourceCount: 0,
+                admittedTestCount: 0,
+                selectedDiscoveredCount: 0,
+                rejectionCounts: [
+                  { reason: 'invalid_shape', count: 2 },
+                  { reason: 'non_executable_declaration', count: 1 },
+                ],
+              }
+            : unit.key.includes('control')
+              ? {
+                  searchHitCount: 1,
+                  qualifiedPointerCount: 1,
+                  hydrationAttemptCount: 1,
+                  sourceReadCount: 1,
+                  admittedSourceCount: 1,
+                  admittedTestCount: 0,
+                  selectedDiscoveredCount: 1,
+                  rejectionCounts: [],
+                }
+              : undefined;
+        return {
+          requirementUnitId: unit.id,
+          shortlist: { algorithmVersion: 'fixture-v1', candidates, exclusions: [] },
+          result: unit.decision,
+          confidence: unit.confidence,
+          rationale: unit.rationale,
+          selectedCandidateIds: unit.selectedCandidateIds,
+          sourceRefs: unit.sourceRefs,
+          ...(evidenceGrounding ? { evidenceGrounding } : {}),
+        };
+      }),
+    },
+  });
+}
+
 function comparisonReport(replicate: number, legacy = false): Record<string, unknown> {
   const value = {
     kind: 'ainative-planner/evidence-visibility-comparison',
@@ -469,6 +574,7 @@ test('diagnosis assembly deterministically reconstructs and verifies V2 hydratio
     const first = await assemble();
     const second = await assemble();
     assert.equal(first.inputSha256, second.inputSha256);
+    assert.equal(first.input.schemaVersion, 2);
     assert.equal(await readFile(first.inputPath, 'utf8'), await readFile(second.inputPath, 'utf8'));
     assert.deepEqual(await verifyDiagnosisArtifacts(value.artifacts, first.inputSha256), first.input);
 
@@ -580,6 +686,7 @@ test('diagnosis lineage classifies standard and integrated excluded arms with bo
 
     const legacyParsed = DiagnosisInputSchema.parse({
       ...assembled.input,
+      schemaVersion: 1,
       lineage: assembled.input.lineage.map((item) => {
         const { arm: _arm, ...legacy } = item;
         return legacy;
@@ -868,6 +975,7 @@ test('dedicated-control-v1 diagnosis preserves separate control and excluded evi
       currentProtocol;
     const legacyParsed = DiagnosisInputSchema.parse({
       ...assembled.input,
+      schemaVersion: 1,
       campaign: {
         ...assembled.input.campaign,
         targetExcludedProtocol: legacyProtocol,
@@ -1079,6 +1187,313 @@ test('standard-primary-v2 diagnosis reuses standard lineage and filters target s
       frozenSourceCompleteness?.limitations.includes(
         'Filtered 2 frozen-source candidates containing the standard-primary-v2 excluded target identity.',
       ),
+    );
+  } finally {
+    value.database.close();
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test('diagnosis emits all-unit funnel aggregates and stratifies bounded detail across failures, controls, disagreements, and holdout', async () => {
+  const value = await fixture(2);
+  try {
+    const storedCampaign = value.database.getCampaign(value.campaignId);
+    const campaign = {
+      ...storedCampaign,
+      config: {
+        ...storedCampaign.config,
+        benchmarks: storedCampaign.config.benchmarks.map((benchmark) =>
+          benchmark.role === 'holdout' ? { ...benchmark, name: 'z-holdout' } : benchmark,
+        ),
+      },
+    };
+    const failureUnits = Array.from({ length: 35 }, (_, index) =>
+      aggregateFixtureUnit(`primary-failure-${String(index).padStart(2, '0')}`, 'build', {
+        candidates: index === 0 ? 2 : 0,
+        discovered: index === 0 ? 3 : 0,
+      }),
+    );
+    const control = aggregateFixtureUnit('primary-control', 'reuse', {
+      candidates: 1,
+      discovered: 1,
+      selected: true,
+    });
+    const unstable = aggregateFixtureUnit('primary-unstable', 'build', { candidates: 1 });
+    const firstPrimary = factsForUnits([...failureUnits, control, unstable]);
+    const secondPrimary = factsForUnits([
+      ...failureUnits,
+      control,
+      { ...unstable, decision: 'reuse' },
+    ]);
+    const primaryReplicates = [
+      firstPrimary,
+      secondPrimary,
+      firstPrimary,
+      firstPrimary,
+      firstPrimary,
+      firstPrimary,
+      firstPrimary,
+    ];
+    const holdoutFailure = aggregateFixtureUnit('primary-failure-00', 'question');
+    const holdoutControl = aggregateFixtureUnit('holdout-control', 'reuse', {
+      candidates: 1,
+      discovered: 1,
+      selected: true,
+    });
+    const holdout = factsForUnits([holdoutFailure, holdoutControl]);
+    const judgment = {
+      summary: 'Fixture mismatches.',
+      verdicts: failureUnits.map((unit) => ({
+        unitKey: unit.key,
+        expectedDecision: 'reuse' as const,
+        classification: 'system_error' as const,
+        confidence: 'high' as const,
+        rationale: 'Fixture source supports reuse.',
+        evidence: ['src/right.ts:1'],
+      })),
+    };
+    const variant = value.database.updateVariant(value.variantId, {
+      facts: { ...firstPrimary, sampleSize: primaryReplicates.length },
+      replicateFacts: primaryReplicates,
+      holdoutFacts: { 'z-holdout': holdout },
+      holdoutReplicateFacts: { 'z-holdout': [holdout] },
+      judgment,
+    });
+    for (const unit of failureUnits) {
+      value.database.upsertLabel({
+        campaignId: campaign.id,
+        benchmark: 'primary-pack',
+        unitKey: unit.key,
+        expectedDecision: 'reuse',
+        classification: 'system_error',
+        rationale: 'Fixture human review.',
+        status: 'verified',
+      });
+    }
+    value.database.upsertLabel({
+      campaignId: campaign.id,
+      benchmark: 'z-holdout',
+      unitKey: holdoutFailure.key,
+      expectedDecision: 'reuse',
+      classification: 'system_error',
+      rationale: 'Fixture holdout review.',
+      status: 'verified',
+    });
+
+    const primaryDirectories = primaryReplicates.map((_, index) =>
+      path.join(value.artifacts, 'primary-pack', `replicate-${index + 1}`),
+    );
+    const holdoutOne = path.join(value.artifacts, 'z-holdout', 'replicate-1');
+    await Promise.all([
+      ...primaryDirectories.flatMap((directory, index) => {
+        const replicate = index + 1;
+        const replicateFacts = primaryReplicates[index]!;
+        return [
+          writeJson(path.join(directory, 'facts.json'), replicateFacts),
+          writeJson(path.join(directory, 'result.json'), {
+            caseId: `case-primary-${replicate}`,
+            runId: `run-primary-${replicate}`,
+            status: 'completed',
+          }),
+          writeAggregateAnalysis(
+            directory,
+            `case-primary-${replicate}`,
+            `run-primary-${replicate}`,
+            replicateFacts.units,
+          ),
+        ];
+      }),
+      writeJson(path.join(holdoutOne, 'facts.json'), holdout),
+      writeJson(path.join(holdoutOne, 'result.json'), {
+        caseId: 'case-holdout-1',
+        runId: 'run-holdout-1',
+        status: 'completed',
+      }),
+      writeAggregateAnalysis(holdoutOne, 'case-holdout-1', 'run-holdout-1', holdout.units),
+    ]);
+
+    const assemble = async () =>
+      await assembleDiagnosisInput({
+        artifactDirectory: value.artifacts,
+        campaign,
+        variant,
+        labels: value.database.listLabels(value.campaignId),
+        workflowsSource: value.workflows,
+        environment: {},
+      });
+    const first = await assemble();
+    const second = await assemble();
+    assert.equal(first.inputSha256, second.inputSha256);
+
+    const aggregates = first.input.evidence.filter(
+      ({ kind }) => kind === 'all_unit_funnel_aggregate',
+    );
+    const primaryBuild = aggregates.find(({ data }) => {
+      const row = data as Record<string, unknown>;
+      return row.benchmark === 'primary-pack' && row.replicate === 1 && row.disposition === 'build';
+    });
+    assert.ok(primaryBuild);
+    const primaryBuildData = primaryBuild.data as {
+      unitOccurrences: number;
+      affectedUnits: number;
+      stages: Array<{
+        stage: string;
+        occurrences: number | null;
+        affectedUnits: number | null;
+        observedUnits: number;
+        totalUnits: number;
+      }>;
+      rejectionReasons: Array<{ reason: string; occurrences: number; affectedUnits: number }>;
+      rejectionCoverage: { observedUnits: number; totalUnits: number };
+    };
+    assert.equal(primaryBuildData.unitOccurrences, 36);
+    assert.equal(primaryBuildData.affectedUnits, 36);
+    assert.deepEqual(
+      primaryBuildData.stages.find(({ stage }) => stage === 'search_hit'),
+      {
+        stage: 'search_hit',
+        occurrences: 3,
+        affectedUnits: 1,
+        observedUnits: 1,
+        totalUnits: 36,
+      },
+    );
+    assert.deepEqual(
+      primaryBuildData.stages.find(({ stage }) => stage === 'admitted_evidence'),
+      {
+        stage: 'admitted_evidence',
+        occurrences: 0,
+        affectedUnits: 0,
+        observedUnits: 1,
+        totalUnits: 36,
+      },
+    );
+    assert.deepEqual(primaryBuildData.rejectionReasons, [
+      { reason: 'invalid_shape', occurrences: 2, affectedUnits: 1 },
+      { reason: 'non_executable_declaration', occurrences: 1, affectedUnits: 1 },
+    ]);
+    assert.deepEqual(primaryBuildData.rejectionCoverage, { observedUnits: 1, totalUnits: 36 });
+
+    const holdoutQuestion = aggregates.find(({ data }) => {
+      const row = data as Record<string, unknown>;
+      return row.benchmark === 'z-holdout' && row.disposition === 'question';
+    });
+    assert.ok(holdoutQuestion);
+    assert.deepEqual(
+      (holdoutQuestion.data as typeof primaryBuildData).stages.find(
+        ({ stage }) => stage === 'search_hit',
+      ),
+      {
+        stage: 'search_hit',
+        occurrences: null,
+        affectedUnits: null,
+        observedUnits: 0,
+        totalUnits: 1,
+      },
+    );
+
+    const detailedUnitKeys = new Set(
+      first.input.evidence
+        .filter(({ kind }) => kind === 'unit_adjudication')
+        .flatMap(({ affectedUnitKeys }) => affectedUnitKeys),
+    );
+    assert.ok(detailedUnitKeys.size <= 30);
+    assert.ok(detailedUnitKeys.has('primary-control'));
+    assert.ok(detailedUnitKeys.has('primary-unstable'));
+    assert.ok(
+      first.input.evidence.some(
+        ({ kind, affectedUnitKeys, provenance }) =>
+          kind === 'unit_adjudication' &&
+          affectedUnitKeys.includes('primary-failure-00') &&
+          provenance.artifactPath?.startsWith('z-holdout/'),
+      ),
+    );
+    assert.match(first.input.completeness.limitations.join(' '), /stratified detail/i);
+  } finally {
+    value.database.close();
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test('diagnosis exposes frozen research as historical context instead of current-run evidence', async () => {
+  const value = await fixture(2);
+  try {
+    const content = '# Prior experiment\n\nThis mechanism was not verified in the current run.\n';
+    const researchDirectory = path.join(value.root, 'campaign-research');
+    const researchPath = path.join(researchDirectory, '001-prior-experiment.md');
+    await mkdir(researchDirectory, { recursive: true });
+    await writeFile(researchPath, content);
+    await writeJson(path.join(researchDirectory, 'manifest.json'), {
+      kind: 'ainative-planner-eval/frozen-research-manifest',
+      schemaVersion: 1,
+      materials: [
+        {
+          name: 'prior-experiment.md',
+          path: '001-prior-experiment.md',
+          sha256: digest(content),
+          bytes: Buffer.byteLength(content),
+        },
+      ],
+    });
+    const storedCampaign = value.database.getCampaign(value.campaignId);
+    const campaign = {
+      ...storedCampaign,
+      config: {
+        ...storedCampaign.config,
+        researchPaths: [researchPath],
+        researchSha256: [digest(content)],
+      },
+    };
+    const assembled = await assembleDiagnosisInput({
+      artifactDirectory: value.artifacts,
+      campaign,
+      variant: value.database.getVariant(value.variantId),
+      labels: value.database.listLabels(value.campaignId),
+      workflowsSource: value.workflows,
+      environment: {},
+    });
+
+    assert.equal(assembled.input.researchContext.authority, 'historical_context_only');
+    assert.match(assembled.input.researchContext.interpretationPolicy, /not current-run evidence/i);
+    assert.deepEqual(assembled.input.researchContext.materials, [
+      {
+        name: 'prior-experiment.md',
+        path: '001-prior-experiment.md',
+        sha256: digest(content),
+        bytes: Buffer.byteLength(content),
+        content,
+        contentTruncated: false,
+      },
+    ]);
+    assert.equal(
+      assembled.input.evidence.some(({ kind }) => kind.includes('research')),
+      false,
+    );
+
+    const replacement = 'replacement research bytes';
+    await writeFile(researchPath, replacement);
+    await writeJson(path.join(researchDirectory, 'manifest.json'), {
+      kind: 'ainative-planner-eval/frozen-research-manifest',
+      schemaVersion: 1,
+      materials: [
+        {
+          name: 'prior-experiment.md',
+          path: '001-prior-experiment.md',
+          sha256: digest(replacement),
+          bytes: Buffer.byteLength(replacement),
+        },
+      ],
+    });
+    await assert.rejects(
+      assembleDiagnosisInput({
+        artifactDirectory: value.artifacts,
+        campaign,
+        variant: value.database.getVariant(value.variantId),
+        labels: value.database.listLabels(value.campaignId),
+        workflowsSource: value.workflows,
+        environment: {},
+      }),
+      /frozen research (manifest does not match|material hash changed)/,
     );
   } finally {
     value.database.close();

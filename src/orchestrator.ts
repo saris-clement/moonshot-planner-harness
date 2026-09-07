@@ -35,6 +35,7 @@ import {
   type PlannerQuestionRecord,
 } from './plannerClient.js';
 import { writeAgentHistory, writeCampaignIndex, writeVariantReport } from './reports.js';
+import { captureResearchInputs, freezeResearchInputs } from './research.js';
 import {
   assembleDiagnosisInput,
   diagnosisResultPath,
@@ -959,18 +960,21 @@ export class CampaignOrchestrator {
   private async initializeResolved(
     resolved: Awaited<ReturnType<typeof resolveCampaignConfig>>,
   ): Promise<CampaignRecord> {
-    const measuredBenchmarks = await Promise.all(
-      resolved.config.benchmarks.map(async (benchmark) => {
-        const bytes = await readFile(benchmark.zipPath);
-        const measuredSha = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
-        if (benchmark.sha256 !== measuredSha) {
-          throw new Error(
-            `${benchmark.name} SHA mismatch during frozen copy: expected ${benchmark.sha256 ?? '<missing>'}, got ${measuredSha}`,
-          );
-        }
-        return { benchmark, bytes };
-      }),
-    );
+    const [measuredBenchmarks, researchInputs] = await Promise.all([
+      Promise.all(
+        resolved.config.benchmarks.map(async (benchmark) => {
+          const bytes = await readFile(benchmark.zipPath);
+          const measuredSha = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+          if (benchmark.sha256 !== measuredSha) {
+            throw new Error(
+              `${benchmark.name} SHA mismatch during frozen copy: expected ${benchmark.sha256 ?? '<missing>'}, got ${measuredSha}`,
+            );
+          }
+          return { benchmark, bytes };
+        }),
+      ),
+      captureResearchInputs(resolved.researchInputs),
+    ]);
     if (resolved.config.targetExcluded) {
       const targetIndex = [
         'src',
@@ -1018,17 +1022,21 @@ export class CampaignOrchestrator {
     const environmentSha = await sha256File(frozenEnvironment);
     const packsDirectory = path.join(directory, 'packs');
     await mkdir(packsDirectory, { recursive: true });
-    const benchmarks = await Promise.all(
-      measuredBenchmarks.map(async ({ benchmark, bytes }) => {
-        const frozenPath = path.join(packsDirectory, `${benchmark.name}.zip`);
-        await writeFile(frozenPath, bytes, { flag: 'wx', mode: 0o600 });
-        return { ...benchmark, zipPath: frozenPath };
-      }),
-    );
+    const [benchmarks, researchPaths] = await Promise.all([
+      Promise.all(
+        measuredBenchmarks.map(async ({ benchmark, bytes }) => {
+          const frozenPath = path.join(packsDirectory, `${benchmark.name}.zip`);
+          await writeFile(frozenPath, bytes, { flag: 'wx', mode: 0o600 });
+          return { ...benchmark, zipPath: frozenPath };
+        }),
+      ),
+      freezeResearchInputs(directory, researchInputs),
+    ]);
     const config = {
       ...resolved.config,
       environmentFile: frozenEnvironment,
       benchmarks,
+      researchPaths,
     };
     await Promise.all([
       writeResolvedCampaignConfig(

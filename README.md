@@ -6,7 +6,7 @@ It is deliberately a one-machine tool: one coordinator process, SQLite state, di
 
 ## What It Does
 
-- Freezes the planner seed, workflows source, primary pack, holdout packs, and environment profile.
+- Freezes the planner seed, workflows source, primary pack, holdout packs, environment profile, and optional campaign research files.
 - Uses GPT-5.6 Sol through OpenCode to propose and implement bounded generic changes.
 - Builds and runs up to three isolated planner stacks concurrently.
 - Stops each evaluation after Phase 2.
@@ -14,7 +14,7 @@ It is deliberately a one-machine tool: one coordinator process, SQLite state, di
 - Uses a separate blind LLM session to suggest per-unit expected decisions.
 - Resolves imported blocking questions through requirements-agent first, then a concise source-grounded fallback, and records every answer.
 - Persists human-reviewed labels independently from model suggestions.
-- Reconstructs bounded, cited post-run diagnoses from durable planner/S3 artifacts, optional Langfuse observations, frozen source references, judge evidence, labels, and replicate facts before proposing a planner mutation.
+- Reconstructs bounded, cited post-run diagnoses from durable planner/S3 artifacts, optional Langfuse observations, frozen source references, judge evidence, labels, and replicate facts before proposing a planner mutation. Compact funnel aggregates cover every archived adjudication while detailed evidence is stratified across failures, controls, disagreements, and holdouts.
 - Generates one Markdown research record per experiment before execution and refreshes it with measured facts, evidence, and a conservative conclusion afterward.
 - Preserves optional human-authored context in a separate `docs/experiments/<campaign>/human/<variant>.md` sidecar that report refreshes never overwrite.
 - For target-enabled campaigns, resolves one target-safe primary pack and runs two normal-primary, two holdout, and two target-excluded repetitions concurrently. The normal primary is the comparison control; no duplicate control cohort runs.
@@ -49,7 +49,7 @@ The console uses real History API routes and can be refreshed at any valid deep 
 
 The server serves `index.html` only for these GET/HEAD UI paths. API paths and extension-bearing paths never receive the UI fallback.
 
-Initialization copies the environment file and both ZIPs into the ignored campaign data directory, records their hashes, and uses only those frozen copies afterward. Environment contents are never copied into reports. If the local planner API requires authentication, expose its token to the harness as `PLANNER_EVAL_API_TOKEN` in that file.
+Initialization copies the environment file, ZIPs, and optional absolute `researchPaths` into the ignored campaign data directory, records their hashes, and uses only those frozen copies afterward. Research is exposed to the diagnostician and strategist as `historical_context_only`; it may inform hypotheses but is never current-run evidence. Environment contents are never copied into reports. If the local planner API requires authentication, expose its token to the harness as `PLANNER_EVAL_API_TOKEN` in that file.
 
 Optional diagnosis-time Langfuse reads use `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, and `LANGFUSE_SECRET_KEY` from that frozen campaign environment. Reads are case/run filtered and capped; credentials and authorization headers are never persisted. Missing or failed Langfuse telemetry is recorded as incomplete optional evidence and does not invalidate durable run facts.
 
@@ -109,6 +109,7 @@ Blocking requirements questions are resolved once per campaign before evaluation
   campaigns/<id>/                frozen config, goal, agent history
     environment.env              mode-0600 frozen runtime profile
     packs/                       immutable benchmark ZIP copies
+    research/                    hash-pinned optional research copies and manifest
   worktrees/<id>/                planner candidates and frozen workflows source
   artifacts/<id>/<variant>/      raw output, patches, logs, S3 objects
     diagnosis/                   immutable bounded inputs, manifests, optional telemetry, prompts, logs, and results
@@ -117,7 +118,7 @@ docs/experiments/<id>/           trackable Markdown facts and conclusions
 docs/experiments/history/        hash-pinned historical research materials
 ```
 
-Raw packs, source excerpts, model events, and logs stay in ignored `.data/`. Experiment Markdown contains preregistered assumptions and instructions, hashes, parent metrics, measured aggregates, interpretation provenance, target protocol and normal-arm binding, a conservative conclusion, and artifact references without copying raw source text. Historical strategist context is enumerated by `docs/experiments/history/manifest.json`; each imported file is verified by SHA-256 before use.
+Raw packs, source excerpts, model events, and logs stay in ignored `.data/`. Experiment Markdown contains preregistered assumptions and instructions, hashes, parent metrics, measured aggregates, interpretation provenance, target protocol and normal-arm binding, a conservative conclusion, and artifact references without copying raw source text. Campaign-configured research is copied and hash-pinned at initialization. Shared historical strategist context remains separately enumerated by `docs/experiments/history/manifest.json`; every imported file is verified by SHA-256 before use.
 
 ## Verification
 

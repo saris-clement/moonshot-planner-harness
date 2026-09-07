@@ -6,6 +6,9 @@
   "environmentFile": "/absolute/path/to/planner-eval.env",
   "seedRevision": "REPLACE_WITH_EXACT_PLANNER_SHA",
   "workflowsRevision": "REPLACE_WITH_EXACT_WORKFLOWS_SHA",
+  "researchPaths": [
+    "/absolute/path/to/prior-investigation.md"
+  ],
   "benchmarks": [
     {
       "name": "deceased-account",

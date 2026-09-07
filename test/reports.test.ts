@@ -201,7 +201,37 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
       )}\n`,
     );
     await writeFile(path.join(paths.reports, 'unverified.md'), 'This must not enter strategist history.\n');
-    await writeAgentHistory(historyPath, paths.reports, campaign, [variant], [label]);
+    const frozenResearchContent = '# Campaign research\n\nHistorical context, not current evidence.\n';
+    const frozenResearchDirectory = path.join(root, 'frozen-research');
+    const frozenResearchPath = path.join(frozenResearchDirectory, '001-campaign-research.md');
+    await mkdir(frozenResearchDirectory, { recursive: true });
+    await writeFile(frozenResearchPath, frozenResearchContent);
+    await writeFile(
+      path.join(frozenResearchDirectory, 'manifest.json'),
+      `${JSON.stringify({
+        kind: 'ainative-planner-eval/frozen-research-manifest',
+        schemaVersion: 1,
+        materials: [
+          {
+            name: 'campaign-research.md',
+            path: '001-campaign-research.md',
+            sha256: `sha256:${createHash('sha256').update(frozenResearchContent).digest('hex')}`,
+            bytes: Buffer.byteLength(frozenResearchContent),
+          },
+        ],
+      })}\n`,
+    );
+    const campaignWithResearch = {
+      ...campaign,
+      config: {
+        ...campaign.config,
+        researchPaths: [frozenResearchPath],
+        researchSha256: [
+          `sha256:${createHash('sha256').update(frozenResearchContent).digest('hex')}`,
+        ],
+      },
+    };
+    await writeAgentHistory(historyPath, paths.reports, campaignWithResearch, [variant], [label]);
     const history = JSON.parse(await readFile(historyPath, 'utf8')) as Record<string, unknown>;
     const serialized = JSON.stringify(history);
     assert.match(serialized, /"benchmark":"primary-pack"/);
@@ -214,6 +244,8 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
     assert.match(serialized, /"name":"V13c experiment axes"/);
     assert.match(serialized, /"comparability":"historical_context_only"/);
     assert.match(serialized, /No results claimed/);
+    assert.match(serialized, /"researchContext":\{"authority":"historical_context_only"/);
+    assert.match(serialized, /Historical context, not current evidence/);
     assert.doesNotMatch(serialized, /This must not enter strategist history/);
 
     const manifestPath = path.join(paths.reports, 'history', 'manifest.json');
@@ -222,7 +254,7 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
     await rm(manifestPath);
     await symlink(outsideManifest, manifestPath);
     await assert.rejects(
-      writeAgentHistory(historyPath, paths.reports, campaign, [variant], [label]),
+      writeAgentHistory(historyPath, paths.reports, campaignWithResearch, [variant], [label]),
       /historical research manifest must be a contained regular file/,
     );
 
@@ -231,7 +263,7 @@ test('reports and history keep diagnosis separate from measured, judge, and huma
     await mkdir(outsideHistory);
     await symlink(outsideHistory, path.join(paths.reports, 'history'));
     await assert.rejects(
-      writeAgentHistory(historyPath, paths.reports, campaign, [variant], [label]),
+      writeAgentHistory(historyPath, paths.reports, campaignWithResearch, [variant], [label]),
       /historical research root must be a real directory/,
     );
   } finally {

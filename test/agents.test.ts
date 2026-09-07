@@ -162,6 +162,8 @@ test('strategist prompt and schema require current diagnosis finding citations',
   assert.match(calls[0]!.join(' '), /real finding IDs/);
   assert.match(calls[0]!.join(' '), /counterevidence/);
   assert.match(calls[0]!.join(' '), /assumptions/);
+  assert.match(calls[0]!.join(' '), /research.*historical context only/i);
+  assert.match(calls[0]!.join(' '), /not current-run evidence/i);
 });
 
 test('strategist output is rejected when it omits explicit assumptions', async () => {
@@ -342,6 +344,8 @@ test('diagnostician archives strict cited unverified output and mutator receives
     assert.equal(result.findings[0]?.id, 'finding-hydration');
     assert.match(calls[0]!.join(' '), /both supporting evidence and counterevidence/);
     assert.match(calls[0]!.join(' '), /excluded from numeric scoring|unverified/);
+    assert.match(calls[0]!.join(' '), /research.*historical context only/i);
+    assert.match(calls[0]!.join(' '), /not current-run evidence/i);
     assert.match(calls[1]!.join(' '), /previous response did not satisfy the required JSON contract/);
     assert.match(
       await readFile(

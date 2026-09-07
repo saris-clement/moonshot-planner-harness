@@ -434,10 +434,12 @@ test('campaign initialization freezes environment and pack bytes', async () => {
   const environmentFile = path.join(root, 'planner.env');
   const primary = path.join(root, 'primary.zip');
   const holdout = path.join(root, 'holdout.zip');
+  const research = path.join(root, 'investigation.md');
   await Promise.all([
     writeFile(environmentFile, 'OPENAI_MODEL=gpt-5.6-sol\n'),
     writeFile(primary, 'primary bytes'),
     writeFile(holdout, 'holdout bytes'),
+    writeFile(research, '# Prior investigation\n\nHistorical hypothesis only.\n'),
   ]);
   const configPath = path.join(root, 'campaign.json');
   await writeFile(
@@ -450,6 +452,7 @@ test('campaign initialization freezes environment and pack bytes', async () => {
       environmentFile,
       seedRevision: seedSha,
       workflowsRevision: workflowsSha,
+      researchPaths: [research],
       benchmarks: [
         { name: 'primary', role: 'primary', zipPath: primary },
         { name: 'holdout', role: 'holdout', zipPath: holdout },
@@ -484,11 +487,105 @@ test('campaign initialization freezes environment and pack bytes', async () => {
       await readFile(campaign.config.benchmarks[0]!.zipPath, 'utf8'),
       'primary bytes',
     );
+    assert.deepEqual(campaign.config.researchPaths, [
+      path.join(data, 'campaigns/freeze-test/research/001-investigation.md'),
+    ]);
+    assert.deepEqual(campaign.config.researchSha256, [
+      `sha256:${createHash('sha256')
+        .update('# Prior investigation\n\nHistorical hypothesis only.\n')
+        .digest('hex')}`,
+    ]);
+    assert.equal(
+      await readFile(campaign.config.researchPaths[0]!, 'utf8'),
+      '# Prior investigation\n\nHistorical hypothesis only.\n',
+    );
+    const researchManifest = JSON.parse(
+      await readFile(path.join(data, 'campaigns/freeze-test/research/manifest.json'), 'utf8'),
+    ) as {
+      kind: string;
+      materials: Array<{ path: string; sha256: string; bytes: number }>;
+    };
+    assert.equal(researchManifest.kind, 'ainative-planner-eval/frozen-research-manifest');
+    assert.deepEqual(researchManifest.materials, [
+      {
+        name: 'investigation.md',
+        path: '001-investigation.md',
+        sha256: `sha256:${createHash('sha256')
+          .update('# Prior investigation\n\nHistorical hypothesis only.\n')
+          .digest('hex')}`,
+        bytes: Buffer.byteLength('# Prior investigation\n\nHistorical hypothesis only.\n'),
+      },
+    ]);
     await writeFile(primary, 'mutated');
+    await writeFile(research, 'mutated research');
     assert.equal(
       await readFile(campaign.config.benchmarks[0]!.zipPath, 'utf8'),
       'primary bytes',
     );
+    assert.equal(
+      await readFile(campaign.config.researchPaths[0]!, 'utf8'),
+      '# Prior investigation\n\nHistorical hypothesis only.\n',
+    );
+  } finally {
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('campaign initialization rejects research mutation after configuration resolution', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'planner-eval-research-race-'));
+  const plannerRepo = path.join(root, 'planner');
+  const workflowsRepo = path.join(root, 'workflows');
+  const [seedSha, workflowsSha] = await Promise.all([
+    gitFixture(plannerRepo),
+    gitFixture(workflowsRepo, true),
+  ]);
+  const environmentFile = path.join(root, 'planner.env');
+  const primary = path.join(root, 'primary.zip');
+  const holdout = path.join(root, 'holdout.zip');
+  const research = path.join(root, 'research.md');
+  await Promise.all([
+    writeFile(environmentFile, ''),
+    writeFile(primary, 'primary bytes'),
+    writeFile(holdout, 'holdout bytes'),
+    writeFile(research, 'original research bytes'),
+  ]);
+  const resolved = await resolveCampaignConfig({
+    id: 'research-race-test',
+    goal: 'Reject mutable research bytes after campaign configuration resolution.',
+    plannerRepo,
+    workflowsRepo,
+    environmentFile,
+    seedRevision: seedSha,
+    workflowsRevision: workflowsSha,
+    researchPaths: [research],
+    benchmarks: [
+      { name: 'primary', role: 'primary', zipPath: primary },
+      { name: 'holdout', role: 'holdout', zipPath: holdout },
+    ],
+  });
+  await writeFile(research, 'mutated research bytes');
+  const data = path.join(root, 'data');
+  await mkdir(data);
+  const paths: HarnessPaths = {
+    root: data,
+    database: path.join(data, 'harness.sqlite'),
+    campaigns: path.join(data, 'campaigns'),
+    worktrees: path.join(data, 'worktrees'),
+    artifacts: path.join(data, 'artifacts'),
+    reports: path.join(root, 'reports'),
+  };
+  const database = new HarnessDatabase(paths.database);
+  try {
+    const internal = new CampaignOrchestrator(paths, database) as unknown as {
+      initializeResolved: (input: typeof resolved) => Promise<CampaignRecord>;
+    };
+    await assert.rejects(
+      internal.initializeResolved(resolved),
+      /research input SHA mismatch during frozen copy/,
+    );
+    assert.deepEqual(database.listCampaigns(), []);
+    assert.equal(await stat(path.join(paths.campaigns, resolved.config.id)).catch(() => null), null);
   } finally {
     database.close();
     await rm(root, { recursive: true, force: true });

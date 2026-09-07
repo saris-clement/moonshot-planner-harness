@@ -11,6 +11,7 @@ import type {
 import type { HarnessPaths } from './paths.js';
 import { campaignReportDirectory } from './paths.js';
 import { compareCohort } from './metrics.js';
+import { readFrozenResearchContext } from './research.js';
 
 function markdown(value: string): string {
   return value.replaceAll('|', '\\|').replace(/[\r\n]+/g, ' ').trim();
@@ -756,7 +757,10 @@ export async function writeAgentHistory(
   labels: readonly LabelRecord[],
   targetEvaluations: readonly TargetExcludedEvaluationRecord[] = [],
 ): Promise<void> {
-  const historicalExperiments = await readHistoricalExperiments(experimentsRoot);
+  const [historicalExperiments, researchContext] = await Promise.all([
+    readHistoricalExperiments(experimentsRoot),
+    readFrozenResearchContext(campaign.config.researchPaths, campaign.config.researchSha256),
+  ]);
   const history = {
     goal: campaign.config.goal,
     genericityConstraints: [
@@ -772,6 +776,7 @@ export async function writeAgentHistory(
       benchmarks: campaign.config.benchmarks.map(({ name, role, sha256 }) => ({ name, role, sha256 })),
     },
     historicalExperiments,
+    researchContext,
     labels: labels.map(({ benchmark, unitKey, expectedDecision, classification, rationale, status }) => ({
       benchmark,
       unitKey,
