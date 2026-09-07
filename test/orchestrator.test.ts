@@ -1427,6 +1427,38 @@ test('target-blind judgment persists generic evidence instead of an excluded sou
   ]);
 });
 
+test('automatic promotion skips candidates rejected by holdout validation', async () => {
+  const fixture = await v2LifecycleFixture('automatic-holdout-rejection');
+  try {
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      promoteUnlocked: (campaignId: string, variantId: string) => Promise<VariantRecord>;
+      promoteFirstEligibleAutomaticCandidate: (
+        campaignId: string,
+        eligible: readonly VariantRecord[],
+      ) => Promise<boolean>;
+    };
+    internal.promoteUnlocked = async (_campaignId, variantId) => {
+      fixture.database.updateVariant(variantId, {
+        status: 'rejected',
+        error: 'holdout regression: holdout',
+      });
+      throw new Error('variant regressed holdout benchmarks: holdout');
+    };
+
+    assert.equal(
+      await internal.promoteFirstEligibleAutomaticCandidate(fixture.campaign.id, [fixture.variant]),
+      false,
+    );
+    assert.equal(fixture.database.getVariant(fixture.variant.id).status, 'rejected');
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 const baselineHypothesisForTest = {
   title: 'Seed',
   rationale: 'Observe the seed.',

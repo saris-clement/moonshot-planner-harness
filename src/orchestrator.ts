@@ -1595,12 +1595,29 @@ export class CampaignOrchestrator {
     if (eligible.length === 0) {
       this.database.updateCampaign(campaignId, { status: 'stopped_round_failed' });
     } else if (campaign.config.mode === 'automatic') {
-      await this.promoteUnlocked(campaignId, eligible[0]!.id);
+      if (!(await this.promoteFirstEligibleAutomaticCandidate(campaignId, eligible))) {
+        this.database.updateCampaign(campaignId, { status: 'stopped_round_failed' });
+      }
     } else {
       this.database.updateCampaign(campaignId, { status: 'awaiting_review' });
     }
     await this.refreshReports(campaignId);
     return results;
+  }
+
+  private async promoteFirstEligibleAutomaticCandidate(
+    campaignId: string,
+    eligible: readonly VariantRecord[],
+  ): Promise<boolean> {
+    for (const candidate of eligible) {
+      try {
+        await this.promoteUnlocked(campaignId, candidate.id);
+        return true;
+      } catch (error) {
+        if (this.database.getVariant(candidate.id).status !== 'rejected') throw error;
+      }
+    }
+    return false;
   }
 
   async promote(campaignId: string, variantId: string): Promise<VariantRecord> {
