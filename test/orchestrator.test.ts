@@ -1567,6 +1567,11 @@ test('V2 readiness requires a valid binding to standard primary execution and ar
         evaluation: ReturnType<HarnessDatabase['getTargetExcludedEvaluation']>,
         baseline: boolean,
       ) => boolean;
+      reconcileTargetSafeQuestionResolution: (
+        campaign: CampaignRecord,
+        config: TargetExcludedConfig,
+        evaluation: ReturnType<HarnessDatabase['getTargetExcludedEvaluation']>,
+      ) => ReturnType<HarnessDatabase['getTargetExcludedEvaluation']>;
       verifyArchivedTargetExcludedComparisons: (
         campaign: CampaignRecord,
         variantId: string,
@@ -1583,6 +1588,40 @@ test('V2 readiness requires a valid binding to standard primary execution and ar
       ),
       true,
     );
+    const leakyResolution: BenchmarkQuestionResolution = {
+      ...resolution('primary', resolvedArtifactSha),
+      pmSimulationAnswers: 1,
+      entries: [
+        {
+          id: 'pm-question',
+          question: 'Which product behavior is intended?',
+          resolution: 'pm_simulation',
+          answer: 'Use the implementation-backed behavior.',
+          evidence: ['src/customers/trumark/deceased-accounts/index.ts:42'],
+        },
+      ],
+    };
+    const blocked = database.updateTargetExcludedEvaluation(created.id, {
+      questionResolution: leakyResolution,
+      gate: computeTargetExcludedGate([facts, facts], [facts, facts], true, true),
+    });
+    assert.equal(
+      orchestrator.targetExcludedEvaluationReady(campaign, targetConfig, blocked, true),
+      false,
+    );
+    const reconciled = orchestrator.reconcileTargetSafeQuestionResolution(
+      campaign,
+      targetConfig,
+      blocked,
+    );
+    assert.ok(reconciled);
+    assert.equal(
+      orchestrator.targetExcludedEvaluationReady(campaign, targetConfig, reconciled, true),
+      true,
+    );
+    assert.deepEqual(reconciled.questionResolution?.entries[0]?.evidence, [
+      'PM simulation evidence is retained in the immutable harness agent transcript.',
+    ]);
     await orchestrator.verifyArchivedTargetExcludedComparisons(
       campaign,
       created.id,

@@ -372,6 +372,26 @@ export function withRuntimeQuestions(
   };
 }
 
+const TARGET_SAFE_PM_EVIDENCE =
+  'PM simulation evidence is retained in the immutable harness agent transcript.';
+
+export function targetSafeQuestionResolution(
+  summary: NonNullable<VariantRecord['questionResolutions']>[string],
+  targetWorkflow: string,
+): NonNullable<VariantRecord['questionResolutions']>[string] {
+  return {
+    ...summary,
+    entries: summary.entries.map((entry) => ({
+      ...entry,
+      evidence:
+        entry.resolution === 'pm_simulation' &&
+        entry.evidence.some((item) => containsTargetIdentityLeak(item, targetWorkflow))
+          ? [TARGET_SAFE_PM_EVIDENCE]
+          : entry.evidence,
+    })),
+  };
+}
+
 export class CampaignOrchestrator {
   private readonly activeCampaigns = new Set<string>();
   private readonly reportQueues = new Map<string, Promise<void>>();
@@ -662,7 +682,7 @@ export class CampaignOrchestrator {
           throw new Error('persisted V2 normal-arm binding differs from standard execution');
         }
         questionResolution = withRuntimeQuestions(
-          summary,
+          targetSafeQuestionResolution(summary, config.targetImplementationWorkflow),
           results.flatMap(({ questions }) => questions),
           'excluded',
         );
@@ -1102,7 +1122,12 @@ export class CampaignOrchestrator {
                 );
                 targetConfig = await this.persistAutomaticV2Config(campaign, targetConfig);
               }
-              const evaluation = this.database.getTargetExcludedEvaluation(bound.id);
+              let evaluation = this.database.getTargetExcludedEvaluation(bound.id);
+              evaluation = this.reconcileTargetSafeQuestionResolution(
+                campaign,
+                targetConfig,
+                evaluation,
+              );
               if (!this.targetExcludedEvaluationReady(campaign, targetConfig, evaluation, true)) {
                 await this.runTargetExcludedBackfill(campaign, bound, targetConfig);
               }
@@ -1957,6 +1982,50 @@ export class CampaignOrchestrator {
     );
   }
 
+  private reconcileTargetSafeQuestionResolution(
+    campaign: CampaignRecord,
+    config: TargetExcludedConfig,
+    evaluation: TargetExcludedEvaluationRecord | null,
+  ): TargetExcludedEvaluationRecord | null {
+    if (
+      config.protocol !== 'standard-primary-v2' ||
+      !evaluation?.questionResolution ||
+      !evaluation.excludedReplicateFacts ||
+      !evaluation.comparisons ||
+      !evaluation.judgment
+    ) {
+      return evaluation;
+    }
+    const questionResolution = targetSafeQuestionResolution(
+      evaluation.questionResolution,
+      config.targetImplementationWorkflow,
+    );
+    if (isDeepStrictEqual(questionResolution, evaluation.questionResolution)) return evaluation;
+    const baselineRuns =
+      evaluation.variantId === config.baselineVariantId
+        ? evaluation.excludedReplicateFacts
+        : this.database.getTargetExcludedEvaluation(config.baselineVariantId)
+            ?.excludedReplicateFacts ?? [];
+    const comparisonValid =
+      evaluation.comparisons.length === config.replicates &&
+      evaluation.comparisons.every((comparison) => comparison.valid);
+    const leakageDetected =
+      evaluation.comparisons.some((comparison) => comparison.leakagePaths.length > 0) ||
+      containsTargetIdentityLeak(evaluation.judgment, config.targetImplementationWorkflow) ||
+      containsTargetIdentityLeak(questionResolution, config.targetImplementationWorkflow);
+    return this.database.updateTargetExcludedEvaluation(evaluation.variantId, {
+      questionResolution,
+      gate: computeTargetExcludedGate(
+        baselineRuns,
+        evaluation.excludedReplicateFacts,
+        comparisonValid,
+        leakageDetected,
+        config.warningBuildDropRatio,
+        config.blockBuildDropRatio,
+      ),
+    });
+  }
+
   stop(campaignId: string): CampaignRecord {
     for (const [key, pending] of this.pendingTargetAnswers) {
       if (pending.campaignId !== campaignId) continue;
@@ -2403,7 +2472,10 @@ export class CampaignOrchestrator {
                 excludedFacts: targetExcludedRuns.facts,
                 excludedReplicateFacts: targetExcludedRuns.replicates,
                 questionResolution: withRuntimeQuestions(
-                  questionResolutions[primary.name]!,
+                  targetSafeQuestionResolution(
+                    questionResolutions[primary.name]!,
+                    v2Config.targetImplementationWorkflow,
+                  ),
                   targetExcludedRuns.questions,
                   'excluded',
                 ),
@@ -3110,7 +3182,7 @@ export class CampaignOrchestrator {
         ...(selectedOptionId ? { selectedOptionId } : {}),
         resolution: 'pm_simulation',
         evidence: targetContext
-          ? ['PM simulation evidence is retained in the immutable harness agent transcript.']
+          ? [TARGET_SAFE_PM_EVIDENCE]
           : source.evidence,
         requirementsAgentRequests: consultationRecords.length,
       };
@@ -3432,7 +3504,14 @@ export class CampaignOrchestrator {
         excludedReplicateFacts: excluded.replicates,
         questionResolution:
           config.protocol === 'standard-primary-v2'
-            ? withRuntimeQuestions(resolutions[primary.name]!, excluded.questions, 'excluded')
+            ? withRuntimeQuestions(
+                targetSafeQuestionResolution(
+                  resolutions[primary.name]!,
+                  config.targetImplementationWorkflow,
+                ),
+                excluded.questions,
+                'excluded',
+              )
             : withRuntimeQuestions(
                 withRuntimeQuestions(resolutions[primary.name]!, control!.questions, 'control'),
                 excluded.questions,
