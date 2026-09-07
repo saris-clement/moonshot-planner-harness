@@ -4,11 +4,13 @@ import path from 'node:path';
 import { sha256File } from './config.js';
 import { LangfuseReadClient, type LangfuseCollection } from './langfuse.js';
 import { isV2TargetIdentitySourceCandidate } from './targetExcludedSource.js';
+import { readFrozenResearchContext } from './research.js';
 import {
   DiagnosisInputSchema,
   DiagnosisManifestSchema,
   DiagnosisOutputSchema,
   type CampaignRecord,
+  type Decision,
   type DiagnosisCompletenessItem,
   type DiagnosisEvidence,
   type DiagnosisFinding,
@@ -81,6 +83,11 @@ function numberField(value: unknown, key: string): number | null {
   return isRecord(value) && typeof value[key] === 'number' && Number.isFinite(value[key])
     ? value[key]
     : null;
+}
+
+function countField(value: unknown, key: string): number | null {
+  const count = numberField(value, key);
+  return count !== null && Number.isSafeInteger(count) && count >= 0 ? count : null;
 }
 
 function safeRelativePath(root: string, filePath: string): string {
@@ -244,78 +251,338 @@ function targetRunFacts(
   ].filter((facts): facts is RunFacts => facts !== null);
 }
 
-function selectFocusUnits(input: AssembleDiagnosisInput): {
-  keys: Set<string>;
-  candidateCount: number;
-} {
+interface DiagnosisFactScope {
+  benchmark: string;
+  role: 'primary' | 'holdout';
+  arm: DiagnosisLineageArm;
+  facts: RunFacts[];
+}
+
+function focusScopeKey(benchmark: string, arm: DiagnosisLineageArm, unitKey: string): string {
+  return JSON.stringify([benchmark, arm, unitKey]);
+}
+
+function diagnosisFactScopes(input: AssembleDiagnosisInput): DiagnosisFactScope[] {
   const standardPrimaryV2 = isStandardPrimaryV2(input);
-  const standardMeasured = new Map(
-    (input.variant.facts?.units ?? []).map((unit) => [unit.key, unit]),
-  );
-  const targetMeasured = new Map(
-    targetRunFacts(input.targetExcluded, standardPrimaryV2).flatMap((facts) =>
-      facts.units.map((unit) => [unit.key, unit] as const),
-    ),
-  );
-  const targetExcludedMeasured = new Map(
-    (input.targetExcluded?.excludedFacts?.units ?? []).map((unit) => [unit.key, unit]),
-  );
-  const measured = new Map([...standardMeasured, ...targetMeasured]);
-  const priority = new Map<string, number>();
-  const add = (key: string, value: number) => {
-    if (!measured.has(key)) return;
-    priority.set(key, Math.min(priority.get(key) ?? value, value));
+  const scopes: DiagnosisFactScope[] = [];
+  const add = (
+    benchmark: string,
+    role: DiagnosisFactScope['role'],
+    arm: DiagnosisLineageArm,
+    aggregate: RunFacts | null | undefined,
+    replicates: RunFacts[] | null | undefined,
+  ) => {
+    const facts = replicates?.length ? replicates : aggregate ? [aggregate] : [];
+    if (facts.length > 0) scopes.push({ benchmark, role, arm, facts });
   };
-  const primary = input.campaign.config.benchmarks.find((benchmark) => benchmark.role === 'primary')?.name;
-  for (const label of input.labels) {
-    const labelFacts = label.benchmark.includes('target-excluded')
-      ? targetExcludedMeasured.size > 0
-        ? targetExcludedMeasured
-        : targetMeasured
-      : label.benchmark === primary
-        ? standardMeasured
-        : null;
-    const unit = labelFacts?.get(label.unitKey);
-    if (!unit || unit.decision === label.expectedDecision) continue;
-    add(label.unitKey, label.status === 'verified' ? 0 : 2);
-  }
-  for (const verdict of input.variant.judgment?.verdicts ?? []) {
-    const unit = standardMeasured.get(verdict.unitKey);
-    if (!unit || unit.decision === verdict.expectedDecision) continue;
-    add(verdict.unitKey, verdict.classification === 'system_error' ? 1 : 3);
-  }
-  for (const verdict of input.targetExcluded?.judgment?.verdicts ?? []) {
-    const unit = (targetExcludedMeasured.size > 0 ? targetExcludedMeasured : targetMeasured).get(
-      verdict.unitKey,
-    );
-    if (!unit || unit.decision === verdict.expectedDecision) continue;
-    add(verdict.unitKey, verdict.classification === 'system_error' ? 1 : 3);
-  }
-  for (const cohort of [
-    input.variant.replicateFacts ?? [],
-    ...(standardPrimaryV2 ? [] : [input.targetExcluded?.controlReplicateFacts ?? []]),
-    input.targetExcluded?.excludedReplicateFacts ?? [],
-  ]) {
-    const decisions = new Map<string, Set<string>>();
-    for (const replicate of cohort) {
-      for (const unit of replicate.units) {
-        const values = decisions.get(unit.key) ?? new Set<string>();
-        values.add(unit.decision);
-        decisions.set(unit.key, values);
+  for (const benchmark of input.campaign.config.benchmarks) {
+    if (benchmark.role === 'primary') {
+      add(benchmark.name, benchmark.role, 'standard', input.variant.facts, input.variant.replicateFacts);
+    } else {
+      add(
+        benchmark.name,
+        benchmark.role,
+        'standard',
+        input.variant.holdoutFacts?.[benchmark.name],
+        input.variant.holdoutReplicateFacts?.[benchmark.name],
+      );
+      if (!standardPrimaryV2) {
+        add(
+          benchmark.name,
+          benchmark.role,
+          'control',
+          input.targetExcluded?.holdoutFacts?.[benchmark.name],
+          input.targetExcluded?.holdoutReplicateFacts?.[benchmark.name],
+        );
       }
     }
-    for (const [key, values] of decisions) if (values.size > 1) add(key, 4);
   }
-  if (priority.size === 0) {
-    for (const unit of input.variant.facts?.units ?? []) add(unit.key, 5);
+  const primary = input.campaign.config.benchmarks.find(({ role }) => role === 'primary');
+  if (primary && input.targetExcluded) {
+    if (!standardPrimaryV2) {
+      add(
+        primary.name,
+        primary.role,
+        'control',
+        input.targetExcluded.controlFacts,
+        input.targetExcluded.controlReplicateFacts,
+      );
+    }
+    add(
+      primary.name,
+      primary.role,
+      'excluded',
+      input.targetExcluded.excludedFacts,
+      input.targetExcluded.excludedReplicateFacts,
+    );
   }
-  const selected = [...priority]
-    .sort(([leftKey, leftPriority], [rightKey, rightPriority]) =>
-      leftPriority - rightPriority || leftKey.localeCompare(rightKey),
-    )
-    .slice(0, MAX_FOCUS_UNITS)
-    .map(([key]) => key);
-  return { keys: new Set(selected), candidateCount: priority.size };
+  return scopes;
+}
+
+function selectFocusUnits(input: AssembleDiagnosisInput): {
+  keys: Set<string>;
+  scopeKeys: Set<string>;
+  candidateCount: number;
+  stratumCount: number;
+} {
+  const scopes = diagnosisFactScopes(input);
+  const knownScopes = new Map<string, string>();
+  for (const scope of scopes) {
+    for (const facts of scope.facts) {
+      for (const unit of facts.units) {
+        knownScopes.set(focusScopeKey(scope.benchmark, scope.arm, unit.key), unit.key);
+      }
+    }
+  }
+  const strata = new Map<string, Set<string>>();
+  const add = (stratum: string, scope: DiagnosisFactScope, key: string) => {
+    const scopedKey = focusScopeKey(scope.benchmark, scope.arm, key);
+    if (!knownScopes.has(scopedKey)) return;
+    const scopedKeys = strata.get(stratum) ?? new Set<string>();
+    scopedKeys.add(scopedKey);
+    strata.set(stratum, scopedKeys);
+  };
+
+  for (const scope of scopes) {
+    const decisions = new Map<string, Set<Decision>>();
+    for (const facts of scope.facts) {
+      for (const unit of facts.units) {
+        const values = decisions.get(unit.key) ?? new Set<Decision>();
+        values.add(unit.decision);
+        decisions.set(unit.key, values);
+        if (scope.role === 'holdout') add('holdout', scope, unit.key);
+        if (scope.arm === 'control') add('target_control', scope, unit.key);
+        if (unit.shortlistCandidateCount === 0) add('funnel_no_candidates', scope, unit.key);
+        else if (unit.discoveredEvidenceCount === 0) add('funnel_no_discovery', scope, unit.key);
+        else if (unit.sourceRefs.length === 0) add('funnel_no_selection', scope, unit.key);
+        if (unit.sourceRefs.length > 0) add('source_backed_control', scope, unit.key);
+      }
+    }
+    for (const [key, values] of decisions) {
+      if (values.size > 1) add('replicate_disagreement', scope, key);
+    }
+  }
+
+  const matchingScopes = (benchmark: string): DiagnosisFactScope[] =>
+    benchmark === 'target-excluded'
+      ? scopes.filter(({ arm }) => arm === 'excluded')
+      : scopes.filter(({ benchmark: name, arm }) => name === benchmark && arm === 'standard');
+  for (const label of input.labels) {
+    for (const scope of matchingScopes(label.benchmark)) {
+      const units = scope.facts.flatMap((facts) =>
+        facts.units.filter(({ key }) => key === label.unitKey),
+      );
+      if (units.some(({ decision }) => decision !== label.expectedDecision)) {
+        add(
+          label.status === 'verified' ? 'verified_mismatch' : 'suggested_mismatch',
+          scope,
+          label.unitKey,
+        );
+      } else if (units.length > 0) {
+        add('decision_agreement_control', scope, label.unitKey);
+      }
+    }
+  }
+
+  const judgments = [
+    ...input.campaign.config.benchmarks.flatMap((benchmark) => {
+      const judgment =
+        benchmark.role === 'primary'
+          ? input.variant.judgment
+          : input.variant.holdoutJudgments?.[benchmark.name];
+      return judgment ? [{ benchmark: benchmark.name, judgment }] : [];
+    }),
+    ...(input.targetExcluded?.judgment
+      ? [{ benchmark: 'target-excluded', judgment: input.targetExcluded.judgment }]
+      : []),
+  ];
+  for (const { benchmark, judgment } of judgments) {
+    for (const verdict of judgment.verdicts) {
+      for (const scope of matchingScopes(benchmark)) {
+        const units = scope.facts.flatMap((facts) =>
+          facts.units.filter(({ key }) => key === verdict.unitKey),
+        );
+        if (units.some(({ decision }) => decision !== verdict.expectedDecision)) {
+          add(
+            verdict.classification === 'system_error'
+              ? 'judge_system_error'
+              : 'judge_other_mismatch',
+            scope,
+            verdict.unitKey,
+          );
+        } else if (units.length > 0) {
+          add('decision_agreement_control', scope, verdict.unitKey);
+        }
+      }
+    }
+  }
+
+  if (strata.size === 0) {
+    strata.set('fallback', new Set(knownScopes.keys()));
+  }
+  const orderedStrata = [
+    'verified_mismatch',
+    'judge_system_error',
+    'funnel_no_candidates',
+    'funnel_no_discovery',
+    'funnel_no_selection',
+    'replicate_disagreement',
+    'holdout',
+    'target_control',
+    'source_backed_control',
+    'decision_agreement_control',
+    'suggested_mismatch',
+    'judge_other_mismatch',
+    'fallback',
+  ].flatMap((name) => {
+    const keys = strata.get(name);
+    return keys ? [{ name, keys: [...keys].sort() }] : [];
+  });
+  const selectedScopes = new Set<string>();
+  const offsets = new Map(orderedStrata.map(({ name }) => [name, 0]));
+  while (selectedScopes.size < Math.min(MAX_FOCUS_UNITS, knownScopes.size)) {
+    let added = false;
+    for (const stratum of orderedStrata) {
+      let offset = offsets.get(stratum.name) ?? 0;
+      while (offset < stratum.keys.length && selectedScopes.has(stratum.keys[offset]!)) offset += 1;
+      offsets.set(stratum.name, offset + 1);
+      const key = stratum.keys[offset];
+      if (!key) continue;
+      selectedScopes.add(key);
+      added = true;
+      if (selectedScopes.size >= MAX_FOCUS_UNITS) break;
+    }
+    if (!added) break;
+  }
+  return {
+    keys: new Set([...selectedScopes].map((scopedKey) => knownScopes.get(scopedKey)!)),
+    scopeKeys: selectedScopes,
+    candidateCount: knownScopes.size,
+    stratumCount: orderedStrata.length,
+  };
+}
+
+const FUNNEL_STAGES = [
+  'shortlist_candidate',
+  'search_hit',
+  'qualified_pointer',
+  'hydration_attempt',
+  'source_read',
+  'admitted_evidence',
+  'selected_evidence',
+] as const;
+
+type FunnelStage = (typeof FUNNEL_STAGES)[number];
+
+function analysisFunnelAggregates(
+  benchmark: string,
+  role: 'primary' | 'holdout',
+  arm: DiagnosisLineageArm,
+  replicate: number,
+  analysisUnits: JsonRecord[],
+  adjudications: JsonRecord[],
+): JsonRecord[] {
+  const knownUnitIds = new Set(
+    analysisUnits.flatMap((unit) => {
+      const id = stringField(unit, 'id');
+      return id ? [id] : [];
+    }),
+  );
+  const groups = new Map<string, Array<{ adjudication: JsonRecord; unitId: string }>>();
+  for (const [index, adjudication] of adjudications.entries()) {
+    const disposition = stringField(adjudication, 'result') ?? 'unknown';
+    const unitId = stringField(adjudication, 'requirementUnitId') ?? `unknown-${index + 1}`;
+    const values = groups.get(disposition) ?? [];
+    values.push({ adjudication, unitId });
+    groups.set(disposition, values);
+  }
+  return [...groups]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([disposition, values]) => {
+      const stageValues = new Map<FunnelStage, Array<{ unitId: string; count: number }>>(
+        FUNNEL_STAGES.map((stage) => [stage, []]),
+      );
+      const rejectionReasons = new Map<string, Array<{ unitId: string; count: number }>>();
+      const rejectionObservedUnits = new Set<string>();
+      for (const { adjudication, unitId } of values) {
+        const shortlist = isRecord(adjudication.shortlist) ? adjudication.shortlist : null;
+        if (shortlist && Array.isArray(shortlist.candidates)) {
+          stageValues.get('shortlist_candidate')!.push({
+            unitId,
+            count: shortlist.candidates.length,
+          });
+        }
+        const grounding = isRecord(adjudication.evidenceGrounding)
+          ? adjudication.evidenceGrounding
+          : null;
+        if (!grounding) continue;
+        const admittedSourceCount = countField(grounding, 'admittedSourceCount');
+        const admittedTestCount = countField(grounding, 'admittedTestCount');
+        const metrics: Array<[FunnelStage, number | null]> = [
+          ['search_hit', countField(grounding, 'searchHitCount')],
+          ['qualified_pointer', countField(grounding, 'qualifiedPointerCount')],
+          ['hydration_attempt', countField(grounding, 'hydrationAttemptCount')],
+          ['source_read', countField(grounding, 'sourceReadCount')],
+          [
+            'admitted_evidence',
+            admittedSourceCount !== null && admittedTestCount !== null
+              ? admittedSourceCount + admittedTestCount
+              : null,
+          ],
+          ['selected_evidence', countField(grounding, 'selectedDiscoveredCount')],
+        ];
+        for (const [stage, count] of metrics) {
+          if (count !== null) stageValues.get(stage)!.push({ unitId, count });
+        }
+        if (!Array.isArray(grounding.rejectionCounts)) continue;
+        rejectionObservedUnits.add(unitId);
+        for (const rejection of grounding.rejectionCounts.filter(isRecord)) {
+          const reason = stringField(rejection, 'reason');
+          const count = countField(rejection, 'count');
+          if (!reason || count === null) continue;
+          const records = rejectionReasons.get(reason) ?? [];
+          records.push({ unitId, count });
+          rejectionReasons.set(reason, records);
+        }
+      }
+      const stages = FUNNEL_STAGES.map((stage) => {
+        const observed = stageValues.get(stage)!;
+        return {
+          stage,
+          occurrences:
+            observed.length > 0 ? observed.reduce((sum, item) => sum + item.count, 0) : null,
+          affectedUnits:
+            observed.length > 0
+              ? new Set(observed.filter(({ count }) => count > 0).map(({ unitId }) => unitId)).size
+              : null,
+          observedUnits: new Set(observed.map(({ unitId }) => unitId)).size,
+          totalUnits: values.length,
+        };
+      });
+      return {
+        benchmark,
+        role,
+        arm,
+        replicate,
+        disposition,
+        unitOccurrences: values.length,
+        affectedUnits: new Set(values.map(({ unitId }) => unitId)).size,
+        analysisUnitCount: knownUnitIds.size,
+        stages,
+        rejectionReasons: [...rejectionReasons]
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([reason, records]) => ({
+            reason,
+            occurrences: records.reduce((sum, item) => sum + item.count, 0),
+            affectedUnits: new Set(records.filter(({ count }) => count > 0).map(({ unitId }) => unitId))
+              .size,
+          })),
+        rejectionCoverage: {
+          observedUnits: rejectionObservedUnits.size,
+          totalUnits: values.length,
+        },
+      };
+    });
 }
 
 function artifactLineageArm(relativeDirectory: string): {
@@ -473,6 +740,10 @@ export async function verifyDiagnosisArtifacts(
 
 export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Promise<AssembledDiagnosis> {
   const artifactRoot = path.resolve(input.artifactDirectory);
+  const researchContext = await readFrozenResearchContext(
+    input.campaign.config.researchPaths,
+    input.campaign.config.researchSha256,
+  );
   const standardPrimaryV2 = isStandardPrimaryV2(input);
   const targetExcludedSourceManifestSha256 = input.targetExcludedSourceManifestPath &&
     (await stat(input.targetExcludedSourceManifestPath).catch(() => null))?.isFile()
@@ -481,8 +752,14 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
   const focus = selectFocusUnits(input);
   const inventory = new Map<string, ArtifactInventoryItem>();
   const evidence = new Map<string, DiagnosisEvidence>();
+  const evidenceFocusScopes = new Map<string, string>();
   const completeness: DiagnosisCompletenessItem[] = [];
-  const reconstructionSignals: DiagnosisInput['reconstructionSignals'] = [];
+  const reconstructionSignals: Array<
+    DiagnosisInput['reconstructionSignals'][number] & {
+      scopeBenchmark: string | null;
+      scopeArm: DiagnosisLineageArm | null;
+    }
+  > = [];
   const sourceCandidates = new Set<string>();
   const unitKeys = new Map<string, string>();
   const focusByCase = new Map<
@@ -646,7 +923,12 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
       analysisUnits.forEach((unit, index) => {
         const id = stringField(unit, 'id');
         const key = id ? factMap.get(id) ?? unitKeys.get(id) : null;
-        if (!analysisCaseId || !id || !key || !focus.keys.has(key)) return;
+        if (
+          !analysisCaseId ||
+          !id ||
+          !key ||
+          !focus.scopeKeys.has(focusScopeKey(benchmarkName, arm, key))
+        ) return;
         const caseFocus = focusByCase.get(analysisCaseId) ?? {
           unitIds: new Set<string>(),
           ordinals: new Set<number>(),
@@ -660,6 +942,34 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
       const adjudications = Array.isArray(analysis.adjudications)
         ? analysis.adjudications.filter(isRecord)
         : [];
+      for (const aggregate of analysisFunnelAggregates(
+        benchmarkName,
+        benchmark.role,
+        arm,
+        replicate,
+        analysisUnits,
+        adjudications,
+      )) {
+        const disposition = String(aggregate.disposition);
+        addEvidence(`all-unit-funnel|${relativeDirectory}|${disposition}`, {
+          kind: 'all_unit_funnel_aggregate',
+          summary: `${scopeName} replicate ${replicate} ${disposition} disposition has ${String(aggregate.unitOccurrences)} adjudication occurrences; funnel counts distinguish occurrences, affected units, and unavailable capture.`,
+          affectedUnitKeys: [],
+          provenance: {
+            classification: 'deterministic_reconstruction',
+            source: 'harness',
+            artifactPath: analysisArtifact.relativePath,
+            artifactSha256: analysisArtifact.sha256,
+            integrity: 'verified',
+            caseId: stringField(metadata, 'caseId') ?? lineage.caseId,
+            runId: stringField(metadata, 'runId') ?? lineage.runId,
+            unitKey: null,
+            limitation:
+              'Counts summarize all archived adjudications in this analysis. Null means the stage was not durably captured; zero means it was captured with no occurrences.',
+          },
+          data: boundedJson(aggregate),
+        });
+      }
       addEvidence(`analysis-pins|${relativeDirectory}`, {
         kind: 'analysis_pins',
         summary: `${scopeName} replicate ${replicate} published immutable input, source, workflow-resolution, and knowledge pins.`,
@@ -727,6 +1037,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
             evidenceGrounding: grounding ?? { availability: 'not_captured' },
           }),
         });
+        evidenceFocusScopes.set(record.id, focusScopeKey(benchmarkName, arm, key));
         analysisEvidenceByUnit.set(unitId, record.id);
         for (const ref of Array.isArray(adjudication.sourceRefs) ? adjudication.sourceRefs : []) {
           if (isRecord(ref) && typeof ref.path === 'string') sourceCandidates.add(ref.path);
@@ -747,6 +1058,8 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
               evidenceRefs: [record.id],
               summary: `Deterministic receipt: ${searchHits} search hits led to ${sourceReads} source reads but no admitted evidence; recorded rejection reasons, not KB availability, explain the loss.`,
               provenance: 'deterministic_reconstruction',
+              scopeBenchmark: benchmarkName,
+              scopeArm: arm,
             });
           } else if ((Array.isArray(shortlist.candidates) ? shortlist.candidates.length : 0) === 0) {
             reconstructionSignals.push({
@@ -755,6 +1068,8 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
               evidenceRefs: [record.id],
               summary: 'Deterministic receipt: the durable candidate shortlist was empty before adjudication.',
               provenance: 'deterministic_reconstruction',
+              scopeBenchmark: benchmarkName,
+              scopeArm: arm,
             });
           }
         }
@@ -842,6 +1157,8 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
     replicates: RunFacts[] | null,
     expected = input.campaign.config.evaluation.replicates,
     enforceExpected = false,
+    scopeBenchmark = benchmark,
+    scopeArm: DiagnosisLineageArm = 'standard',
   ): void => {
     if (!replicates) {
       completeness.push({
@@ -897,6 +1214,8 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
         evidenceRefs: [record.id],
         summary: `${unstable.length} units changed decision across persisted replicates.`,
         provenance: 'deterministic_reconstruction',
+        scopeBenchmark,
+        scopeArm,
       });
     }
     completeness.push({
@@ -963,6 +1282,8 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
         target.controlReplicateFacts,
         targetExpectedReplicates('control', target.controlFacts, target.controlReplicateFacts),
         true,
+        primary,
+        'control',
       );
     }
     addReplicateEvidence(
@@ -970,6 +1291,8 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
       target.excludedReplicateFacts,
       targetExpectedReplicates('excluded', target.excludedFacts, target.excludedReplicateFacts),
       true,
+      primary,
+      'excluded',
     );
   }
 
@@ -1188,6 +1511,21 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
           result: result ? boundedJson(result.value) : { availability: 'unavailable' },
         }),
       });
+      const transcriptLineage = lineage.find(
+        (item) =>
+          item.caseId === stringField(entry, 'caseId') &&
+          (!item.runId || item.runId === stringField(entry, 'runId')),
+      );
+      if (key) {
+        evidenceFocusScopes.set(
+          record.id,
+          focusScopeKey(
+            transcriptLineage?.benchmark ?? '__unresolved__',
+            transcriptLineage?.arm ?? 'standard',
+            key,
+          ),
+        );
+      }
       if (key && result && isRecord(result.value.metadata)) {
         const resultContent = stringField(result.value, 'content');
         if (resultContent) {
@@ -1206,6 +1544,8 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
                 summary:
                   'The durable tool result retained evidence-rejection records for a unit-correlated source operation.',
                 provenance: 'deterministic_reconstruction',
+                scopeBenchmark: transcriptLineage?.benchmark ?? '__unresolved__',
+                scopeArm: transcriptLineage?.arm ?? 'standard',
               });
             }
           } catch {
@@ -1330,7 +1670,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
               ?.unitByOrdinal.get(Number.parseInt(namedOrdinal, 10)) ?? null
           : null);
       const key = unitId ? unitKeys.get(unitId) ?? unitId : null;
-      addEvidence(`langfuse|${traceId}|${stringField(observationRecord, 'id') ?? observationIndex}`, {
+      const record = addEvidence(`langfuse|${traceId}|${stringField(observationRecord, 'id') ?? observationIndex}`, {
         kind: 'langfuse_observation',
         summary: `Optional Langfuse observation ${String(observationRecord.name ?? observationIndex + 1)}${key ? ` correlated to ${key}` : ''}.`,
         affectedUnitKeys: key ? [key] : [],
@@ -1347,6 +1687,21 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
         },
         data: boundedJson({ traceId, observation }),
       });
+      const observationLineage = lineage.find(
+        (item) =>
+          item.caseId === observationCaseId &&
+          (!item.runId || item.runId === stringField(metadata, 'runId')),
+      );
+      if (key) {
+        evidenceFocusScopes.set(
+          record.id,
+          focusScopeKey(
+            observationLineage?.benchmark ?? '__unresolved__',
+            observationLineage?.arm ?? 'standard',
+            key,
+          ),
+        );
+      }
     }
   }
   completeness.push({
@@ -1386,7 +1741,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
   for (const { benchmark, judgment } of judgments) {
     if (!judgment) continue;
     for (const verdict of judgment.verdicts) {
-      addEvidence(`judge|${benchmark}|${verdict.unitKey}`, {
+      const record = addEvidence(`judge|${benchmark}|${verdict.unitKey}`, {
         kind: 'judge_verdict',
         summary: `Blind judge suggested ${verdict.expectedDecision}/${verdict.classification} for ${verdict.unitKey}; this remains model-generated, not verified truth.`,
         affectedUnitKeys: [verdict.unitKey],
@@ -1403,6 +1758,14 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
         },
         data: boundedJson({ benchmark, ...verdict }),
       });
+      evidenceFocusScopes.set(
+        record.id,
+        focusScopeKey(
+          benchmark === 'target-excluded' ? primaryBenchmarkName : benchmark,
+          benchmark === 'target-excluded' ? 'excluded' : 'standard',
+          verdict.unitKey,
+        ),
+      );
       verdict.evidence.forEach((value) => sourceCandidates.add(value));
     }
   }
@@ -1428,7 +1791,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
   }
 
   for (const label of input.labels) {
-    addEvidence(`label|${label.benchmark}|${label.unitKey}`, {
+    const record = addEvidence(`label|${label.benchmark}|${label.unitKey}`, {
       kind: 'label',
       summary: `${label.status === 'verified' ? 'Human-verified' : 'Model-suggested'} label for ${label.unitKey}.`,
       affectedUnitKeys: [label.unitKey],
@@ -1448,6 +1811,14 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
       },
       data: boundedJson(label),
     });
+    evidenceFocusScopes.set(
+      record.id,
+      focusScopeKey(
+        label.benchmark === 'target-excluded' ? primaryBenchmarkName : label.benchmark,
+        label.benchmark === 'target-excluded' ? 'excluded' : 'standard',
+        label.unitKey,
+      ),
+    );
   }
   completeness.push({
     component: 'labels',
@@ -1721,9 +2092,13 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
   }
 
   const focusedSignals = reconstructionSignals
-    .map((signal) => ({
+    .map(({ scopeBenchmark, scopeArm, ...signal }) => ({
       ...signal,
-      affectedUnitKeys: signal.affectedUnitKeys.filter((key) => focus.keys.has(key)),
+      affectedUnitKeys: signal.affectedUnitKeys.filter((key) =>
+        scopeBenchmark && scopeArm
+          ? focus.scopeKeys.has(focusScopeKey(scopeBenchmark, scopeArm, key))
+          : false,
+      ),
     }))
     .filter((signal) => signal.affectedUnitKeys.length > 0)
     .filter(
@@ -1745,31 +2120,57 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
     judge_verdict: MAX_FOCUS_UNITS,
     label: MAX_FOCUS_UNITS,
   };
-  const retainedEvidence = [...evidence.values()].filter((item) => {
-    const isFocused = item.affectedUnitKeys.some((key) => focus.keys.has(key));
+  const evidenceRankByUnit = new Map<string, number>();
+  const rankedEvidence = [...evidence.values()]
+    .map((item) => {
+      const unitKey = item.affectedUnitKeys.find((key) => focus.keys.has(key)) ?? null;
+      const scopedKey = evidenceFocusScopes.get(item.id) ?? null;
+      const bucket = `${item.kind}:${scopedKey ?? unitKey ?? 'unscoped'}`;
+      const rank = evidenceRankByUnit.get(bucket) ?? 0;
+      evidenceRankByUnit.set(bucket, rank + 1);
+      return { item, unitKey, scopedKey, rank };
+    })
+    .sort((left, right) =>
+      left.item.kind.localeCompare(right.item.kind) ||
+      Number(right.scopedKey !== null || right.unitKey !== null) -
+        Number(left.scopedKey !== null || left.unitKey !== null) ||
+      left.rank - right.rank ||
+      (left.scopedKey ?? left.unitKey ?? '').localeCompare(
+        right.scopedKey ?? right.unitKey ?? '',
+      ) ||
+      left.item.id.localeCompare(right.item.id),
+    )
+    .map(({ item }) => item);
+  const retainedEvidence = rankedEvidence.filter((item) => {
+    const scopedKey = evidenceFocusScopes.get(item.id);
+    const isFocused = scopedKey
+      ? focus.scopeKeys.has(scopedKey)
+      : item.affectedUnitKeys.some((key) => focus.keys.has(key));
     if (item.affectedUnitKeys.length > 0 && !isFocused && !requiredEvidence.has(item.id)) return false;
+    if (requiredEvidence.has(item.id)) return true;
     if (item.kind === 'langfuse_observation' && isFocused) {
       const unitKey = item.affectedUnitKeys.find((key) => focus.keys.has(key))!;
-      const count = retainedLangfuseByUnit.get(unitKey) ?? 0;
-      if (count >= 10 && !requiredEvidence.has(item.id)) return false;
-      retainedLangfuseByUnit.set(unitKey, count + 1);
+      const quotaKey = evidenceFocusScopes.get(item.id) ?? unitKey;
+      const count = retainedLangfuseByUnit.get(quotaKey) ?? 0;
+      if (count >= 10) return false;
+      retainedLangfuseByUnit.set(quotaKey, count + 1);
     }
     if (
       item.affectedUnitKeys.length === 0 &&
       (item.kind === 'tool_transcript_entry' || item.kind === 'langfuse_observation')
     ) {
       const count = retainedByKind.get(item.kind) ?? 0;
-      if (count >= 20 && !requiredEvidence.has(item.id)) return false;
+      if (count >= 20) return false;
     }
     const limit = evidenceLimits[item.kind];
     const count = retainedByKind.get(item.kind) ?? 0;
-    if (limit !== undefined && count >= limit && !requiredEvidence.has(item.id)) return false;
+    if (limit !== undefined && count >= limit) return false;
     retainedByKind.set(item.kind, count + 1);
     return true;
   });
   const focusLimitation =
-    focus.candidateCount > focus.keys.size
-      ? `Diagnosis retained ${focus.keys.size} of ${focus.candidateCount} mismatched or unstable primary units, prioritized by verified labels, system-error judgments, suggestions, and replicate instability.`
+    focus.candidateCount > focus.scopeKeys.size
+      ? `Diagnosis retained stratified detail for ${focus.scopeKeys.size} of ${focus.candidateCount} measured benchmark/arm units across ${focus.stratumCount} available strata, including funnel failures, source-backed controls, decision disagreements, and holdout coverage.`
       : null;
   const materialLimitations = [
     ...completeness.flatMap((item) => item.limitations),
@@ -1785,7 +2186,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
     );
   const diagnosisInput = DiagnosisInputSchema.parse({
     kind: 'ainative-planner-eval/diagnosis-input',
-    schemaVersion: 1,
+    schemaVersion: 2,
     interpretationPolicy: 'Diagnosis is model-generated, unverified, and excluded from numeric scoring.',
     campaign: {
       id: input.campaign.id,
@@ -1826,6 +2227,7 @@ export async function assembleDiagnosisInput(input: AssembleDiagnosisInput): Pro
         `${right.benchmark}:${right.arm}:${right.replicate}`,
       ),
     ),
+    researchContext,
     completeness: {
       status: overallPartial ? 'partial' : 'complete',
       items: completeness.sort((left, right) =>

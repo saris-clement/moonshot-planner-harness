@@ -3,6 +3,7 @@ import { readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { CampaignConfigSchema, type CampaignConfig } from './types.js';
 import { runCommand } from './process.js';
+import { resolveResearchInputPins } from './research.js';
 
 export async function sha256File(filePath: string): Promise<string> {
   const bytes = await readFile(filePath);
@@ -30,6 +31,7 @@ export async function loadCampaignConfig(filePath: string): Promise<{
   config: CampaignConfig;
   seedSha: string;
   workflowsSha: string;
+  researchInputs: Awaited<ReturnType<typeof resolveResearchInputPins>>;
 }> {
   const absolutePath = path.resolve(filePath);
   const input = JSON.parse(await readFile(absolutePath, 'utf8')) as unknown;
@@ -40,6 +42,7 @@ export async function resolveCampaignConfig(input: unknown): Promise<{
   config: CampaignConfig;
   seedSha: string;
   workflowsSha: string;
+  researchInputs: Awaited<ReturnType<typeof resolveResearchInputPins>>;
 }> {
   const config = CampaignConfigSchema.parse(input);
   await Promise.all([
@@ -49,7 +52,7 @@ export async function resolveCampaignConfig(input: unknown): Promise<{
     ...config.benchmarks.map((benchmark) => assertFile(benchmark.zipPath, benchmark.name)),
   ]);
 
-  const [seedSha, workflowsSha, benchmarks] = await Promise.all([
+  const [seedSha, workflowsSha, benchmarks, researchInputs] = await Promise.all([
     resolveGitRevision(config.plannerRepo, config.seedRevision),
     resolveGitRevision(config.workflowsRepo, config.workflowsRevision),
     Promise.all(
@@ -61,12 +64,24 @@ export async function resolveCampaignConfig(input: unknown): Promise<{
         return { ...benchmark, sha256 };
       }),
     ),
+    resolveResearchInputPins(config.researchPaths),
   ]);
+  if (
+    config.researchSha256.length > 0 &&
+    researchInputs.some((material, index) => material.sha256 !== config.researchSha256[index])
+  ) {
+    throw new Error('configured researchSha256 does not match the research input bytes');
+  }
 
   return {
-    config: { ...config, benchmarks },
+    config: {
+      ...config,
+      benchmarks,
+      researchSha256: researchInputs.map(({ sha256 }) => sha256),
+    },
     seedSha,
     workflowsSha,
+    researchInputs,
   };
 }
 
