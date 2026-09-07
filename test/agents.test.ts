@@ -485,6 +485,95 @@ test('hypothesis compliance reviewer binds its unverified verdict to patch and m
   }
 });
 
+test('compliance repair keeps the same hypothesis and receives immutable failed-attempt feedback', async () => {
+  const worktree = await mkdtemp(path.join(os.tmpdir(), 'planner-agent-repair-worktree-'));
+  const artifacts = await mkdtemp(path.join(os.tmpdir(), 'planner-agent-repair-artifacts-'));
+  const mutationContextPath = path.join(artifacts, 'mutation-context.json');
+  const treatmentPatchPath = path.join(artifacts, 'mutation.patch');
+  const failedResultPath = path.join(artifacts, 'failed-result.json');
+  await Promise.all([
+    writeFile(mutationContextPath, '{"selectedFindings":[{"id":"finding-hydration"}]}\n'),
+    writeFile(treatmentPatchPath, 'diff --git a/server/src/policy.ts b/server/src/policy.ts\n'),
+    writeFile(
+      failedResultPath,
+      JSON.stringify({
+        status: 'failed',
+        intervention: { status: 'not_satisfied', rationale: 'Runtime clause is incomplete.' },
+        codeRegression: { status: 'satisfied', rationale: 'Boundary test exists.' },
+        falsificationTest: {
+          status: 'deferred_to_evaluation',
+          rationale: 'Coordinator-owned replay.',
+        },
+      }),
+    ),
+  ]);
+  const calls: Array<{ args: string[]; cwd: string | undefined; attachments: string[] }> = [];
+  const runner = new AgentRunner(
+    campaign,
+    async (command, args, options): Promise<CommandResult> => {
+      const attachments = args.flatMap((value, index) =>
+        value === '--file' ? [args[index + 1]!] : [],
+      );
+      calls.push({ args: [...args], cwd: options?.cwd, attachments });
+      assert.equal(attachments.length, 3);
+      assert.ok(attachments.every((value) => path.dirname(value) === worktree));
+      return {
+        command,
+        args: [...args],
+        exitCode: 0,
+        stdout: '',
+        stderr: '',
+        durationMs: 1,
+      };
+    },
+  );
+  const variant = {
+    id: 'agent-repair-v001',
+    hypothesis: {
+      title: 'Retain evidence',
+      rationale: 'Exercise the diagnosed mechanism.',
+      instructions: 'Retain executable evidence.',
+      expectedImpact: 'Better source-backed decisions.',
+      risk: 'Over-admission.',
+      findingIds: ['finding-hydration'],
+    },
+  } as VariantRecord;
+
+  try {
+    await runner.repairHypothesisCompliance(
+      variant,
+      worktree,
+      artifacts,
+      mutationContextPath,
+      treatmentPatchPath,
+      failedResultPath,
+      2,
+    );
+    const prompt = calls[0]!.args.join(' ');
+    assert.equal(calls[0]!.cwd, worktree);
+    assert.match(prompt, /repair the existing mutation/i);
+    assert.match(prompt, /same hypothesis/i);
+    assert.match(prompt, /failed compliance checks/i);
+    assert.match(prompt, /preserve.*satisfied/i);
+    assert.match(prompt, /do not stage changes/i);
+    assert.match(
+      await readFile(
+        path.join(artifacts, 'hypothesis-compliance', 'attempt-02', 'repair-prompt.txt'),
+        'utf8',
+      ),
+      /Retain evidence/,
+    );
+    assert.ok(
+      (await Promise.all(calls[0]!.attachments.map(async (value) => await stat(value).catch(() => null)))).every(
+        (value) => value === null,
+      ),
+    );
+  } finally {
+    await rm(worktree, { recursive: true, force: true });
+    await rm(artifacts, { recursive: true, force: true });
+  }
+});
+
 test('diagnostician archives strict cited unverified output and mutator receives bounded context', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'planner-agent-diagnosis-'));
   const inputPath = path.join(directory, 'diagnosis-input.json');

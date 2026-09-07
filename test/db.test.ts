@@ -150,6 +150,7 @@ test('database persists campaign lineage, labels, and ordered events', async () 
       /already configured/,
     );
     const persistedVariant = database.getVariant(variant.id);
+    assert.deepEqual(persistedVariant.hypothesisComplianceAttempts, []);
     assert.equal(persistedVariant.elapsedMs, 600_000);
     assert.equal(persistedVariant.patchHash, `sha256:${'0'.repeat(64)}`);
     assert.equal(persistedVariant.phase2ElapsedMs, 240_000);
@@ -225,6 +226,40 @@ test('database persists campaign lineage, labels, and ordered events', async () 
       `sha256:${'4'.repeat(64)}`,
     );
     assert.equal(compliantVariant.hypothesisComplianceResultHash, `sha256:${'3'.repeat(64)}`);
+    const attemptResult = {
+      ...compliance,
+      schemaVersion: 2 as const,
+      codeRegression: {
+        status: 'satisfied' as const,
+        rationale: 'The deterministic boundary has regression coverage.',
+        evidence: ['server/test/policy.test.ts:40'],
+      },
+    };
+    const attempt = {
+      variantId: variant.id,
+      attempt: 1,
+      phase: 'initial' as const,
+      outcome: 'passed' as const,
+      treatmentPatchSha256: compliance.patchSha256,
+      candidatePatchSha256: `sha256:${'4'.repeat(64)}`,
+      mutationContextSha256: compliance.mutationContextSha256,
+      resultSha256: `sha256:${'3'.repeat(64)}`,
+      result: attemptResult,
+      error: null,
+      startedAt: '2026-09-07T10:00:00.000Z',
+      completedAt: '2026-09-07T10:01:00.000Z',
+    };
+    database.appendHypothesisComplianceAttempt(variant.id, attempt);
+    database.appendHypothesisComplianceAttempt(variant.id, attempt);
+    assert.deepEqual(database.getVariant(variant.id).hypothesisComplianceAttempts, [attempt]);
+    assert.throws(
+      () =>
+        database.appendHypothesisComplianceAttempt(variant.id, {
+          ...attempt,
+          completedAt: '2026-09-07T10:02:00.000Z',
+        }),
+      /immutable hypothesis compliance attempt changed/,
+    );
     database.upsertLabel({
       campaignId: config.id,
       benchmark: 'primary-pack',

@@ -8,6 +8,7 @@ import test from 'node:test';
 import { HarnessDatabase } from '../src/db.js';
 import {
   CampaignOrchestrator,
+  complianceBatchExhausted,
   targetExcludedControlHoldoutDirectory,
   targetExcludedComparisonDirectories,
   targetExcludedLiveStackDirectory,
@@ -828,6 +829,39 @@ test('target-excluded protocol planning preserves V1 paths and selects canonical
   );
 });
 
+test('automatic replenishment accepts only fully exhausted semantic compliance batches', () => {
+  const campaign = {
+    config: { limits: { hypothesisComplianceRepairAttempts: 1 } },
+  } as CampaignRecord;
+  const variant = {
+    status: 'failed',
+    facts: null,
+    hypothesisComplianceAttempts: [
+      { outcome: 'semantic_failed' },
+      { outcome: 'no_op' },
+    ],
+  } as VariantRecord;
+  assert.equal(complianceBatchExhausted(campaign, [variant]), true);
+  assert.equal(
+    complianceBatchExhausted(campaign, [
+      {
+        ...variant,
+        hypothesisComplianceAttempts: [
+          { outcome: 'semantic_failed' },
+          { outcome: 'operational_failed' },
+        ],
+      } as VariantRecord,
+    ]),
+    false,
+  );
+  assert.equal(
+    complianceBatchExhausted(campaign, [
+      { ...variant, hypothesisComplianceAttempts: [{ outcome: 'semantic_failed' }] } as VariantRecord,
+    ]),
+    false,
+  );
+});
+
 test('diagnosis failure preserves measured facts, score, artifact completeness, and review state', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'planner-eval-diagnosis-failure-'));
   const data = path.join(root, 'data');
@@ -1312,6 +1346,413 @@ test('hypothesis compliance preflight persists its patch-bound verdict and fails
     const events = fixture.database.listEvents(fixture.campaign.id);
     assert.ok(events.some(({ type, variantId }) => type === 'hypothesis_compliance.passed' && variantId === passing.id));
     assert.ok(events.some(({ type, variantId }) => type === 'hypothesis_compliance.failed' && variantId === failing.id));
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('compliance loop repairs one semantic failure on the same variant and preserves both attempts', async () => {
+  const fixture = await v2LifecycleFixture('hypothesis-compliance-repair-loop');
+  try {
+    const candidate = fixture.database.createVariant({
+      id: 'hypothesis-compliance-repair-loop-v001',
+      campaignId: fixture.campaign.id,
+      parentVariantId: fixture.variant.id,
+      round: 1,
+      ordinal: 1,
+      hypothesis: {
+        title: 'Repairable policy',
+        rationale: 'Exercise one bounded compliance repair.',
+        instructions: 'Implement the complete runtime policy and regression.',
+        expectedImpact: 'Pass after structured repair feedback.',
+        risk: 'The repair may remain incomplete.',
+        findingIds: [],
+        assumptions: ['The failed review identifies a repairable semantic omission.'],
+      },
+    });
+    const artifactDirectory = path.join(
+      fixture.paths.artifacts,
+      fixture.campaign.id,
+      candidate.id,
+    );
+    const contextPath = path.join(artifactDirectory, 'mutation-context.json');
+    const context = '{"selectedFindings":[]}\n';
+    await mkdir(artifactDirectory, { recursive: true });
+    await writeFile(contextPath, context);
+    const contextSha256 = `sha256:${createHash('sha256').update(context).digest('hex')}`;
+    let treatment = 'initial treatment';
+    let reviewCalls = 0;
+    let repairCalls = 0;
+    let passingReviewCall = 2;
+    let expectedCandidateId = candidate.id;
+    const captureMutation: typeof import('../src/stack.js').captureMutationDiff = async (
+      _campaign,
+      _variant,
+      _worktree,
+      directory,
+    ) => {
+      const patchPath = path.join(directory, 'mutation.patch');
+      await writeFile(patchPath, treatment);
+      return {
+        patchPath,
+        patch: treatment,
+        result: { changedFiles: ['server/src/policy.ts'], addedLines: 1, removedLines: 0 },
+      };
+    };
+    const captureDiff: typeof import('../src/stack.js').captureAndGateDiff = async (
+      _campaign,
+      _variant,
+      _worktree,
+      directory,
+    ) => {
+      const patchPath = path.join(directory, 'variant.patch');
+      await writeFile(patchPath, treatment);
+      return {
+        patchPath,
+        result: {
+          changedFiles: ['server/src/policy.ts'],
+          addedLines: 1,
+          removedLines: 0,
+          forbiddenAdditions: [],
+        },
+      };
+    };
+    const assess: import('../src/agents.js').AgentRunner['assessHypothesisCompliance'] = async (
+      variant,
+      patchPath,
+      mutationContextPath,
+      directory,
+    ) => {
+      reviewCalls += 1;
+      const patchSha256 = `sha256:${createHash('sha256')
+        .update(await readFile(patchPath))
+        .digest('hex')}`;
+      const mutationContextSha256 = `sha256:${createHash('sha256')
+        .update(await readFile(mutationContextPath))
+        .digest('hex')}`;
+      const passed = reviewCalls === passingReviewCall;
+      const result = {
+        kind: 'ainative-planner-eval/hypothesis-compliance' as const,
+        schemaVersion: 2 as const,
+        interpretationStatus: 'unverified_model_judgment' as const,
+        variantId: variant.id,
+        patchSha256,
+        mutationContextSha256,
+        status: passed ? ('passed' as const) : ('failed' as const),
+        summary: passed ? 'Repaired mutation is complete.' : 'Runtime clause is incomplete.',
+        intervention: {
+          status: passed ? ('satisfied' as const) : ('not_satisfied' as const),
+          rationale: passed ? 'Complete runtime behavior.' : 'Missing runtime behavior.',
+          evidence: ['server/src/policy.ts:1'],
+        },
+        codeRegression: {
+          status: 'satisfied' as const,
+          rationale: 'Regression exists.',
+          evidence: ['server/test/policy.test.ts:1'],
+        },
+        falsificationTest: {
+          status: 'deferred_to_evaluation' as const,
+          rationale: 'Coordinator-owned replay.',
+          evidence: ['campaign replay'],
+        },
+        limitations: ['Unverified model judgment.'],
+      };
+      const resultPath = hypothesisComplianceResultPath(
+        directory,
+        patchSha256,
+        mutationContextSha256,
+      );
+      await mkdir(path.dirname(resultPath), { recursive: true });
+      await writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`);
+      return { result, resultPath };
+    };
+    const repair: import('../src/agents.js').AgentRunner['repairHypothesisCompliance'] = async (
+      variant,
+      worktree,
+      _artifactDirectory,
+      _mutationContextPath,
+      _treatmentPatchPath,
+      _failedResultPath,
+      attempt,
+    ) => {
+      repairCalls += 1;
+      assert.equal(variant.id, expectedCandidateId);
+      assert.equal(worktree, fixture.root);
+      assert.equal(attempt, 2);
+      treatment = 'repaired treatment';
+    };
+    const internal = new CampaignOrchestrator(
+      fixture.paths,
+      fixture.database,
+    ) as unknown as {
+      runMutationComplianceAttempts: (
+        campaign: CampaignRecord,
+        variant: VariantRecord,
+        worktree: string,
+        artifactDirectory: string,
+        mutationContextPath: string,
+        mutationContextSha256: string,
+        mutationBaselineTree: string,
+        dependencies: {
+          assess: typeof assess;
+          repair: typeof repair;
+          captureMutation: typeof captureMutation;
+          captureDiff: typeof captureDiff;
+        },
+      ) => Promise<VariantRecord>;
+    };
+
+    const result = await internal.runMutationComplianceAttempts(
+      fixture.campaign,
+      candidate,
+      fixture.root,
+      artifactDirectory,
+      contextPath,
+      contextSha256,
+      'baseline-tree',
+      { assess, repair, captureMutation, captureDiff },
+    );
+    assert.equal(result.id, candidate.id);
+    assert.equal(result.hypothesisComplianceStatus, 'passed');
+    assert.equal(reviewCalls, 2);
+    assert.equal(repairCalls, 1);
+    assert.deepEqual(
+      result.hypothesisComplianceAttempts.map(({ attempt, phase, outcome }) => ({
+        attempt,
+        phase,
+        outcome,
+      })),
+      [
+        { attempt: 1, phase: 'initial', outcome: 'semantic_failed' },
+        { attempt: 2, phase: 'repair', outcome: 'passed' },
+      ],
+    );
+    assert.equal(
+      await readFile(
+        path.join(artifactDirectory, 'hypothesis-compliance/attempt-01/mutation.patch'),
+        'utf8',
+      ),
+      'initial treatment',
+    );
+    assert.equal(
+      await readFile(
+        path.join(artifactDirectory, 'hypothesis-compliance/attempt-02/mutation.patch'),
+        'utf8',
+      ),
+      'repaired treatment',
+    );
+
+    const exhausted = fixture.database.createVariant({
+      id: 'hypothesis-compliance-repair-loop-v002',
+      campaignId: fixture.campaign.id,
+      parentVariantId: fixture.variant.id,
+      round: 1,
+      ordinal: 2,
+      hypothesis: candidate.hypothesis,
+    });
+    const exhaustedDirectory = path.join(
+      fixture.paths.artifacts,
+      fixture.campaign.id,
+      exhausted.id,
+    );
+    const exhaustedContextPath = path.join(exhaustedDirectory, 'mutation-context.json');
+    await mkdir(exhaustedDirectory, { recursive: true });
+    await writeFile(exhaustedContextPath, context);
+    treatment = 'exhausted initial treatment';
+    reviewCalls = 0;
+    repairCalls = 0;
+    passingReviewCall = Number.POSITIVE_INFINITY;
+    expectedCandidateId = exhausted.id;
+    await assert.rejects(
+      internal.runMutationComplianceAttempts(
+        fixture.campaign,
+        exhausted,
+        fixture.root,
+        exhaustedDirectory,
+        exhaustedContextPath,
+        contextSha256,
+        'baseline-tree',
+        { assess, repair, captureMutation, captureDiff },
+      ),
+      /failed after repair exhaustion/,
+    );
+    const exhaustedResult = fixture.database.getVariant(exhausted.id);
+    assert.equal(repairCalls, 1);
+    assert.deepEqual(
+      exhaustedResult.hypothesisComplianceAttempts.map(({ outcome }) => outcome),
+      ['semantic_failed', 'semantic_failed'],
+    );
+    assert.equal(exhaustedResult.hypothesisComplianceStatus, 'failed');
+
+    const tampered = fixture.database.createVariant({
+      id: 'hypothesis-compliance-repair-loop-v003',
+      campaignId: fixture.campaign.id,
+      parentVariantId: fixture.variant.id,
+      round: 1,
+      ordinal: 3,
+      hypothesis: candidate.hypothesis,
+    });
+    const tamperedDirectory = path.join(
+      fixture.paths.artifacts,
+      fixture.campaign.id,
+      tampered.id,
+    );
+    const tamperedContextPath = path.join(tamperedDirectory, 'mutation-context.json');
+    await mkdir(tamperedDirectory, { recursive: true });
+    await writeFile(tamperedContextPath, '{"selectedFindings":[{"id":"tampered"}]}\n');
+    treatment = '';
+    repairCalls = 0;
+    expectedCandidateId = tampered.id;
+    await assert.rejects(
+      internal.runMutationComplianceAttempts(
+        fixture.campaign,
+        tampered,
+        fixture.root,
+        tamperedDirectory,
+        tamperedContextPath,
+        contextSha256,
+        'baseline-tree',
+        { assess, repair, captureMutation, captureDiff },
+      ),
+      /mutator modified the immutable mutation context/,
+    );
+    const tamperedResult = fixture.database.getVariant(tampered.id);
+    assert.equal(repairCalls, 0);
+    assert.deepEqual(
+      tamperedResult.hypothesisComplianceAttempts.map(({ outcome }) => outcome),
+      ['operational_failed'],
+    );
+
+    const repairFailed = fixture.database.createVariant({
+      id: 'hypothesis-compliance-repair-loop-v004',
+      campaignId: fixture.campaign.id,
+      parentVariantId: fixture.variant.id,
+      round: 1,
+      ordinal: 4,
+      hypothesis: candidate.hypothesis,
+    });
+    const repairFailedDirectory = path.join(
+      fixture.paths.artifacts,
+      fixture.campaign.id,
+      repairFailed.id,
+    );
+    const repairFailedContextPath = path.join(repairFailedDirectory, 'mutation-context.json');
+    await mkdir(repairFailedDirectory, { recursive: true });
+    await writeFile(repairFailedContextPath, context);
+    treatment = 'repair failure treatment';
+    reviewCalls = 0;
+    passingReviewCall = Number.POSITIVE_INFINITY;
+    await assert.rejects(
+      internal.runMutationComplianceAttempts(
+        fixture.campaign,
+        repairFailed,
+        fixture.root,
+        repairFailedDirectory,
+        repairFailedContextPath,
+        contextSha256,
+        'baseline-tree',
+        {
+          assess,
+          repair: async () => {
+            throw new Error('repair command failed');
+          },
+          captureMutation,
+          captureDiff,
+        },
+      ),
+      /repair command failed/,
+    );
+    const repairFailure = fixture.database.getVariant(repairFailed.id);
+    assert.deepEqual(
+      repairFailure.hypothesisComplianceAttempts.map(({ outcome }) => outcome),
+      ['semantic_failed', 'operational_failed'],
+    );
+    assert.equal(repairFailure.hypothesisComplianceStatus, 'failed');
+    assert.equal(repairFailure.hypothesisCompliance, null);
+    assert.equal(repairFailure.hypothesisCompliancePatchHash, null);
+    assert.equal(repairFailure.hypothesisComplianceResultHash, null);
+    assert.ok(repairFailure.hypothesisComplianceAttempts[1]?.treatmentPatchSha256);
+    assert.equal(
+      await stat(
+        path.join(
+          repairFailedDirectory,
+          'hypothesis-compliance/attempt-02/mutation.patch',
+        ),
+      ).then((value) => value.isFile()),
+      true,
+    );
+
+    const staticFailed = fixture.database.createVariant({
+      id: 'hypothesis-compliance-repair-loop-v005',
+      campaignId: fixture.campaign.id,
+      parentVariantId: fixture.variant.id,
+      round: 1,
+      ordinal: 5,
+      hypothesis: candidate.hypothesis,
+    });
+    const staticFailedDirectory = path.join(
+      fixture.paths.artifacts,
+      fixture.campaign.id,
+      staticFailed.id,
+    );
+    const staticFailedContextPath = path.join(staticFailedDirectory, 'mutation-context.json');
+    await mkdir(staticFailedDirectory, { recursive: true });
+    await writeFile(staticFailedContextPath, context);
+    treatment = 'statically rejected treatment';
+    await assert.rejects(
+      internal.runMutationComplianceAttempts(
+        fixture.campaign,
+        staticFailed,
+        fixture.root,
+        staticFailedDirectory,
+        staticFailedContextPath,
+        contextSha256,
+        'baseline-tree',
+        {
+          assess,
+          repair,
+          captureMutation,
+          captureDiff: async (_campaign, _variant, _worktree, directory) => {
+            await writeFile(path.join(directory, 'variant.patch'), treatment);
+            throw new Error('static diff gate rejected candidate');
+          },
+        },
+      ),
+      /static diff gate rejected candidate/,
+    );
+    const staticFailure = fixture.database.getVariant(staticFailed.id);
+    assert.ok(staticFailure.hypothesisComplianceAttempts[0]?.treatmentPatchSha256);
+    assert.ok(staticFailure.hypothesisComplianceAttempts[0]?.candidatePatchSha256);
+    assert.equal(staticFailure.patchHash, staticFailure.hypothesisComplianceAttempts[0]?.candidatePatchSha256);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('campaign resume fails closed when a generated variant was interrupted', async () => {
+  const fixture = await v2LifecycleFixture('interrupted-generated-repair');
+  try {
+    fixture.database.createVariant({
+      id: 'interrupted-generated-repair-v001',
+      campaignId: fixture.campaign.id,
+      parentVariantId: fixture.variant.id,
+      round: 1,
+      ordinal: 1,
+      hypothesis: baselineHypothesisForTest,
+    });
+    fixture.database.updateVariant('interrupted-generated-repair-v001', {
+      status: 'mutating',
+    });
+    fixture.database.updateCampaign(fixture.campaign.id, {
+      status: 'stopped_round_failed',
+      currentParentVariantId: fixture.variant.id,
+    });
+    assert.throws(
+      () => new CampaignOrchestrator(fixture.paths, fixture.database).resume(fixture.campaign.id),
+      /cannot resume with interrupted generated variants/,
+    );
   } finally {
     fixture.database.close();
     await rm(fixture.root, { recursive: true, force: true });

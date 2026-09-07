@@ -7,6 +7,7 @@ import {
   HypothesisSchema,
   HypothesisComplianceOutputSchema,
   HypothesisComplianceOutputV2Schema,
+  HypothesisComplianceAttemptSchema,
   TargetExcludedConfigSchema,
   type BenchmarkQuestionResolution,
   type QuestionResolutionEntry,
@@ -48,6 +49,21 @@ test('campaign defaults reserve twelve hours of aggregate Phase 2 model duration
   });
 
   assert.equal(config.limits.phase2TimeoutMs, 43_200_000);
+  assert.equal(config.limits.hypothesisComplianceRepairAttempts, 1);
+  assert.equal(
+    CampaignConfigSchema.parse({
+      ...config,
+      limits: { ...config.limits, hypothesisComplianceRepairAttempts: 0 },
+    }).limits.hypothesisComplianceRepairAttempts,
+    0,
+  );
+  assert.equal(
+    CampaignConfigSchema.safeParse({
+      ...config,
+      limits: { ...config.limits, hypothesisComplianceRepairAttempts: 2 },
+    }).success,
+    false,
+  );
 });
 
 test('campaign target-excluded v2 declaration requires exactly two evaluation replicates', () => {
@@ -362,5 +378,32 @@ test('hypothesis compliance passes only when intervention and falsification chec
   assert.equal(
     HypothesisComplianceOutputSchema.parse({ ...legacy, schemaVersion: 1 }).schemaVersion,
     1,
+  );
+  const failedResult = HypothesisComplianceOutputV2Schema.parse({
+    ...output,
+    status: 'failed',
+    intervention: { ...output.intervention, status: 'not_satisfied' },
+  });
+  const attempt = HypothesisComplianceAttemptSchema.parse({
+    variantId: 'campaign-v001',
+    attempt: 1,
+    phase: 'initial',
+    outcome: 'semantic_failed',
+    treatmentPatchSha256: output.patchSha256,
+    candidatePatchSha256: `sha256:${'c'.repeat(64)}`,
+    mutationContextSha256: output.mutationContextSha256,
+    resultSha256: `sha256:${'d'.repeat(64)}`,
+    result: failedResult,
+    error: null,
+    startedAt: '2026-09-07T10:00:00.000Z',
+    completedAt: '2026-09-07T10:01:00.000Z',
+  });
+  assert.equal(attempt.outcome, 'semantic_failed');
+  assert.equal(
+    HypothesisComplianceAttemptSchema.safeParse({
+      ...attempt,
+      phase: 'repair',
+    }).success,
+    false,
   );
 });

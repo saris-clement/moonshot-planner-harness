@@ -34,6 +34,7 @@
   "limits": {
     "concurrency": 3,
     "maxVariants": 9,
+    "hypothesisComplianceRepairAttempts": 1,
     "noImprovementRounds": 2,
     "phase2TimeoutMs": 43200000,
     "stackReadyTimeoutMs": 300000,

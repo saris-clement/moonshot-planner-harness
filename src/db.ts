@@ -7,6 +7,7 @@ import type {
   DiagnosisStatus,
   Hypothesis,
   HypothesisComplianceOutput,
+  HypothesisComplianceAttempt,
   HypothesisComplianceStatus,
   HypothesisInput,
   JudgeOutput,
@@ -28,6 +29,7 @@ import {
   CampaignConfigSchema,
   DiagnosisOutputSchema,
   HypothesisComplianceOutputSchema,
+  HypothesisComplianceAttemptSchema,
   HypothesisSchema,
   TargetExcludedConfigSchema,
   TargetNormalArmBindingSchema,
@@ -121,6 +123,7 @@ function variantFromRow(row: Row): VariantRecord {
       row.hypothesis_compliance_error === null
         ? null
         : String(row.hypothesis_compliance_error),
+    hypothesisComplianceAttempts: [],
     artifactCollectionComplete: Boolean(row.artifact_collection_complete),
     facts: row.facts_json === null ? null : parseJson<RunFacts>(row.facts_json),
     replicateFacts:
@@ -379,6 +382,13 @@ export class HarnessDatabase {
         updated_at TEXT NOT NULL,
         PRIMARY KEY(campaign_id, unit_key)
       );
+      CREATE TABLE IF NOT EXISTS hypothesis_compliance_attempts (
+        variant_id TEXT NOT NULL REFERENCES variants(id),
+        attempt INTEGER NOT NULL,
+        attempt_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(variant_id, attempt)
+      );
       CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         campaign_id TEXT NOT NULL REFERENCES campaigns(id),
@@ -577,7 +587,7 @@ export class HarnessDatabase {
   getVariant(id: string): VariantRecord {
     const row = this.database.prepare('SELECT * FROM variants WHERE id = ?').get(id) as Row | undefined;
     if (!row) throw new Error(`variant not found: ${id}`);
-    return variantFromRow(row);
+    return { ...variantFromRow(row), hypothesisComplianceAttempts: this.listHypothesisComplianceAttempts(id) };
   }
 
   listVariants(campaignId: string): VariantRecord[] {
@@ -585,7 +595,62 @@ export class HarnessDatabase {
       this.database
         .prepare('SELECT * FROM variants WHERE campaign_id = ? ORDER BY ordinal ASC')
         .all(campaignId) as Row[]
-    ).map(variantFromRow);
+    ).map((row) => {
+      const variant = variantFromRow(row);
+      return {
+        ...variant,
+        hypothesisComplianceAttempts: this.listHypothesisComplianceAttempts(variant.id),
+      };
+    });
+  }
+
+  private listHypothesisComplianceAttempts(variantId: string): HypothesisComplianceAttempt[] {
+    const rows = this.database
+      .prepare(
+        'SELECT attempt_json FROM hypothesis_compliance_attempts WHERE variant_id = ? ORDER BY attempt ASC',
+      )
+      .all(variantId) as Row[];
+    return rows.map((row) =>
+      HypothesisComplianceAttemptSchema.parse(parseJson<unknown>(row.attempt_json)),
+    );
+  }
+
+  appendHypothesisComplianceAttempt(
+    variantId: string,
+    input: HypothesisComplianceAttempt,
+  ): HypothesisComplianceAttempt {
+    const variant = this.getVariant(variantId);
+    const attempt = HypothesisComplianceAttemptSchema.parse(input);
+    if (attempt.variantId !== variantId) {
+      throw new Error('hypothesis compliance attempt belongs to another variant');
+    }
+    const existing = this.database
+      .prepare(
+        'SELECT attempt_json FROM hypothesis_compliance_attempts WHERE variant_id = ? AND attempt = ?',
+      )
+      .get(variantId, attempt.attempt) as Row | undefined;
+    if (existing) {
+      const persisted = HypothesisComplianceAttemptSchema.parse(
+        parseJson<unknown>(existing.attempt_json),
+      );
+      if (JSON.stringify(persisted) !== JSON.stringify(attempt)) {
+        throw new Error('immutable hypothesis compliance attempt changed');
+      }
+      return persisted;
+    }
+    this.database
+      .prepare(
+        `INSERT INTO hypothesis_compliance_attempts
+          (variant_id, attempt, attempt_json, created_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(variantId, attempt.attempt, JSON.stringify(attempt), now());
+    this.addEvent(variant.campaignId, variantId, 'hypothesis_compliance.attempted', {
+      attempt: attempt.attempt,
+      outcome: attempt.outcome,
+      resultSha256: attempt.resultSha256,
+    });
+    return attempt;
   }
 
   updateVariant(

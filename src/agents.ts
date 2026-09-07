@@ -20,6 +20,7 @@ import { runCommand } from './process.js';
 import { sha256File } from './config.js';
 import { diagnosisResultPath, validateDiagnosisFindingReferences } from './diagnosis.js';
 import {
+  hypothesisComplianceAttemptDirectory,
   hypothesisComplianceResultPath,
   mutationContextRequiresFalsification,
   verifyHypothesisComplianceResult,
@@ -372,6 +373,61 @@ Return JSON only:
     }
     await writeImmutableText(resultPath, `${JSON.stringify(result, null, 2)}\n`);
     return { result, resultPath };
+  }
+
+  async repairHypothesisCompliance(
+    variant: VariantRecord,
+    worktree: string,
+    artifactDirectory: string,
+    mutationContextPath: string,
+    treatmentPatchPath: string,
+    failedResultPath: string,
+    attempt: number,
+  ): Promise<void> {
+    const prompt = `Repair the existing mutation for the same hypothesis in this disposable worktree.
+
+Hypothesis:
+${JSON.stringify(variant.hypothesis, null, 2)}
+
+Read the attached original mutation context, prior treatment patch, and failed compliance result.
+
+Rules:
+- Address all failed compliance checks and their cited evidence. Do not replace, broaden, or silently narrow the hypothesis.
+- Preserve checks already marked satisfied and preserve cited counterevidence.
+- Implement every material intervention clause with a generic mechanism.
+- Add or correct executable regression coverage for locally testable mechanics. Leave campaign-level empirical falsification to the coordinator.
+- Do not add customer, workflow, requirement-text, source-path, alias, capability-ID, or fixed-distribution heuristics.
+- Change files only under these configured path prefixes: ${JSON.stringify(this.campaign.config.gates.allowedPathPrefixes)}.
+- Do not edit the harness, campaign data, experiment reports, or attached feedback.
+- Do not stage changes or alter the Git index. Do not commit, alter Git configuration, push, or start Docker.
+- Do not run host tests; the coordinator runs trusted tests in a networkless builder container.
+- Leave the repaired mutation unstaged in this same worktree.`;
+    const directory = hypothesisComplianceAttemptDirectory(artifactDirectory, attempt);
+    await writeImmutableText(path.join(directory, 'repair-prompt.txt'), `${prompt}\n`);
+    await withLocalAgentAttachments(
+      worktree,
+      [
+        { source: mutationContextPath, name: `.harness-repair-context-${variant.id}.json` },
+        { source: treatmentPatchPath, name: `.harness-prior-treatment-${variant.id}.patch` },
+        { source: failedResultPath, name: `.harness-compliance-feedback-${variant.id}.json` },
+      ],
+      async (attachments) =>
+        await this.commandRunner(
+          this.campaign.config.agent.command,
+          this.argumentsFor(
+            prompt,
+            `${variant.id} compliance repair ${attempt}`,
+            attachments,
+            worktree,
+            true,
+          ),
+          {
+            cwd: worktree,
+            timeoutMs: 1_800_000,
+            logPath: path.join(directory, 'repair.jsonl'),
+          },
+        ),
+    );
   }
 
   async diagnose(
