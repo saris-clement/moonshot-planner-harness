@@ -392,6 +392,23 @@ export function targetSafeQuestionResolution(
   };
 }
 
+export function targetSafeJudgeOutput(
+  judgment: JudgeOutput,
+  targetWorkflow: string,
+): JudgeOutput {
+  return {
+    ...judgment,
+    verdicts: judgment.verdicts.map((verdict) => ({
+      ...verdict,
+      evidence: verdict.evidence.map((item) =>
+        containsTargetIdentityLeak(item, targetWorkflow)
+          ? 'Target implementation is absent from the target-excluded source snapshot.'
+          : item,
+      ),
+    })),
+  };
+}
+
 export class CampaignOrchestrator {
   private readonly activeCampaigns = new Set<string>();
   private readonly reportQueues = new Map<string, Promise<void>>();
@@ -3613,12 +3630,15 @@ export class CampaignOrchestrator {
       campaign,
       config.targetImplementationWorkflow,
     );
-    const judgment = await new AgentRunner(campaign).judge(
-      variant,
-      workflowsSource,
-      path.join(artifactDirectory, 'facts.json'),
-      artifactDirectory,
-      true,
+    const judgment = targetSafeJudgeOutput(
+      await new AgentRunner(campaign).judge(
+        variant,
+        workflowsSource,
+        path.join(artifactDirectory, 'facts.json'),
+        artifactDirectory,
+        true,
+      ),
+      config.targetImplementationWorkflow,
     );
     await this.ensureTargetExcludedWorkflowsSource(
       campaign,

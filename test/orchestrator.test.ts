@@ -12,6 +12,7 @@ import {
   targetExcludedComparisonDirectories,
   targetExcludedLiveStackDirectory,
   targetExcludedProtocolPlan,
+  targetSafeJudgeOutput,
   withRuntimeQuestions,
 } from '../src/orchestrator.js';
 import type { HarnessPaths } from '../src/paths.js';
@@ -1397,6 +1398,33 @@ test('target-bound runtime questions use full-source PM simulation without expos
     fixture.database.close();
     await rm(fixture.root, { recursive: true, force: true });
   }
+});
+
+test('target-blind judgment persists generic evidence instead of an excluded source path', () => {
+  const judgment = targetSafeJudgeOutput(
+    {
+      summary: 'The target implementation is absent.',
+      verdicts: [
+        {
+          unitKey: 'unit-a',
+          expectedDecision: 'build',
+          classification: 'real_gap',
+          confidence: 'high',
+          rationale: 'No eligible source was present.',
+          evidence: [
+            'No src/customers/trumark/deceased-accounts implementation exists in the frozen checkout',
+            'Shared search returned no eligible declaration.',
+          ],
+        },
+      ],
+    },
+    'trumark/deceased-accounts',
+  );
+
+  assert.deepEqual(judgment.verdicts[0]?.evidence, [
+    'Target implementation is absent from the target-excluded source snapshot.',
+    'Shared search returned no eligible declaration.',
+  ]);
 });
 
 const baselineHypothesisForTest = {
