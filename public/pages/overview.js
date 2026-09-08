@@ -18,7 +18,7 @@ export function overviewPage(context) {
   const investigations = variants.filter((variant) => variant.investigation);
   const investigator = element('section', { className: 'section investigator-overview' }, [
     sectionHeading('Agent research', 'Autonomous investigator', 'Session budgets cover investigator work, not planner usage. Test passes are not correctness judgments.'),
-    ...investigations.map((variant) => element('article', { className: 'investigator-row' }, [
+    ...investigations.map((variant) => element('article', { className: 'investigator-row', attributes: { 'data-live-key': `${variant.id}:investigator` } }, [
       routeLink(variant.hypothesis.title, `/campaigns/${encodeURIComponent(campaign.id)}/experiments/${encodeURIComponent(variant.id)}?tab=investigation`, 'active-variant-title'),
       investigationStatus(campaign, variant),
     ])),

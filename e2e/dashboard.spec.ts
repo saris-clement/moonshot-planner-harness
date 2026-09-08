@@ -1529,6 +1529,281 @@ test('shows fractional mean correct counts without rounding or clipping in ledge
   }
 });
 
+test('live polling preserves run controls, disclosures and scroll while measurements advance', async ({ page }) => {
+  const original = database.getVariant(liveId);
+  try {
+    for (const route of [`/campaigns/${campaignId}/overview`, `/campaigns/${campaignId}/experiments/${liveId}?tab=runs`]) {
+      await page.goto(`${baseUrl}${route}`);
+      const description = page.locator('.description-details');
+      await description.locator('summary').click();
+      const table = page.locator(`[data-live-key="${liveId}:replicates"]`);
+      await table.evaluate((node) => { node.scrollLeft = 120; });
+      const tableNode = await table.elementHandle();
+      const descriptionNode = await description.elementHandle();
+      const select = page.getByRole('combobox', { name: 'Campaign', exact: true });
+      const selectNode = await select.elementHandle();
+      await select.focus();
+      await page.evaluate('window.scrollTo(0, 100)');
+      const scroll = await page.evaluate<number>('window.scrollY');
+      const marker = route.endsWith('overview') ? 171 : 172;
+      database.updateVariant(liveId, { executionState: { ...original.executionState!, executions: original.executionState!.executions.map((entry) => ({
+        ...entry, usage: { ...primaryUsage(), calls: marker },
+      })) } });
+      // No event: exercise the fallback poll, not only SSE.
+      await expect(table).toContainText(String(marker), { timeout: 8_000 });
+      expect(await tableNode!.evaluate((node) => node.isConnected)).toBe(true);
+      expect(await descriptionNode!.evaluate((node) => node.isConnected)).toBe(true);
+      expect(await selectNode!.evaluate((node) => node.isConnected)).toBe(true);
+      await expect(description).toHaveAttribute('open', '');
+      await expect(select).toBeFocused();
+      expect(await table.evaluate((node) => node.scrollLeft)).toBe(120);
+      expect(await page.evaluate<number>('window.scrollY')).toBe(scroll);
+    }
+  } finally {
+    database.updateVariant(liveId, { executionState: original.executionState });
+  }
+});
+
+test('live events preserve ledger controls and allow a pending click to complete', async ({ page }) => {
+  const original = database.getVariant(liveId);
+  try {
+    await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments`);
+    const select = page.locator('#filter-status');
+    await select.focus();
+    const selectNode = await select.elementHandle();
+    const link = page.getByTestId(`experiment-row-${liveId}`).locator('.ledger-title');
+    const linkNode = await link.elementHandle();
+    const bounds = (await link.boundingBox())!;
+    await page.mouse.move(bounds.x + 5, bounds.y + 5);
+    await page.mouse.down();
+    database.updateVariant(liveId, { status: 'judging' });
+    database.addEvent(campaignId, liveId, 'variant.updated', {});
+    await expect(page.getByTestId(`experiment-row-${liveId}`).locator('.status')).toHaveText('judging');
+    expect(await selectNode!.evaluate((node) => node.isConnected)).toBe(true);
+    expect(await linkNode!.evaluate((node) => node.isConnected)).toBe(true);
+    await page.mouse.up();
+    await expect(page).toHaveURL(`${baseUrl}/campaigns/${campaignId}/experiments/${liveId}`);
+  } finally {
+    database.updateVariant(liveId, { status: original.status });
+  }
+});
+
+test('live events preserve clean review controls and expanded JSON without freezing other content', async ({ page }) => {
+  const original = database.getVariant(baselineId);
+  try {
+    await page.goto(`${baseUrl}/campaigns/${campaignId}/review/${baselineId}?benchmark=primary-pack&filter=all&unit=unit-a`);
+    const rootToggle = page.getByRole('button', { name: 'Copy unit anchor' });
+    const node = await rootToggle.elementHandle();
+    const json = page.locator('.json-viewer-node').first();
+    await json.locator('summary').first().click();
+    const select = page.getByLabel('Expected disposition');
+    await select.focus();
+    const selectNode = await select.elementHandle();
+    database.updateVariant(baselineId, { hypothesis: { ...original.hypothesis, title: 'Updated review heading' } });
+    database.addEvent(campaignId, baselineId, 'variant.updated', {});
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('Updated review heading');
+    expect(await node!.evaluate((node) => node.isConnected)).toBe(true);
+    expect(await selectNode!.evaluate((node) => node.isConnected)).toBe(true);
+    await expect(select).toBeFocused();
+    await expect(json).not.toHaveAttribute('open');
+  } finally {
+    database.updateVariant(baselineId, { hypothesis: original.hypothesis });
+  }
+});
+
+test('live target questions keep native options open when an earlier question disappears and retain failed answers', async ({ page, headless }) => {
+  const original = database.getVariant(liveId);
+  const target = database.getTargetExcludedEvaluation(liveId)!;
+  try {
+    database.updateTargetExcludedEvaluation(liveId, { executionState: {
+      executions: target.executionState!.executions.map((entry) => ({ ...entry, questions: entry.questions.map((question) => ({
+        ...question, responseKind: 'single_select' as const, options: [{ id: 'a', label: 'Policy A' }, { id: 'b', label: 'Policy B' }],
+      })) })),
+    } });
+    await page.route(`**/variants/${liveId}/target-excluded/questions/*/answer`, (route) => route.fulfill({ status: 503, json: { error: 'Temporary answer failure' } }));
+    await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${liveId}?tab=target-excluded`);
+    const form = page.locator('.counterfactual-question[data-question-benchmark="primary-pack:excluded"]');
+    const answer = form.getByLabel('Answer and rationale');
+    await answer.fill('Keep my answer through updates.');
+    const select = form.getByLabel('Select an answer');
+    await select.selectOption('b');
+    const node = await select.elementHandle();
+    await select.click();
+    // macOS headless Chrome dismisses native menus itself; also run this test with --headed.
+    if (!headless) await expect.poll(() => select.evaluate((node) => node.matches(':open'))).toBe(true);
+    database.updateVariant(liveId, {
+      executionState: { executions: original.executionState!.executions.map((entry) => ({ ...entry, questions: [] })) },
+    });
+    database.addEvent(campaignId, liveId, 'variant.updated', {});
+    await expect.poll(() => page.evaluate(`import('/state.js').then(({ state }) => state.campaign.variants.find(v => v.id === '${liveId}').executionState.executions.flatMap(e => e.questions).length)`)).toBe(0);
+    if (!headless) {
+      await expect(page.locator('.counterfactual-question')).toHaveCount(2);
+      expect(await node!.evaluate((node) => node.matches(':open'))).toBe(true);
+    }
+    expect(await node!.evaluate((node) => node.isConnected)).toBe(true);
+    await expect(select).toBeFocused();
+    await select.blur();
+    await expect(page.locator('.counterfactual-question')).toHaveCount(1);
+    await expect(select).toHaveValue('b');
+    await form.getByRole('button', { name: 'Resume analysis' }).click();
+    await expect(page.locator('#notice')).toContainText('Temporary answer failure');
+    await expect(form.getByRole('button', { name: 'Resume analysis' })).toBeEnabled();
+    await expect(answer).toHaveValue('Keep my answer through updates.');
+    await expect(select).toHaveValue('b');
+  } finally {
+    database.updateVariant(liveId, { executionState: original.executionState, hypothesis: original.hypothesis });
+    database.updateTargetExcludedEvaluation(liveId, { executionState: target.executionState });
+  }
+});
+
+test('live review applies pristine labels but preserves drafts and cancels rejected filter changes', async ({ page }) => {
+  const response = await page.request.get(`${baseUrl}/api/campaigns/${campaignId}`);
+  const details = await response.json();
+  await page.route(`${baseUrl}/api/campaigns/${campaignId}`, (route) => route.fulfill({ json: details }));
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/review/${baselineId}?benchmark=primary-pack&filter=all&unit=unit-a`);
+  const answer = page.getByLabel('Human rationale');
+  await expect(answer).toBeVisible();
+  const label = details.labels.find((label: { benchmark: string; unitKey: string }) => label.benchmark === 'primary-pack' && label.unitKey === 'unit-a');
+  Object.assign(label, { status: 'verified', expectedDecision: 'reuse', rationale: 'New human label from another tab.' });
+  database.addEvent(campaignId, baselineId, 'label.updated', {});
+  await expect(answer).toHaveValue('New human label from another tab.');
+  await expect(page.getByLabel('Expected disposition')).toHaveValue('reuse');
+  await answer.fill('My unsaved local reasoning.');
+  await page.evaluate('document.querySelector("#review-rationale").setSelectionRange(3, 9)');
+  Object.assign(label, { expectedDecision: 'extend', rationale: 'A newer external label.' });
+  const title = details.variants.find((variant: { id: string }) => variant.id === baselineId).hypothesis;
+  title.title = 'Updated while draft stays open';
+  database.addEvent(campaignId, baselineId, 'label.updated', {});
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText(title.title);
+  await expect(answer).toHaveValue('My unsaved local reasoning.');
+  expect(await page.evaluate('[document.querySelector("#review-rationale").selectionStart, document.querySelector("#review-rationale").selectionEnd]')).toEqual([3, 9]);
+  page.on('dialog', (dialog) => dialog.dismiss());
+  await page.getByLabel('Select benchmark').selectOption('holdout-pack');
+  await expect(page.getByLabel('Select benchmark')).toHaveValue('primary-pack');
+  await page.getByLabel('Filter requirement units').selectOption('errors');
+  await expect(page.getByLabel('Filter requirement units')).toHaveValue('all');
+  await expect(page).toHaveURL(/benchmark=primary-pack&filter=all&unit=unit-a$/);
+  await expect(answer).toHaveValue('My unsaved local reasoning.');
+  await page.getByRole('button', { name: 'Help', exact: true }).click();
+  await expect(page.getByRole('dialog', { name: 'Planner harness help' })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(answer).toHaveValue('My unsaved local reasoning.');
+});
+
+test('live mobile refresh keeps the drawer and filter disclosure open', async ({ page }) => {
+  const original = database.getVariant(liveId);
+  try {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments`);
+    await page.locator('.mobile-filters summary').click();
+    await page.getByRole('button', { name: 'Open navigation' }).click();
+    const menu = page.getByRole('button', { name: 'Open navigation' });
+    const node = await menu.elementHandle();
+    database.updateVariant(liveId, { status: 'judging' });
+    database.addEvent(campaignId, liveId, 'variant.updated', {});
+    await expect(page.getByTestId(`experiment-row-${liveId}`).locator('.status')).toHaveText('judging');
+    await expect(menu).toHaveAttribute('aria-expanded', 'true');
+    expect(await node!.evaluate((node) => node.isConnected)).toBe(true);
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.mobile-filters')).toHaveAttribute('open', '');
+    await expect(menu).toBeFocused();
+  } finally {
+    database.updateVariant(liveId, { status: original.status });
+  }
+});
+
+test('live navigation ignores an older campaign response and reconnects to the returned campaign', async ({ page }) => {
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/overview`);
+  await expect(page.getByRole('heading', { name: 'ui e2e' })).toBeVisible();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route(`${baseUrl}/api/campaigns/${investigatorCampaignId}`, async (route) => {
+    await held;
+    await route.continue();
+  });
+  const requested = page.waitForRequest(`${baseUrl}/api/campaigns/${investigatorCampaignId}`);
+  await page.getByRole('combobox', { name: 'Campaign', exact: true }).selectOption(investigatorCampaignId);
+  await requested;
+  await page.getByRole('combobox', { name: 'Campaign', exact: true }).selectOption(campaignId);
+  await expect(page).toHaveURL(`${baseUrl}/campaigns/${campaignId}/overview`);
+  const completed = page.waitForResponse(`${baseUrl}/api/campaigns/${investigatorCampaignId}`);
+  release();
+  await completed;
+  const refresh = page.waitForResponse(`${baseUrl}/api/campaigns/${campaignId}`);
+  database.addEvent(campaignId, liveId, 'variant.updated', {});
+  await refresh;
+  await expect(page.getByRole('heading', { name: 'ui e2e' })).toBeVisible();
+  await expect(page.getByRole('combobox', { name: 'Campaign', exact: true })).toHaveValue(campaignId);
+});
+
+test('investigation archive can retry a transient failure without closing details', async ({ page }) => {
+  let requests = 0;
+  await page.route(`**/api/campaigns/${investigatorCampaignId}/variants/${investigatorId}/artifacts`, async (route) => {
+    if (++requests === 1) await route.fulfill({ status: 503, json: { error: 'Temporary archive failure' } });
+    else await route.continue();
+  });
+  await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${investigatorId}?tab=investigation`);
+  const action = page.getByTestId('investigation-action-test-failed');
+  await action.getByText('Hypothesis, result and logs', { exact: true }).click();
+  await action.getByText('Artifact paths and logs', { exact: true }).click();
+  await expect(action.getByText('Archive unavailable: Temporary archive failure')).toBeVisible();
+  await action.getByRole('button', { name: 'Retry archive' }).click();
+  await expect(action.getByRole('link', { name: 'investigation/test-failed/test.log', exact: true })).toBeVisible();
+  expect(requests).toBe(2);
+});
+
+test('live Markdown preserves selection and last-good content and ignores older report responses', async ({ page }) => {
+  const reportUrl = `${baseUrl}/api/campaigns/${campaignId}/variants/${baselineId}/report?format=html`;
+  let html = `<h2 id="evidence" data-markdown-level="1">Evidence</h2><p>Keep this selection.</p><pre>${'Recorded evidence\n'.repeat(150)}</pre>`;
+  let requests = 0;
+  let hold = false;
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route(reportUrl, async (route) => {
+    const body = html;
+    requests++;
+    if (hold) await held;
+    await route.fulfill({ contentType: 'text/html', body });
+  });
+  try {
+    await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${baselineId}?tab=markdown`);
+    const article = page.getByTestId('experiment-markdown');
+    await expect(article).toContainText('Keep this selection.');
+    const node = await article.elementHandle();
+    await article.evaluate((node) => {
+      const range = node.ownerDocument.createRange();
+      range.selectNodeContents(node.querySelector('p')!);
+      node.ownerDocument.getSelection()!.removeAllRanges();
+      node.ownerDocument.getSelection()!.addRange(range);
+      node.scrollTo({ top: 100, behavior: 'instant' });
+    });
+    const refreshed = page.waitForResponse(reportUrl);
+    database.addEvent(campaignId, baselineId, 'reports.refreshed', {});
+    await refreshed;
+    await expect.poll(() => requests).toBe(2);
+    expect(await page.evaluate('document.getSelection().toString()')).toBe('Keep this selection.');
+    expect(await article.evaluate((node) => node.scrollTop)).toBe(100);
+    expect(await node!.evaluate((node) => node.isConnected)).toBe(true);
+    hold = true;
+    html = '<h2 id="evidence" data-markdown-level="1">Stale report</h2>';
+    database.addEvent(campaignId, baselineId, 'reports.refreshed', {});
+    await expect.poll(() => requests).toBe(3);
+    await expect(article).toContainText('Keep this selection.');
+    hold = false;
+    html = '<h2 id="evidence" data-markdown-level="1">Newest report</h2>';
+    database.addEvent(campaignId, baselineId, 'reports.refreshed', {});
+    await expect(article).toContainText('Newest report');
+    const completed = page.waitForResponse(reportUrl);
+    release();
+    await completed;
+    await expect(article).toContainText('Newest report');
+    await expect(article).not.toContainText('Stale report');
+    expect(await node!.evaluate((node) => node.isConnected)).toBe(true);
+  } finally {
+    release();
+  }
+});
+
 test('explains Investigation and Markdown in a compact keyboard-accessible help dialog on desktop and mobile', async ({ page }) => {
   for (const width of [1440, 390]) {
     await page.setViewportSize({ width, height: 844 });
@@ -1574,8 +1849,11 @@ test('help remains open during live refresh, restores focus, and closes on histo
   const previousTrigger = await trigger.elementHandle();
   await trigger.click();
   const dialog = page.getByRole('dialog', { name: 'One experiment, two views' });
+  const refreshed = page.waitForResponse((response) => response.url() === `${baseUrl}/api/campaigns/${investigatorCampaignId}`);
   database.addEvent(investigatorCampaignId, investigatorId, 'investigator.updated', { helpRefreshTest: true });
-  await expect.poll(() => previousTrigger!.evaluate((node) => node.isConnected)).toBe(false);
+  await refreshed;
+  await page.waitForTimeout(100);
+  expect(await previousTrigger!.evaluate((node) => node.isConnected)).toBe(true);
   await expect(dialog).toBeVisible();
   await expect(dialog.getByRole('button', { name: 'Close help' })).toBeFocused();
   await page.keyboard.press('Escape');
@@ -1949,3 +2227,143 @@ for (const enabled of [true, false]) {
     expect(database.getCampaign(id).config.investigator?.enabled).toBe(enabled);
   });
 }
+
+test('timing help chips explain execution scopes without changing measurements', async ({ page }) => {
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/overview`);
+  const active = page.getByTestId(`active-variant-${liveId}`);
+  for (const [label, definition] of [
+    ['End-to-end', 'Elapsed time for this execution'],
+    ['Phase 2', 'baseline or final evaluation batch'],
+    ['Planner duration', 'Sum of planner-reported durations'],
+    ['Wall elapsed', 'from startup through result capture'],
+    ['Model duration', 'reported for this replicate'],
+  ] as const) {
+    const trigger = active.getByRole('button', { name: `Help with ${label}`, exact: true });
+    await expect(trigger).toHaveAttribute('aria-haspopup', 'dialog');
+    await trigger.press('Enter');
+    const dialog = page.getByRole('dialog', { name: label, exact: true });
+    await expect(dialog).toContainText(definition);
+    await expect(dialog).toContainText('missing, not zero');
+    await expect(dialog).toContainText('cannot be added or subtracted');
+    if (label === 'End-to-end') {
+      await expect(dialog).toContainText('human review or promotion');
+      await expect(dialog).toContainText('resets');
+    }
+    if (label === 'Phase 2') {
+      await expect(dialog).toContainText('after stack startup');
+      await expect(dialog).toContainText('configured target-excluded work');
+      await expect(dialog).toContainText('investigation trials, builds, or later judging');
+    }
+    if (label === 'Planner duration') {
+      await expect(dialog).toContainText('latest trial');
+      await expect(dialog).toContainText('final cohorts');
+      await expect(dialog).toContainText('not wall-clock or active time');
+      await expect(dialog).toContainText('investigator-agent and target-excluded usage');
+    }
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.help-dialog')).toHaveCount(0);
+    await expect(dialog).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+  }
+  await expect(active.getByLabel('Experiment timing and planner usage')).toContainText('820 incl. reasoning');
+  await expect(active.getByLabel('Experiment timing and planner usage')).toContainText('$0.95');
+
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${baselineId}?tab=summary`);
+  const summary = page.getByLabel('Experiment timing and planner usage');
+  for (const label of ['End-to-end', 'Phase 2', 'Planner duration']) {
+    await expect(summary.getByRole('button', { name: `Help with ${label}`, exact: true })).toBeVisible();
+  }
+  await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${investigatorId}?tab=investigation`);
+  await page.getByRole('button', { name: 'Help with Wall time', exact: true }).click();
+  const wall = page.getByRole('dialog', { name: 'Wall time', exact: true });
+  await expect(wall).toContainText('investigator session');
+  await expect(wall).toContainText('configured wall-time budget');
+  await expect(wall).toContainText('not planner model duration');
+});
+
+test('timing help survives refresh and restores the matching replaced trigger', async ({ page }) => {
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${liveId}?tab=runs`);
+  const trigger = page.getByRole('button', { name: 'Help with Wall elapsed', exact: true });
+  await trigger.click();
+  const dialog = page.getByRole('dialog', { name: 'Wall elapsed', exact: true });
+  const originalDialog = await dialog.elementHandle();
+  const refreshed = page.waitForResponse((response) => response.url() === `${baseUrl}/api/campaigns/${campaignId}`);
+  database.addEvent(campaignId, liveId, 'variant.updated', { timingHelpRefresh: true });
+  await refreshed;
+  await expect(dialog).toBeVisible();
+  expect(await originalDialog!.evaluate((node) => node.isConnected && node.parentElement === node.ownerDocument.body)).toBe(true);
+  await expect(dialog.getByRole('button', { name: 'Close help' })).toBeFocused();
+  // Exercise focus fallback even when live rendering preserves the original node.
+  await page.evaluate(`import('/help.js').then(({ helpButton }) => {
+    document.querySelector('[data-help-topic="Wall elapsed"]').replaceWith(helpButton('Wall elapsed'));
+  })`);
+  await dialog.getByRole('button', { name: 'Close help' }).click();
+  await expect(trigger).toBeFocused();
+  await trigger.click();
+  await page.evaluate(`window.dispatchEvent(new PopStateEvent('popstate'))`);
+  await expect(dialog).toHaveCount(0);
+});
+
+test('global help guide is scrollable and keyboard accessible at compact widths', async ({ page }) => {
+  for (const width of [1440, 390, 320]) {
+    await page.setViewportSize({ width, height: 640 });
+    await page.goto(`${baseUrl}/campaigns/new`);
+    await expect(page.getByRole('heading', { name: 'Create an evaluation campaign', exact: true })).toBeVisible();
+    const trigger = page.locator('.topbar').getByRole('button', { name: 'Help', exact: true });
+    await expect(trigger).toBeVisible();
+    expect(await page.evaluate<number>('document.documentElement.scrollWidth')).toBe(width);
+    await trigger.focus();
+    await page.keyboard.press('Enter');
+    const dialog = page.getByRole('dialog', { name: 'Planner harness help', exact: true });
+    await expect(dialog).toBeVisible();
+    for (const heading of ['Getting started', 'Where to look', 'How autonomous investigation works', 'Reading results']) {
+      await expect(dialog.getByRole('heading', { name: heading, exact: true })).toHaveCount(1);
+    }
+    await expect(dialog.getByRole('list', { name: 'Autonomous investigation steps' }).getByRole('listitem')).toHaveCount(6);
+    for (const copy of [
+      'Autonomous investigation is optional', 'archived evidence', 'persistent session',
+      'Revise, abandon, or finalize', 'full configured tests', 'independent AI compliance review',
+      'holdout/regression', 'configured target-excluded', 'development, not final validation',
+      'tests do not establish accuracy', 'unverified model judgment', 'human-reviewed labels',
+      'AI suggestions', 'Finalization is not promotion', 'Supervised mode', 'Automatic mode', 'eligible',
+    ]) await expect(dialog).toContainText(copy);
+    const bounds = await dialog.boundingBox();
+    expect(bounds!.x).toBeGreaterThanOrEqual(0);
+    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width);
+    expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(640);
+    expect(await dialog.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
+    const close = dialog.getByRole('button', { name: 'Close help' });
+    await expect(close).toBeFocused();
+    if (process.env.HARNESS_UI_SCREENSHOTS) await page.screenshot({ path: test.info().outputPath(`help-${width}.png`) });
+    await dialog.locator('.help-body').evaluate((node) => { node.scrollTop = node.scrollHeight; });
+    await expect(dialog.getByRole('heading', { name: 'Reading results', exact: true })).toBeInViewport();
+    await expect(close).toBeInViewport();
+    await page.keyboard.press('Tab');
+    expect(await dialog.evaluate((node) => node.contains(node.ownerDocument.activeElement))).toBe(true);
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+    await trigger.click();
+    await close.click();
+    await expect(dialog).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+    await trigger.click();
+    await page.mouse.click(5, 5);
+    await expect(dialog).toHaveCount(0);
+    await expect(trigger).toBeFocused();
+  }
+});
+
+test('target separator remains subordinate to timing help table headers', async ({ page }) => {
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/overview`);
+  const group = page.getByTestId(`replicate-group-${liveId}-target-excluded`);
+  const title = group.locator('.replicate-group-title');
+  await expect(title).toHaveText('Target-excluded guard');
+  await expect(title).toHaveCSS('text-transform', 'none');
+  await expect(title).toHaveCSS('font-weight', '500');
+  expect(await title.evaluate((node) => parseFloat(node.ownerDocument.defaultView!.getComputedStyle(node).fontSize))).toBeLessThanOrEqual(9);
+  await expect(group.locator('th')).toHaveCSS('padding-top', '5px');
+  await expect(group.locator('.status')).toHaveText('running');
+  await expect(group.locator('.replicate-group-note')).toContainText('excluded from standard totals');
+  if (process.env.HARNESS_UI_SCREENSHOTS) await page.getByTestId(`active-variant-${liveId}`).screenshot({ path: test.info().outputPath('run-timing.png') });
+});

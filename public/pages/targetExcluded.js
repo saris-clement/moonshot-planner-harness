@@ -97,6 +97,7 @@ function questionPanel(context, campaign, variant, evaluation) {
       const form = element('form', {
         className: 'counterfactual-question',
         attributes: {
+          'data-live-key': `${variant.id}:question:${scopeId}`,
           'data-question-benchmark': question.benchmark,
           'data-question-replicate': question.replicate,
           'data-question-id': question.id,
@@ -166,7 +167,7 @@ function runTable(evaluation) {
       element('thead', {}, [element('tr', {}, ['Arm', 'Run', 'Status', 'Progress', 'Build'].map((text) =>
         element('th', { text, attributes: { scope: 'col' } }),
       ))]),
-      element('tbody', {}, executions.map((execution) => element('tr', {}, [
+      element('tbody', {}, executions.map((execution) => element('tr', { attributes: { 'data-live-key': `${execution.benchmark}:${execution.replicate}` } }, [
         element('th', {
           className: 'target-run-row-heading',
           text: execution.benchmark,

@@ -20,6 +20,7 @@ import {
   replicateMatrix,
   targetExcludedReplicateMatrix,
 } from './models.js';
+import { helpButton } from './help.js';
 
 export function routeLink(label, href, className = '') {
   return element('a', {
@@ -267,7 +268,9 @@ export function replicateTable(campaign, variant, options = {}) {
           'Cost',
           'Questions',
           'Langfuse',
-        ].map((label) => element('th', { text: label, attributes: { scope: 'col' } }))),
+        ].map((label) => element('th', { text: label, attributes: { scope: 'col' } },
+          ['Wall elapsed', 'Model duration'].includes(label) ? [helpButton(label)] : [],
+        ))),
       ]),
       body,
     ]),
@@ -289,7 +292,9 @@ export function usageSummary(campaign, variant) {
   ];
   return element('dl', { className: 'metric-summary', attributes: { 'aria-label': 'Experiment timing and planner usage' } },
     values.map(([label, value]) =>
-      element('div', {}, [element('dt', { text: label }), element('dd', { text: value })]),
+      element('div', {}, [element('dt', { text: label },
+        ['End-to-end', 'Phase 2', 'Planner duration'].includes(label) ? [helpButton(label)] : [],
+      ), element('dd', { text: value })]),
     ),
   );
 }
@@ -360,7 +365,10 @@ export function questionEntry(question) {
       ]);
   return element('article', {
     className: 'question-entry',
-    attributes: { 'data-question-scope': `${question.benchmark}:${question.replicate}:${question.id}` },
+    attributes: {
+      'data-question-scope': `${question.benchmark}:${question.replicate}:${question.id}`,
+      'data-live-key': JSON.stringify([question.benchmark, question.replicate, question.id]),
+    },
   }, [
     element('div', { className: 'question-meta' }, [
       element('span', { text: `${question.benchmark} · replicate ${question.replicate}` }),

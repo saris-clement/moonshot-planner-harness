@@ -14,6 +14,7 @@ import {
 import { targetExcludedPanel } from './targetExcluded.js';
 import { investigationPanel, investigationSummary } from '../investigation.js';
 import { experimentHelpButton } from '../experimentHelp.js';
+import { liveRegion, updateLiveView } from '../live.js';
 
 const tabs = [
   ['summary', 'Summary'],
@@ -29,8 +30,13 @@ const markdownCache = new Map();
 const markdownViewState = new Map();
 const reportedMarkdownFailures = new Set();
 const appliedMarkdownHashes = new Map();
+const reportGenerations = new Map();
+const markdownPanels = new WeakMap();
+const artifactPanels = new WeakMap();
+const markdownHeadingSelector = '[data-markdown-level="1"], [data-markdown-level="2"], [data-markdown-level="3"]';
 
 export function invalidateExperimentMarkdown(campaignId) {
+  reportGenerations.set(campaignId, (reportGenerations.get(campaignId) ?? 0) + 1);
   const prefix = `/api/campaigns/${encodeURIComponent(campaignId)}/`;
   for (const key of markdownCache.keys()) {
     if (key.startsWith(prefix)) markdownCache.delete(key);
@@ -40,11 +46,20 @@ export function invalidateExperimentMarkdown(campaignId) {
   }
 }
 
-function loadExperimentMarkdown(reportUrl) {
+function reportRevision(campaign, variant) {
+  return JSON.stringify([
+    variant.updatedAt, variant.artifactCollectionComplete, variant.investigation?.updatedAt,
+    reportGenerations.get(campaign.id) ?? 0,
+  ]);
+}
+
+function loadExperimentMarkdown(reportUrl, revision) {
   const cached = markdownCache.get(reportUrl);
-  if (cached) return cached;
+  if (cached?.revision === revision && !cached.failed) return cached.request;
   const request = apiText(reportUrl);
-  markdownCache.set(reportUrl, request);
+  const entry = { revision, request, failed: false };
+  markdownCache.set(reportUrl, entry);
+  request.catch(() => { entry.failed = true; });
   return request;
 }
 
@@ -56,10 +71,67 @@ function scrollToMarkdownHeading(content, heading, behavior) {
   content.scrollTo({ top, behavior });
 }
 
-function renderMarkdownContents(content, navigationLinks, html, focusedTarget, reportKey) {
+function updateMarkdownSection(region) {
+  const content = region.querySelector('.experiment-markdown');
+  const headings = [...content.querySelectorAll(markdownHeadingSelector)];
+  const links = [...region.querySelectorAll('.markdown-toc-link')];
+  const contentTop = content.getBoundingClientRect().top;
+  let active = 0;
+  for (const [index, heading] of headings.entries()) {
+    if (heading.getBoundingClientRect().top - contentTop <= 28) active = index;
+  }
+  for (const [index, link] of links.entries()) {
+    link.classList.toggle('active', index === active);
+    if (index === active) link.setAttribute('aria-current', 'location');
+    else link.removeAttribute('aria-current');
+  }
+  const activeLink = links[active];
+  const navigation = region.querySelector('.markdown-toc');
+  if (activeLink) {
+    const linkBox = activeLink.getBoundingClientRect();
+    const navigationBox = navigation.getBoundingClientRect();
+    if (linkBox.top < navigationBox.top) navigation.scrollTop -= navigationBox.top - linkBox.top;
+    else if (linkBox.bottom > navigationBox.bottom) navigation.scrollTop += linkBox.bottom - navigationBox.bottom;
+  }
+}
+
+function applyMarkdownHash(region, reportKey) {
+  if (!region.isConnected || appliedMarkdownHashes.get(reportKey) === location.hash) return;
+  const content = region.querySelector('.experiment-markdown');
+  const heading = [...content.querySelectorAll(markdownHeadingSelector)]
+    .find((candidate) => `#${candidate.id}` === location.hash);
+  if (!heading) return;
+  appliedMarkdownHashes.set(reportKey, location.hash);
+  heading.focus({ preventScroll: true });
+  scrollToMarkdownHeading(content, heading, 'auto');
+  updateMarkdownSection(region);
+}
+
+function renderMarkdownContents(region, html, reportKey) {
+  const content = region.querySelector('.experiment-markdown');
+  const navigation = region.querySelector('.markdown-toc');
+  const navigationLinks = navigation.querySelector('.markdown-toc-links');
+  const firstRender = markdownPanels.get(region).html === undefined;
+  const viewState = firstRender ? markdownViewState.get(reportKey) : null;
+  const scrollTop = viewState?.scrollTop ?? content.scrollTop;
+  const scrollLeft = viewState?.scrollLeft ?? content.scrollLeft;
+  const tocTop = viewState?.tocTop ?? navigation.scrollTop;
+  const tocLeft = viewState?.tocLeft ?? navigation.scrollLeft;
+  const focused = document.activeElement;
+  const focusedHere = region.contains(focused);
+  const focusedHref = focusedHere ? focused.getAttribute('href') : null;
+  const focusScope = navigation.contains(focused) ? navigationLinks : content;
+  const focusedOccurrence = focusedHref ? [...focusScope.querySelectorAll('a')]
+    .filter((link) => link.getAttribute('href') === focusedHref).indexOf(focused) : -1;
+  const focusedHeadingId = focusedHere && focused.matches('[data-markdown-level]') ? focused.id : null;
+  const nestedScroll = [...content.querySelectorAll('*')]
+    .filter((node) => node.scrollTop || node.scrollLeft)
+    .map((node) => [node, node.scrollTop, node.scrollLeft]);
+  // The server sanitizes HTML and assigns stable heading ids; keep the native parsing pipeline.
   const parsed = new DOMParser().parseFromString(html, 'text/html');
-  content.replaceChildren(...parsed.body.childNodes);
-  const headings = [...content.querySelectorAll('[data-markdown-level="1"], [data-markdown-level="2"], [data-markdown-level="3"]')];
+  const nextContent = content.cloneNode(false);
+  nextContent.append(...parsed.body.childNodes);
+  const headings = [...nextContent.querySelectorAll(markdownHeadingSelector)];
   for (const heading of headings) heading.setAttribute('tabindex', '-1');
   const links = headings.map((heading) => {
     const level = heading.getAttribute('data-markdown-level') ?? '1';
@@ -67,109 +139,31 @@ function renderMarkdownContents(content, navigationLinks, html, focusedTarget, r
       className: `markdown-toc-link markdown-toc-level-${level}`,
       text: heading.textContent,
       attributes: { href: `#${heading.id}` },
-      on: {
-        click: (event) => {
-          if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-          event.preventDefault();
-          const hash = `#${heading.id}`;
-          if (location.hash !== hash) {
-            history.pushState(history.state, '', `${location.pathname}${location.search}${hash}`);
-          }
-          appliedMarkdownHashes.set(reportKey, hash);
-          heading.focus({ preventScroll: true });
-          scrollToMarkdownHeading(
-            content,
-            heading,
-            matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
-          );
-        },
-      },
     });
   });
-  navigationLinks.replaceChildren(...links);
-  const updateActiveSection = () => {
-    const contentTop = content.getBoundingClientRect().top;
-    let active = 0;
-    for (const [index, heading] of headings.entries()) {
-      if (heading.getBoundingClientRect().top - contentTop <= 28) active = index;
-    }
-    for (const [index, link] of links.entries()) {
-      link.classList.toggle('active', index === active);
-      if (index === active) link.setAttribute('aria-current', 'location');
-      else link.removeAttribute('aria-current');
-    }
-    const activeLink = links[active];
-    const navigation = navigationLinks.parentElement;
-    if (activeLink && navigation) {
-      const linkBox = activeLink.getBoundingClientRect();
-      const navigationBox = navigation.getBoundingClientRect();
-      if (linkBox.top < navigationBox.top) navigation.scrollTop -= navigationBox.top - linkBox.top;
-      else if (linkBox.bottom > navigationBox.bottom) {
-        navigation.scrollTop += linkBox.bottom - navigationBox.bottom;
-      }
-    }
-  };
-  content.addEventListener('scroll', updateActiveSection, { passive: true });
-  updateActiveSection();
-  const hashHeading = headings.find((heading) => `#${heading.id}` === location.hash);
-  const useHashNavigation = Boolean(
-    hashHeading && appliedMarkdownHashes.get(reportKey) !== location.hash,
-  );
-  if (hashHeading && useHashNavigation) {
-    appliedMarkdownHashes.set(reportKey, location.hash);
-    queueMicrotask(() => {
-      hashHeading.focus({ preventScroll: true });
-      scrollToMarkdownHeading(content, hashHeading, 'auto');
-    });
+  updateLiveView(content, nextContent);
+  updateLiveView(navigationLinks, element('div', { className: 'markdown-toc-links' }, links));
+  if (focusedHere && document.activeElement !== focused) {
+    const target = focused.isConnected ? focused : focusedHeadingId
+      ? [...content.querySelectorAll(markdownHeadingSelector)].find((heading) => heading.id === focusedHeadingId)
+      : focusedHref ? [...focusScope.querySelectorAll('a')]
+        .filter((link) => link.getAttribute('href') === focusedHref)[focusedOccurrence] : content;
+    (target ?? content).focus({ preventScroll: true });
   }
-  if (focusedTarget.tocHref || focusedTarget.contentHref || focusedTarget.headingId) {
-    queueMicrotask(() => {
-      if (focusedTarget.tocHref) {
-        links.find((link) => link.getAttribute('href') === focusedTarget.tocHref)?.focus();
-      } else if (focusedTarget.contentHref) {
-        [...content.querySelectorAll('a')]
-          .filter((link) => link.getAttribute('href') === focusedTarget.contentHref)
-          [focusedTarget.contentOccurrence]
-          ?.focus();
-      } else if (focusedTarget.headingId) {
-        headings.find((heading) => heading.id === focusedTarget.headingId)?.focus();
-      }
-    });
+  for (const [node, top, left] of nestedScroll) {
+    if (node.isConnected) node.scrollTo({ top, left, behavior: 'instant' });
   }
-  return useHashNavigation;
+  content.scrollTo({ top: scrollTop, left: scrollLeft, behavior: 'instant' });
+  updateMarkdownSection(region);
+  navigation.scrollTop = tocTop;
+  navigation.scrollLeft = tocLeft;
+  applyMarkdownHash(region, reportKey);
 }
 
 function markdownPanel(campaign, variant, context) {
   const reportUrl = `/api/campaigns/${encodeURIComponent(campaign.id)}/variants/${encodeURIComponent(variant.id)}/report`;
   const renderedUrl = `${reportUrl}?format=html`;
-  const previous = document.querySelector('.experiment-markdown');
-  const previousIsSameReport = previous?.getAttribute('data-report-url') === renderedUrl;
-  const restoreFocus = previousIsSameReport && document.activeElement === previous;
-  const activeElement = document.activeElement;
-  const focusedTocHref = previousIsSameReport
-    ? document.querySelector('.markdown-toc a:focus')?.getAttribute('href')
-    : null;
-  const focusedContentHref = previousIsSameReport && activeElement?.closest('.markdown-body')
-    ? activeElement.getAttribute('href')
-    : null;
-  const focusedContentOccurrence = focusedContentHref
-    ? [...previous.querySelectorAll('a')]
-      .filter((link) => link.getAttribute('href') === focusedContentHref)
-      .indexOf(activeElement)
-    : -1;
-  const focusedHeadingId = previousIsSameReport && activeElement?.matches('[data-markdown-level]')
-    ? activeElement.id
-    : null;
-  const restoreRawFocus = previousIsSameReport && activeElement?.classList.contains('markdown-raw-link');
-  if (previousIsSameReport && previous.getAttribute('aria-busy') !== 'true') {
-    markdownViewState.set(renderedUrl, {
-      scrollTop: previous.scrollTop,
-    });
-  } else if (reportedMarkdownFailures.has(renderedUrl)) {
-    markdownCache.delete(renderedUrl);
-    reportedMarkdownFailures.delete(renderedUrl);
-  }
-  const viewState = markdownViewState.get(renderedUrl) ?? { scrollTop: 0 };
+  const routeKey = `${location.pathname}${location.search}`;
   const content = element('article', {
     className: 'experiment-markdown markdown-body',
     attributes: {
@@ -179,11 +173,6 @@ function markdownPanel(campaign, variant, context) {
       'data-testid': 'experiment-markdown',
       tabindex: '0',
     },
-    on: {
-      scroll: () => markdownViewState.set(renderedUrl, {
-        scrollTop: content.scrollTop,
-      }),
-    },
   }, [element('p', { className: 'muted', text: 'Loading experiment Markdown…' })]);
   const navigationLinks = element('div', { className: 'markdown-toc-links' }, [
     element('p', { className: 'muted', text: 'Loading sections…' }),
@@ -192,44 +181,78 @@ function markdownPanel(campaign, variant, context) {
     className: 'markdown-toc',
     attributes: { 'aria-label': 'On this page' },
   }, [element('p', { className: 'overline', text: 'On this page' }), navigationLinks]);
-  const restoreViewState = () => {
-    content.scrollTop = viewState.scrollTop;
-    if (restoreFocus) content.focus({ preventScroll: true });
-  };
-  queueMicrotask(restoreViewState);
-  const markdownRequest = loadExperimentMarkdown(renderedUrl);
-  markdownRequest
-    .then((html) => {
-      const usedHashNavigation = renderMarkdownContents(content, navigationLinks, html, {
-        tocHref: focusedTocHref,
-        contentHref: focusedContentHref,
-        contentOccurrence: focusedContentOccurrence,
-        headingId: focusedHeadingId,
-      }, renderedUrl);
-      content.setAttribute('aria-busy', 'false');
-      if (!usedHashNavigation) {
-        restoreViewState();
-        requestAnimationFrame(restoreViewState);
-      }
-    })
-    .catch((error) => {
-      if (markdownCache.get(renderedUrl) !== markdownRequest) return;
+  const layout = liveRegion(element('div', {
+    className: 'markdown-layout', attributes: { 'data-live-key': renderedUrl },
+  }, [navigation, content]), (region) => {
+    if (!region.isConnected || `${location.pathname}${location.search}` !== routeKey) return;
+    let state = markdownPanels.get(region);
+    if (!state) {
+      state = { generation: 0, html: undefined, request: null };
+      markdownPanels.set(region, state);
+      // Install once on the mounted region, and resolve headings/links from its current DOM.
+      region.addEventListener('scroll', (event) => {
+        if (!region.isConnected) return;
+        const article = region.querySelector('.experiment-markdown');
+        const toc = region.querySelector('.markdown-toc');
+        if (event.target === article) updateMarkdownSection(region);
+        if (state.html !== undefined) markdownViewState.set(renderedUrl, {
+          scrollTop: article.scrollTop, scrollLeft: article.scrollLeft,
+          tocTop: toc.scrollTop, tocLeft: toc.scrollLeft,
+        });
+      }, { capture: true, passive: true });
+      region.addEventListener('click', (event) => {
+        const link = event.target.closest('.markdown-toc-link');
+        if (!link || !region.contains(link) || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        const article = region.querySelector('.experiment-markdown');
+        const hash = link.getAttribute('href');
+        const heading = [...article.querySelectorAll(markdownHeadingSelector)].find((node) => `#${node.id}` === hash);
+        if (!heading) return;
+        event.preventDefault();
+        if (location.hash !== hash) history.pushState(history.state, '', `${location.pathname}${location.search}${hash}`);
+        appliedMarkdownHashes.set(renderedUrl, hash);
+        heading.focus({ preventScroll: true });
+        scrollToMarkdownHeading(article, heading, matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth');
+      });
+    }
+    applyMarkdownHash(region, renderedUrl);
+    const revision = reportRevision(campaign, variant);
+    const request = loadExperimentMarkdown(renderedUrl, revision);
+    if (state.request === request) return;
+    state.request = request;
+    const generation = ++state.generation;
+    const reportGeneration = reportGenerations.get(campaign.id) ?? 0;
+    const isCurrent = () => region.isConnected && state.generation === generation &&
+      `${location.pathname}${location.search}` === routeKey &&
+      (reportGenerations.get(campaign.id) ?? 0) === reportGeneration &&
+      markdownCache.get(renderedUrl)?.request === request;
+    const article = region.querySelector('.experiment-markdown');
+    if (state.html === undefined) article.setAttribute('aria-busy', 'true');
+    request.then((html) => {
+      if (!isCurrent()) return;
+      if (state.html !== html) renderMarkdownContents(region, html, renderedUrl);
+      state.html = html;
+      if (article.getAttribute('aria-busy') !== 'false') article.setAttribute('aria-busy', 'false');
+      reportedMarkdownFailures.delete(renderedUrl);
+    }).catch((error) => {
+      if (!isCurrent()) return;
       markdownCache.delete(renderedUrl);
       const message = 'Experiment Markdown is unavailable.';
-      content.replaceChildren(element('code', { className: 'error-text', text: message }));
-      content.setAttribute('aria-busy', 'false');
-      navigationLinks.replaceChildren();
+      if (state.html === undefined) {
+        article.replaceChildren(element('code', { className: 'error-text', text: message }));
+        region.querySelector('.markdown-toc-links').replaceChildren();
+      }
+      article.setAttribute('aria-busy', 'false');
       if (!reportedMarkdownFailures.has(renderedUrl)) {
         reportedMarkdownFailures.add(renderedUrl);
         context.notify(`${message} ${error.message}`);
       }
     });
+  });
   const rawLink = element('a', {
     className: 'button button-outline markdown-raw-link',
     text: 'Open raw Markdown',
     attributes: { href: reportUrl, target: '_blank', rel: 'noreferrer' },
   });
-  if (restoreRawFocus) queueMicrotask(() => rawLink.focus());
   return element('section', { className: 'markdown-panel' }, [
     sectionHeading(
       'Research record',
@@ -240,7 +263,7 @@ function markdownPanel(campaign, variant, context) {
        experimentHelpButton('Markdown'),
     ),
     element('div', { className: 'artifact-toolbar' }, [rawLink]),
-    element('div', { className: 'markdown-layout' }, [navigation, content]),
+    layout,
   ]);
 }
 
@@ -296,37 +319,72 @@ function questionsPanel(variant) {
 }
 
 function artifactsPanel(campaign, variant, context) {
-  const target = element('div', { className: 'artifact-content' }, [
-    element('p', { className: 'muted', text: 'Loading experiment archive…' }),
-  ]);
   const root = `/api/campaigns/${encodeURIComponent(campaign.id)}/variants/${encodeURIComponent(variant.id)}`;
-  api(`${root}/artifacts`)
-    .then((artifacts) => {
-      const files = artifacts.files.map((file) =>
-        element('a', {
-          attributes: {
-            href: `${root}/artifacts?path=${encodeURIComponent(file.path)}`,
-            target: '_blank',
-            rel: 'noreferrer',
-          },
-        }, [element('span', { text: file.path }), element('small', { text: `${Math.ceil(file.size / 1024)} KiB` })]),
-      );
-      target.replaceChildren(
-        element('div', { className: 'artifact-toolbar' }, [
-          element('a', {
-            className: 'button button-outline',
-            text: 'Open experiment Markdown',
-            attributes: { href: artifacts.reportUrl, target: '_blank', rel: 'noreferrer' },
-          }),
-        ]),
-        element('div', { className: 'artifact-list' }, files.length ? files : [element('p', { text: 'No raw artifacts have been written yet.' })]),
-      );
-    })
-    .catch((error) => {
-      target.replaceChildren(element('p', { className: 'error-text', text: error.message }));
-      context.notify(error.message);
-    });
-  return target;
+  const routeKey = `${location.pathname}${location.search}`;
+  return liveRegion(element('div', {
+    className: 'artifact-content', attributes: { 'data-live-key': `${root}/artifacts` },
+  }, [
+    element('p', { className: 'muted', text: 'Loading experiment archive…' }),
+  ]), (target) => {
+    if (!target.isConnected || `${location.pathname}${location.search}` !== routeKey) return;
+    let state = artifactPanels.get(target);
+    if (!state) {
+      state = { generation: 0, revision: null, listing: null, pending: false, loaded: false };
+      artifactPanels.set(target, state);
+    }
+    const revision = reportRevision(campaign, variant);
+    if (state.revision === revision && (state.pending || state.loaded)) return;
+    state.revision = revision;
+    state.pending = true;
+    state.loaded = false;
+    const generation = ++state.generation;
+    const reportGeneration = reportGenerations.get(campaign.id) ?? 0;
+    const isCurrent = () => target.isConnected && state.generation === generation &&
+      `${location.pathname}${location.search}` === routeKey &&
+      (reportGenerations.get(campaign.id) ?? 0) === reportGeneration;
+    api(`${root}/artifacts`)
+      .then((artifacts) => {
+        if (!isCurrent()) return;
+        state.pending = false;
+        const listing = JSON.stringify(artifacts);
+        if (state.listing !== listing) {
+          const files = artifacts.files.map((file) =>
+            element('a', {
+              attributes: {
+                href: `${root}/artifacts?path=${encodeURIComponent(file.path)}`,
+                target: '_blank',
+                rel: 'noreferrer',
+              },
+            }, [element('span', { text: file.path }), element('small', { text: `${Math.ceil(file.size / 1024)} KiB` })]),
+          );
+          const focused = document.activeElement;
+          const focusedHere = target.contains(focused);
+          updateLiveView(target, element('div', {
+            className: 'artifact-content', attributes: { 'data-live-key': `${root}/artifacts` },
+          }, [
+            element('div', { className: 'artifact-toolbar' }, [
+              element('a', {
+                className: 'button button-outline',
+                text: 'Open experiment Markdown',
+                attributes: { href: artifacts.reportUrl, target: '_blank', rel: 'noreferrer' },
+              }),
+            ]),
+            element('div', { className: 'artifact-list' }, files.length ? files : [element('p', { text: 'No raw artifacts have been written yet.' })]),
+          ]));
+          if (focusedHere && focused.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true });
+          state.listing = listing;
+        }
+        state.loaded = true;
+        state.error = null;
+      })
+      .catch((error) => {
+        if (!isCurrent()) return;
+        state.pending = false;
+        if (state.listing === null) target.replaceChildren(element('p', { className: 'error-text', text: error.message }));
+        if (state.error !== error.message) context.notify(error.message);
+        state.error = error.message;
+      });
+  });
 }
 
 export function experimentPage(context, route) {

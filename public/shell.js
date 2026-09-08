@@ -1,5 +1,10 @@
 import { element, option } from './dom.js';
 import { routeLink } from './ui.js';
+import { globalHelpButton } from './help.js';
+import { mountLiveRegions, updateLiveView } from './live.js';
+
+let mountedRoute = null;
+let renderedUrl = null;
 
 function campaignNavigation(campaign, route) {
   if (!campaign) return element('nav', { className: 'sidebar-nav', attributes: { 'aria-label': 'Primary navigation' } }, [
@@ -32,6 +37,32 @@ function campaignNavigation(campaign, route) {
 
 export function renderShell({ state, route, content, navigate }) {
   const campaign = state.campaign?.id === route.params.campaignId ? state.campaign : null;
+  const routeKey = `${location.pathname}${['experiments', 'lineage'].includes(route.name) ? '' : location.search}`;
+  const current = document.querySelector('#app > .app-shell');
+  if (current) {
+    const select = current.querySelector('#shell-campaign-select');
+    const nextSelect = element('select', { attributes: { id: select.id, 'aria-label': 'Campaign' } },
+      state.campaigns.length ? state.campaigns.map((item) => option(item.id, item.id, item.id === campaign?.id)) : [option('', 'No campaigns', true)],
+    );
+    nextSelect.disabled = !state.campaigns.length;
+    updateLiveView(select, nextSelect, mountedRoute === routeKey);
+    const navigation = current.querySelector('.sidebar-nav');
+    updateLiveView(navigation, campaignNavigation(campaign, route));
+    const connection = current.querySelector('.connection-state span:last-child');
+    const connectionText = state.reviewDraft?.dirty ? 'Review draft open' : state.connection;
+    if (connection.textContent !== connectionText) connection.textContent = connectionText;
+    const main = current.querySelector('main');
+    const mainClass = route.name === 'review' ? 'content content-review' : 'content';
+    if (main.className !== mainClass) main.className = mainClass;
+    if (mountedRoute === routeKey) updateLiveView(main.firstElementChild, content, renderedUrl === `${location.pathname}${location.search}`);
+    else {
+      main.replaceChildren(content);
+      mountLiveRegions(content);
+    }
+    mountedRoute = routeKey;
+    renderedUrl = `${location.pathname}${location.search}`;
+    return;
+  }
   const collapsed = localStorage.getItem('planner-sidebar-collapsed') === 'true';
   const app = element('div', { className: `app-shell${collapsed ? ' sidebar-collapsed' : ''}` });
   const mobileToggle = element('button', {
@@ -41,12 +72,10 @@ export function renderShell({ state, route, content, navigate }) {
   });
   const campaignSelect = element('select', {
     attributes: { 'aria-label': 'Campaign' },
-    on: {
-      change: (event) => {
-        const moved = navigate(`/campaigns/${encodeURIComponent(event.target.value)}/overview`);
-        if (!moved) event.target.value = campaign?.id ?? '';
-      },
-    },
+  });
+  campaignSelect.addEventListener('change', (event) => {
+    const moved = navigate(`/campaigns/${encodeURIComponent(event.target.value)}/overview`);
+    if (!moved) event.target.value = state.campaign?.id ?? '';
   });
   if (state.campaigns.length) {
     for (const item of state.campaigns) {
@@ -68,6 +97,7 @@ export function renderShell({ state, route, content, navigate }) {
       element('span', { className: 'connection-dot' }),
       element('span', { text: state.reviewDraft?.dirty ? 'Review draft open' : state.connection }),
     ]),
+    globalHelpButton(),
     routeLink('New campaign', '/campaigns/new', 'button button-secondary topbar-new'),
   ]);
   campaignSelect.id = 'shell-campaign-select';
@@ -80,9 +110,11 @@ export function renderShell({ state, route, content, navigate }) {
         text: collapsed ? '›' : '‹',
         attributes: { type: 'button', 'aria-label': collapsed ? 'Expand sidebar' : 'Collapse sidebar' },
         on: {
-          click: () => {
+          click: (event) => {
             const next = !app.classList.contains('sidebar-collapsed');
             app.classList.toggle('sidebar-collapsed', next);
+            event.currentTarget.textContent = next ? '›' : '‹';
+            event.currentTarget.setAttribute('aria-label', next ? 'Expand sidebar' : 'Collapse sidebar');
             localStorage.setItem('planner-sidebar-collapsed', String(next));
           },
         },
@@ -117,4 +149,7 @@ export function renderShell({ state, route, content, navigate }) {
   const contentClass = route.name === 'review' ? 'content content-review' : 'content';
   app.append(header, sidebar, scrim, element('main', { className: contentClass }, [content]));
   document.querySelector('#app').replaceChildren(app);
+  mountedRoute = routeKey;
+  renderedUrl = `${location.pathname}${location.search}`;
+  mountLiveRegions(content);
 }
