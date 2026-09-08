@@ -5,6 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { HarnessDatabase } from '../src/db.js';
+import type { InvestigationState } from '../src/investigator.js';
+import { computeReplicateMeanScore } from '../src/metrics.js';
 import type { HarnessPaths } from '../src/paths.js';
 import { writeAgentHistory, writeCampaignIndex, writeVariantReport } from '../src/reports.js';
 import {
@@ -48,6 +50,120 @@ const runFacts: RunFacts = {
     },
   ],
 };
+
+test('investigator reports distinguish session states, trial evidence, budgets, and incomplete final measurements', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'planner-reports-investigator-'));
+  const paths: HarnessPaths = {
+    root, database: path.join(root, 'harness.sqlite'), campaigns: path.join(root, 'campaigns'),
+    worktrees: path.join(root, 'worktrees'), artifacts: path.join(root, 'artifacts'), reports: path.join(root, 'reports'),
+  };
+  const database = new HarnessDatabase(paths.database);
+  try {
+    const config = CampaignConfigSchema.parse({
+      id: 'report-investigator', goal: 'Separate agent development trials from final measured outcomes.',
+      plannerRepo: root, workflowsRepo: root, environmentFile: path.join(root, 'environment.env'),
+      seedRevision: 'seed', workflowsRevision: 'workflows', investigator: { enabled: true },
+      benchmarks: [
+        { name: 'primary', role: 'primary', zipPath: path.join(root, 'primary.zip') },
+        { name: 'holdout', role: 'holdout', zipPath: path.join(root, 'holdout.zip') },
+      ],
+    });
+    const campaign = database.createCampaign(config, 'a'.repeat(40), 'b'.repeat(40), `sha256:${'c'.repeat(64)}`, 'https://example.invalid/workflows.git');
+    const created = database.createVariant({
+      id: `${campaign.id}-v001`, campaignId: campaign.id, parentVariantId: null, round: 1, ordinal: 1,
+      hypothesis: { title: 'Source guard', rationale: 'Challenge the diagnosis.', instructions: 'Inspect source boundaries.', expectedImpact: 'Unverified.', risk: 'Variance.', findingIds: [] },
+    });
+    const label = database.upsertLabel({ campaignId: campaign.id, benchmark: 'primary', unitKey: 'unit-a', expectedDecision: 'reuse', classification: 'system_error', rationale: 'Provisional baseline reference.', status: 'suggested' });
+    const score = computeReplicateMeanScore([runFacts, runFacts], [label], null);
+    const action = {
+      id: 'action-001', kind: 'test', hypothesis: created.hypothesis, rationale: 'Check the treatment.',
+      startedAt: '2026-09-07T10:00:00.000Z', completedAt: '2026-09-07T10:01:00.000Z',
+      patchHash: `sha256:${'d'.repeat(64)}`, artifactDirectory: 'investigation/action-001', error: null,
+    };
+    const investigation: InvestigationState = {
+      schemaVersion: 1, sessionId: 'session-report', status: 'running', startedAt: action.startedAt,
+      updatedAt: '2026-09-07T10:02:00.000Z', turnCount: 4, agentTokens: null, agentCostUsd: null,
+      reason: 'A recorded interpretation, not human-reviewed truth.',
+      harnessPins: { contextHash: `sha256:${'e'.repeat(64)}`, labelSetHash: `sha256:${'f'.repeat(64)}` },
+      actions: [
+        { ...action, status: 'failed', patchHash: null, artifactDirectory: null, result: null, error: 'Test failed.\nArtifacts: investigation/action-001' },
+        { ...action, id: 'action-002', status: 'completed', result: { passed: true, testFiles: ['server/test/source.test.ts'], logPaths: ['/local/investigation/action-002/tests.log'] } },
+        { ...action, id: 'action-003', kind: 'evaluate_primary', status: 'completed', result: { score, baselineScore: score, facts: runFacts, replicateFacts: [runFacts, runFacts], labelSetHash: `sha256:${'f'.repeat(64)}`, comparisonNotes: ['Runtime answers are not globally frozen.'], transitions: [{ rawMarker: 'DO_NOT_COPY_RAW_MODEL_OUTPUT' }] } },
+        { ...action, id: 'action-004', kind: 'finalize', status: 'completed', result: { passed: true, tests: { passed: true, testFiles: [], logPaths: [] }, compliance: { status: 'passed' } } },
+        { ...action, id: 'action-005', kind: 'evaluate_primary', status: 'completed', result: { unknown: 'DO_NOT_COPY_UNKNOWN_RESULT', passed: true } },
+      ],
+    };
+    for (const status of ['running', 'stopped', 'finalized', 'abandoned', 'budget_exhausted', 'failed'] as const) {
+      const variant = database.updateVariant(created.id, {
+        status: status === 'failed' ? 'failed' : status === 'finalized' ? 'gating' : ['abandoned', 'budget_exhausted'].includes(status) ? 'rejected' : 'mutating',
+        investigation: { ...investigation, status },
+      });
+      const report = await readFile(await writeVariantReport(paths, campaign, variant, [label]), 'utf8');
+      assert.match(report, /## Investigation/);
+      assert.ok(report.includes(`| Session status | ${status} |`));
+      assert.match(report, /\| Agent tokens \| unknown \| 2000000 \|/);
+      assert.match(report, /\| Agent cost USD \| unknown \|/);
+      assert.match(report, /\| Turns \| 4 \| 12 \|/);
+      assert.match(report, /\| Primary evaluation attempts \| 2 \| 3 \|/);
+      assert.match(report, /\| Wall elapsed at last update ms \| 120000 \| 7200000 \|/);
+      assert.match(report, /### Action Timeline/);
+      assert.match(report, /action-001.*failed/);
+      assert.match(report, /Tests passed \(execution only\)/);
+      assert.match(report, /Finalization passed; full tests passed; compliance passed \(unverified\)/);
+      assert.match(report, /Trial verified: unknown; provisional: 0\.0%/);
+      assert.match(report, /Primary result unknown/);
+      assert.match(report, /## Score Basis/);
+      assert.match(report, /raw-replicate mean/);
+      assert.match(report, /Runtime answers are not globally frozen/);
+      assert.match(report, /investigation\/action-001/);
+      assert.doesNotMatch(report, /DO_NOT_COPY_|NaN|undefined/);
+      const conclusion = report.split('## Conclusion')[1]!.split('## LLM Suggestion')[0]!;
+      assert.match(conclusion, status === 'failed' ? /Status: `failed`/ : /Status: `incomplete`/);
+      assert.doesNotMatch(conclusion, /pending/);
+      assert.match(conclusion, /No final measured facts/);
+    }
+    const measured = database.updateVariant(created.id, {
+      status: 'review', facts: runFacts, score, investigation: { ...investigation, status: 'finalized', agentTokens: 0, agentCostUsd: 0 },
+    });
+    const report = await readFile(await writeVariantReport(paths, campaign, measured, [label]), 'utf8');
+    assert.match(report, /\| Agent tokens \| 0 \| 2000000 \|/);
+    assert.match(report, /\| Agent cost USD \| 0\.0000 \|/);
+    assert.match(report, /Status: `measured`/);
+    assert.match(report, /Consensus decision counts/);
+    const index = await readFile(await writeCampaignIndex(paths, campaign, [measured]), 'utf8');
+    assert.match(index, /## Investigator Sessions/);
+    assert.match(index, /session-report/);
+    assert.match(index, /finalized/);
+  } finally {
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('failed runs without facts are failed, not pending, even without an investigator', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'planner-reports-failed-'));
+  const paths: HarnessPaths = { root, database: path.join(root, 'db.sqlite'), campaigns: path.join(root, 'campaigns'), worktrees: path.join(root, 'worktrees'), artifacts: path.join(root, 'artifacts'), reports: path.join(root, 'reports') };
+  const database = new HarnessDatabase(paths.database);
+  try {
+    const config = CampaignConfigSchema.parse({ id: 'failed-report', goal: 'Do not describe failed experiments as pending measurement.', plannerRepo: root, workflowsRepo: root, environmentFile: path.join(root, 'env'), seedRevision: 'seed', workflowsRevision: 'source', benchmarks: [{ name: 'primary', role: 'primary', zipPath: path.join(root, 'p.zip') }, { name: 'holdout', role: 'holdout', zipPath: path.join(root, 'h.zip') }] });
+    const campaign = database.createCampaign(config, 'a'.repeat(40), 'b'.repeat(40), `sha256:${'c'.repeat(64)}`, 'https://example.invalid/workflows.git');
+    const variant = database.updateVariant(database.createVariant({ id: 'failed-report-v000', campaignId: campaign.id, parentVariantId: null, round: 0, ordinal: 0, hypothesis: { title: 'Failed baseline', rationale: 'Measure.', instructions: 'No edits.', expectedImpact: 'Baseline.', risk: 'Infrastructure.', findingIds: [] } }).id, { status: 'failed', error: 'Image build failed.' });
+    const report = await readFile(await writeVariantReport(paths, campaign, variant, []), 'utf8');
+    assert.match(report, /## Conclusion\s+Status: `failed`/);
+    assert.match(report, /\| Standard \| failed \(no final facts\) \|/);
+    assert.doesNotMatch(report, /Status: `pending`|\| Standard \| pending \|/);
+    assert.match(report, /\| Verified errors \| unavailable \|/);
+    assert.match(report, /Image build failed/);
+    database.createTargetExcludedEvaluation(campaign.id, variant.id);
+    const excluded = database.updateTargetExcludedEvaluation(variant.id, { status: 'failed', error: 'Excluded run failed before producing facts.' });
+    const failedGuardReport = await readFile(await writeVariantReport(paths, campaign, variant, [], excluded), 'utf8');
+    assert.match(failedGuardReport, /Gate: `not evaluated`/);
+    assert.match(failedGuardReport, /Pair validity: unavailable/);
+  } finally {
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test('reports and history keep diagnosis separate from measured, judge, and human evidence', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'planner-reports-diagnosis-'));

@@ -12,9 +12,13 @@ import {
 } from './config.js';
 import { HarnessDatabase } from './db.js';
 import { AgentRunner, type SourceQuestionAnswer } from './agents.js';
+import { runInvestigatorLoop } from './investigatorLoop.js';
+import type { InvestigationState } from './investigator.js';
 import {
+  canonicalHash,
   compareCohort,
   compareScores,
+  computeReplicateMeanScore,
   computeScore,
   computeTargetExcludedGate,
   consensusRunFacts,
@@ -63,6 +67,7 @@ import {
   prepareVariantWorktree,
   reattachVariantStack,
   runVariantGates,
+  runInvestigatorTests,
   startVariantStack,
   stageMutationBaseline,
   stopVariantStack,
@@ -83,6 +88,7 @@ import type {
 } from './types.js';
 import { TargetExcludedConfigSchema } from './types.js';
 import { resolveBenchmarkQuestions } from './upstreamQuestions.js';
+import { answerWithRuntimeLedger, runtimeQuestionCacheKey } from './runtimeAnswerLedger.js';
 import {
   runTargetExcludedComparison,
   summarizeTargetExcludedComparisonReport,
@@ -806,6 +812,7 @@ export class CampaignOrchestrator {
         excludedFacts,
         config,
         excludedRoot,
+        excludedReplicates,
       );
       const comparisonValid = comparisons.length === config.replicates &&
         comparisons.every(({ valid }) => valid);
@@ -974,14 +981,36 @@ export class CampaignOrchestrator {
     classification: 'system_error' | 'real_gap' | 'uncertain';
     rationale: string;
   }): Promise<void> {
-    this.database.getCampaign(input.campaignId);
+    const campaign = this.database.getCampaign(input.campaignId);
+    const investigator = campaign.config.investigator?.enabled;
+    const evaluations = this.database.listTargetExcludedEvaluations(input.campaignId)
+      .filter((evaluation) => evaluation.excludedFacts && evaluation.judgment);
+    const config = investigator ? this.database.getTargetExcludedConfig(input.campaignId) : null;
+    const baseline = config ? this.database.getTargetExcludedEvaluation(config.baselineVariantId) : null;
+    if (investigator && evaluations.length > 0) {
+      if (!baseline?.judgment) throw new Error('investigator scoring requires the baseline excluded judgment');
+      for (const evaluation of evaluations) {
+        if (!Array.isArray(evaluation.excludedReplicateFacts) || evaluation.excludedReplicateFacts.length !== config!.replicates) {
+          throw new Error(`${evaluation.variantId}: investigator scoring requires complete raw replicate facts`);
+        }
+      }
+    }
     this.database.upsertTargetExcludedLabel({ ...input, status: 'verified' });
-    const labels = this.database.listTargetExcludedLabels(input.campaignId);
-    for (const evaluation of this.database.listTargetExcludedEvaluations(input.campaignId)) {
-      if (!evaluation.excludedFacts || !evaluation.judgment) continue;
-      this.database.updateTargetExcludedEvaluation(evaluation.variantId, {
-        score: computeScore(evaluation.excludedFacts, labels.map((label) => ({ ...label, benchmark: 'target-excluded' })), evaluation.judgment),
-      });
+    const labels = this.database.listTargetExcludedLabels(input.campaignId)
+      .map((label) => ({ ...label, benchmark: 'target-excluded' }));
+    for (const evaluation of evaluations) {
+      const score = investigator
+        ? computeReplicateMeanScore(evaluation.excludedReplicateFacts!, labels, baseline!.judgment)
+        : computeScore(evaluation.excludedFacts!, labels, evaluation.judgment);
+      if (investigator) {
+        score.cohortMismatches = [...new Set([
+          ...score.cohortMismatches,
+          ...(evaluation.score?.cohortMismatches ?? []),
+          ...(baseline?.excludedFacts && baseline.variantId !== evaluation.variantId
+            ? compareCohort(baseline.excludedFacts, evaluation.excludedFacts!) : []),
+        ])];
+      }
+      this.database.updateTargetExcludedEvaluation(evaluation.variantId, { score });
     }
     await this.refreshReports(input.campaignId);
   }
@@ -1412,6 +1441,7 @@ export class CampaignOrchestrator {
         facts,
         workflowsSource,
         path.join(root, primary.name),
+        replicateFacts,
       );
       const holdoutFacts: Record<string, RunFacts> = {};
       const holdoutReplicateFacts: Record<string, RunFacts[]> = {};
@@ -1432,6 +1462,7 @@ export class CampaignOrchestrator {
           holdout,
           workflowsSource,
           path.join(root, benchmark.name),
+          replicates,
         );
         holdoutFacts[benchmark.name] = holdout;
         holdoutReplicateFacts[benchmark.name] = replicates;
@@ -1475,24 +1506,35 @@ export class CampaignOrchestrator {
 
   async runAutomatic(campaignId: string): Promise<void> {
     await this.withCampaignLock(campaignId, async () => {
+      const investigator = this.database.getCampaign(campaignId).config.investigator?.enabled;
+      const owner = this.database.database.prepare('SELECT lease_owner FROM campaigns WHERE id = ?')
+        .get(campaignId)?.lease_owner;
+      const ownsLease = () => !investigator || Boolean(this.database.database.prepare(
+        'SELECT id FROM campaigns WHERE id = ? AND lease_owner = ? AND lease_expires_at > ?',
+      ).get(campaignId, String(owner), Date.now()));
       try {
         if (this.database.getCampaign(campaignId).config.mode !== 'automatic') {
           throw new Error('campaign mode is supervised; use round instead of auto');
         }
         while (true) {
+          if (!ownsLease()) throw new Error('investigator campaign lease lost; no new round was dispatched');
           const campaign = this.database.getCampaign(campaignId);
           const generated = this.database.listVariants(campaignId).filter((variant) => variant.round > 0);
           if (campaign.status.startsWith('stopped')) return;
-          if (generated.length >= campaign.config.limits.maxVariants) {
+          if (investigator && campaign.status === 'awaiting_review') return;
+          const resumable = investigator && generated.some((variant) => variant.investigation &&
+            ['running', 'stopped'].includes(variant.investigation.status));
+          if (generated.length >= campaign.config.limits.maxVariants && !resumable) {
             this.database.updateCampaign(campaignId, { status: 'stopped_max_variants' });
             return;
           }
           await this.runRoundUnlocked(campaignId);
+          if (!ownsLease()) throw new Error('investigator campaign lease lost; no subsequent round was dispatched');
           const current = this.database.getCampaign(campaignId);
           if (current.status.startsWith('stopped')) return;
         }
       } catch (error) {
-        this.markOperationFailed(campaignId, error);
+        if (ownsLease()) this.markOperationFailed(campaignId, error);
         throw error;
       }
     });
@@ -1524,6 +1566,7 @@ export class CampaignOrchestrator {
         baselineEvaluation,
       );
     }
+    if (campaign.config.investigator?.enabled) return await this.runInvestigatorRound(campaign);
     const diagnosisAvailable = await this.requireCurrentParentDiagnosis(campaign);
     const variants = this.database.listVariants(campaignId);
     const generatedCount = variants.filter((variant) => variant.round > 0).length;
@@ -2167,11 +2210,36 @@ export class CampaignOrchestrator {
 
   resume(campaignId: string): CampaignRecord {
     if (this.isActive(campaignId)) throw new Error('campaign is still active');
+    const leased = this.database.database.prepare(
+      'SELECT lease_owner FROM campaigns WHERE id = ? AND lease_owner IS NOT NULL AND lease_expires_at > ?',
+    ).get(campaignId, Date.now());
+    if (leased) throw new Error('campaign is leased by another coordinator; wait for lease expiry before resume');
     const campaign = this.database.getCampaign(campaignId);
     const variants = this.database.listVariants(campaignId);
+    const investigations = campaign.config.investigator?.enabled
+      ? variants.filter((variant) => variant.round > 0 && variant.investigation &&
+          ['running', 'stopped'].includes(variant.investigation.status))
+      : [];
+    // Validate every candidate before changing any persisted state. Never reconstruct a lost baseline.
+    for (const variant of investigations) {
+      const state = variant.investigation!;
+      if (!variant.worktreePath || typeof state.harnessPins?.mutationBaselineTree !== 'string' ||
+          !state.harnessPins.mutationBaselineTree || typeof state.harnessPins.contextHash !== 'string' ||
+          !state.harnessPins.contextHash || (state.turnCount > 0 && !state.sessionId)) {
+        throw new Error(`cannot resume ${variant.id}: saved session, worktree, or mutation baseline provenance is missing`);
+      }
+      if (state.actions.some((action) => action.kind === 'evaluate_primary' &&
+          (['running', 'interrupted'].includes(action.status) || (action.status === 'failed' && variant.composeProject)))) {
+        throw new Error(`cannot resume ${variant.id}: archive and reconcile the interrupted primary stack before resuming; no action was replayed`);
+      }
+      if (variant.hypothesisComplianceAttempts.length > 0) {
+        throw new Error(`cannot resume ${variant.id}: existing final compliance attempts require explicit recovery`);
+      }
+    }
     const interrupted = variants.filter(
       (variant) =>
         variant.round > 0 &&
+        !investigations.some((candidate) => candidate.id === variant.id) &&
         ['queued', 'mutating', 'gating', 'building', 'starting', 'running', 'judging'].includes(
           variant.status,
         ),
@@ -2180,6 +2248,25 @@ export class CampaignOrchestrator {
       throw new Error(
         `cannot resume with interrupted generated variants: ${interrupted.map(({ id }) => id).join(', ')}`,
       );
+    }
+    for (const variant of investigations) {
+      const state = structuredClone(variant.investigation!);
+      const timestamp = new Date().toISOString();
+      for (const action of state.actions) {
+        if (action.status !== 'running') continue;
+        action.status = 'interrupted';
+        action.completedAt = timestamp;
+        action.error = 'Coordinator interrupted. This action was not replayed; inspect archived evidence before requesting another.';
+      }
+      if (state.status === 'running' && state.turnCount > 0 &&
+          !state.actions.some((action) => action.id === `action-${String(state.turnCount).padStart(3, '0')}`)) {
+        state.agentTokens = null;
+        state.agentCostUsd = null;
+      }
+      state.status = 'stopped';
+      state.updatedAt = timestamp;
+      state.reason = 'Resuming the saved session without replaying interrupted turns or actions.';
+      this.database.updateVariant(variant.id, { investigation: state, status: 'stopped' });
     }
     const hasReview = variants.some((variant) => variant.status === 'review');
     const hasBaseline = variants.some(
@@ -2217,20 +2304,40 @@ export class CampaignOrchestrator {
     if (!campaign.config.benchmarks.some((benchmark) => benchmark.name === input.benchmark)) {
       throw new Error(`unknown benchmark: ${input.benchmark}`);
     }
+    const investigator = campaign.config.investigator?.enabled;
+    const variants = this.database.listVariants(input.campaignId);
+    if (investigator) {
+      for (const variant of variants) {
+        const primary = input.benchmark === primaryBenchmark(campaign).name;
+        const facts = primary ? variant.facts : variant.holdoutFacts?.[input.benchmark];
+        const judgment = primary ? variant.judgment : variant.holdoutJudgments?.[input.benchmark];
+        if (!facts || !judgment) continue;
+        const replicates = primary ? variant.replicateFacts : variant.holdoutReplicateFacts?.[input.benchmark];
+        if (!Array.isArray(replicates) || replicates.length !== campaign.config.evaluation.replicates) {
+          throw new Error(`${variant.id}: investigator scoring requires complete raw replicate facts for ${input.benchmark}`);
+        }
+      }
+    }
     this.database.upsertLabel({ ...input, status: 'verified' });
     const labels = this.database.listLabels(input.campaignId, input.benchmark);
-    for (const variant of this.database.listVariants(input.campaignId)) {
+    for (const variant of variants) {
       if (input.benchmark === primaryBenchmark(campaign).name) {
         if (!variant.facts || !variant.judgment) continue;
-        const score = computeScore(variant.facts, labels, variant.judgment);
-        score.cohortMismatches = variant.score?.cohortMismatches ?? [];
+        const score = investigator
+          ? computeReplicateMeanScore(variant.replicateFacts!, labels, variant.judgment)
+          : computeScore(variant.facts, labels, variant.judgment);
+        score.cohortMismatches = [...new Set([...score.cohortMismatches, ...(variant.score?.cohortMismatches ?? [])])];
         this.database.updateVariant(variant.id, { score });
       } else {
         const facts = variant.holdoutFacts?.[input.benchmark];
         const judgment = variant.holdoutJudgments?.[input.benchmark];
         if (!facts || !judgment) continue;
-        const score = computeScore(facts, labels, judgment);
-        score.cohortMismatches = variant.holdoutScores?.[input.benchmark]?.cohortMismatches ?? [];
+        const score = investigator
+          ? computeReplicateMeanScore(variant.holdoutReplicateFacts![input.benchmark]!, labels, judgment)
+          : computeScore(facts, labels, judgment);
+        score.cohortMismatches = [...new Set([
+          ...score.cohortMismatches, ...(variant.holdoutScores?.[input.benchmark]?.cohortMismatches ?? []),
+        ])];
         this.database.updateVariant(variant.id, {
           holdoutScores: { ...(variant.holdoutScores ?? {}), [input.benchmark]: score },
         });
@@ -2298,6 +2405,303 @@ export class CampaignOrchestrator {
     };
   }
 
+  private async runInvestigatorRound(campaign: CampaignRecord): Promise<VariantRecord[]> {
+    const owner = this.database.database.prepare('SELECT lease_owner FROM campaigns WHERE id = ?')
+      .get(campaign.id)?.lease_owner;
+    const assertLease = () => {
+      if (!owner || !this.database.database.prepare(
+        'SELECT id FROM campaigns WHERE id = ? AND lease_owner = ? AND lease_expires_at > ?',
+      ).get(campaign.id, String(owner), Date.now())) {
+        throw new Error('investigator campaign lease lost; no further candidate or promotion was dispatched');
+      }
+    };
+    assertLease();
+    const variants = this.database.listVariants(campaign.id);
+    let candidates = variants.filter((variant) => variant.investigation &&
+      ['running', 'stopped'].includes(variant.investigation.status));
+    if (candidates.length === 0) {
+      const remaining = campaign.config.limits.maxVariants - variants.filter((variant) => variant.round > 0).length;
+      const count = Math.min(campaign.config.limits.concurrency, remaining);
+      if (count <= 0) throw new Error('campaign reached maxVariants');
+      const round = Math.max(...variants.map((variant) => variant.round), 0) + 1;
+      let ordinal = Math.max(...variants.map((variant) => variant.ordinal), 0);
+      candidates = Array.from({ length: count }, (_, index) => this.database.createVariant({
+        id: nextVariantIdentity(campaign, this.database.listVariants(campaign.id)),
+        campaignId: campaign.id, parentVariantId: campaign.currentParentVariantId,
+        round, ordinal: ++ordinal,
+        hypothesis: {
+          title: `Source-grounded investigation ${index + 1}`,
+          rationale: 'Investigate the measured parent against the complete campaign objective supplied in the investigator context.',
+          instructions: 'Investigate the measured parent, challenge its diagnosis, and develop one generic, testable treatment. Preregister the actual hypothesis before each evaluation.',
+          expectedImpact: 'A source-supported improvement in primary provisional decision accuracy, not merely fewer builds.',
+          risk: 'Provisional labels and provider variation can mislead. Preserve counterevidence and abandon unsupported mechanisms.',
+          findingIds: [], assumptions: ['At least one observed failure is addressable by a generic planner change.'],
+        },
+      }));
+    }
+    for (const candidate of candidates) {
+      assertLease();
+      const state = candidate.investigation;
+      if (!state) continue;
+      if (!candidate.worktreePath || !(await stat(candidate.worktreePath).catch(() => null))?.isDirectory() ||
+          typeof state.harnessPins?.mutationBaselineTree !== 'string' || !state.harnessPins.mutationBaselineTree ||
+          (state.turnCount > 0 && !state.sessionId)) {
+        throw new Error(`cannot resume ${candidate.id}: saved session, worktree, or mutation baseline is missing; no worktree was recreated`);
+      }
+      if (state.actions.some((action) => action.kind === 'evaluate_primary' &&
+          (['running', 'interrupted'].includes(action.status) || (action.status === 'failed' && candidate.composeProject)))) {
+        throw new Error(`cannot resume ${candidate.id}: archive and reconcile the interrupted primary stack first`);
+      }
+      const directory = path.join(variantArtifactDirectory(this.paths, campaign.id, candidate.id),
+        'investigation', `resume-${randomUUID()}`);
+      await mkdir(directory, { recursive: true });
+      // Capture through a temporary index and verify the persisted baseline; never stage on resume.
+      await captureMutationDiff(campaign, candidate, candidate.worktreePath, directory, state.harnessPins.mutationBaselineTree);
+      await captureAndGateDiff(campaign, candidate, candidate.worktreePath, directory);
+    }
+    assertLease();
+    if (this.database.getCampaign(campaign.id).status === 'stopped_by_user') return candidates;
+    this.database.updateCampaign(campaign.id, { status: `running_round_${candidates[0]!.round}` });
+    await this.refreshReports(campaign.id);
+    const results = await Promise.all(candidates.map((candidate) => {
+      assertLease();
+      if (this.database.getCampaign(campaign.id).status === 'stopped_by_user') return candidate;
+      return this.runVariant(campaign, candidate, true);
+    }));
+    assertLease();
+    if (this.database.getCampaign(campaign.id).status === 'stopped_by_user') return results;
+    if (results.some((variant) => variant.status === 'failed' || variant.investigation?.status === 'failed')) {
+      this.database.updateCampaign(campaign.id, { status: 'stopped_investigator_failed' });
+      await this.refreshReports(campaign.id);
+      return results;
+    }
+    if (results.some((variant) => variant.investigation && ['running', 'stopped'].includes(variant.investigation.status))) {
+      this.database.updateCampaign(campaign.id, { status: 'stopped_investigator_incomplete' });
+      await this.refreshReports(campaign.id);
+      return results;
+    }
+    const targetConfig = this.database.getTargetExcludedConfig(campaign.id);
+    const eligible = results.filter((variant) => variant.status === 'review' && variant.score &&
+      !variant.score.cohortMismatches.includes('requirement units') &&
+      variant.diagnosisStatus === 'completed' && variant.diagnosisInputHash &&
+      variant.investigation?.status === 'finalized' &&
+      variant.artifactCollectionComplete && variant.hypothesisComplianceStatus === 'passed' &&
+      (!targetConfig || this.targetExcludedEvaluationReady(campaign, targetConfig,
+        this.database.getTargetExcludedEvaluation(variant.id), false)))
+      .sort((left, right) => compareScores(left.score!, right.score!));
+    if (eligible.length && campaign.config.mode === 'automatic' &&
+        await this.promoteFirstEligibleAutomaticCandidate(campaign.id, eligible)) {
+      await this.refreshReports(campaign.id);
+      return results;
+    }
+    const generated = this.database.listVariants(campaign.id).filter((variant) => variant.round > 0).length;
+    this.database.updateCampaign(campaign.id, {
+      status: eligible.length && campaign.config.mode !== 'automatic' ? 'awaiting_review'
+        : generated >= campaign.config.limits.maxVariants ? 'stopped_max_variants' : 'ready',
+    });
+    await this.refreshReports(campaign.id);
+    return results;
+  }
+
+  private async runInvestigatorCandidate(
+    campaign: CampaignRecord,
+    initialVariant: VariantRecord,
+    worktree: string,
+    artifactDirectory: string,
+    mutationBaselineTree: string,
+  ): Promise<VariantRecord> {
+    const limits = campaign.config.investigator!;
+    const parent = this.database.getVariant(initialVariant.parentVariantId!);
+    const primary = primaryBenchmark(campaign);
+    const trustedPlanner = await this.ensureFrozenPlannerSource(campaign);
+    const workflowsSource = await this.ensureFrozenWorkflowsSource(campaign);
+    const contextPath = path.join(artifactDirectory, 'investigator-context.json');
+    const referencePath = path.join(artifactDirectory, 'investigator-reference.json');
+    const labels = this.database.listLabels(campaign.id, primary.name);
+    if (!(await stat(contextPath).catch(() => null))) {
+      await writeFile(referencePath, `${JSON.stringify({ labels, labelSetHash: canonicalHash(labels), baseline: {
+        id: parent.id, facts: parent.facts, replicateFacts: parent.replicateFacts,
+      } }, null, 2)}\n`, { flag: 'wx' });
+      await writeFile(contextPath, `${JSON.stringify({
+        goal: campaign.config.goal,
+        authority: 'Measurements are observations; labels and diagnosis are unverified model judgments. You may challenge or replace any diagnosis intervention.',
+        primary, labelSetHash: canonicalHash(labels), referencePath,
+        baseline: { id: parent.id, decisions: parent.facts?.decisions, evidence: parent.facts?.evidence, score: parent.score },
+        diagnosis: parent.diagnosis,
+        artifacts: {
+          parent: variantArtifactDirectory(this.paths, campaign.id, parent.id),
+          current: artifactDirectory, workflowsSource,
+          priorExperiments: this.database.listVariants(campaign.id).map((variant) => ({
+            id: variant.id, hypothesis: variant.hypothesis, error: variant.error,
+            investigation: variant.investigation ? { status: variant.investigation.status, reason: variant.investigation.reason,
+              actions: variant.investigation.actions.map(({ id, kind, status, error }) => ({ id, kind, status, error })) } : null, score: variant.score,
+            directory: variantArtifactDirectory(this.paths, campaign.id, variant.id),
+          })),
+        },
+        measurementPolicy: 'Primary labels are frozen for these trials. Runtime question answers and decision context may differ: inspect question audits and never claim controlled replay unless the context matches. Catalyst is regression data, not an unseen holdout.',
+      }, null, 2)}\n`, { flag: 'wx' });
+    }
+    const contextHash = await sha256File(contextPath);
+    const referenceHash = await sha256File(referencePath);
+    const reference = JSON.parse(await readFile(referencePath, 'utf8')) as {
+      labels: typeof labels; labelSetHash: string; baseline: { replicateFacts: RunFacts[] | null; facts: RunFacts | null };
+    };
+    if (!reference.baseline.replicateFacts?.length) throw new Error('investigator requires archived parent replicates');
+    const startedAt = new Date().toISOString();
+    const executionHarnessPins = {
+      revision: (await runCommand('git', ['rev-parse', 'HEAD'])).stdout.trim(),
+      dirtyPatchHash: canonicalHash((await runCommand('git', ['diff', 'HEAD', '--', 'src', 'public'])).stdout),
+      runtimeSourceHash: canonicalHash(await Promise.all((await readdir(path.resolve('src'))).filter((name) => name.endsWith('.ts')).sort().map(async (name) => [name, await sha256File(path.resolve('src', name))]))),
+    };
+    let state: InvestigationState = initialVariant.investigation ?? {
+      schemaVersion: 1, sessionId: null, status: 'running', startedAt, updatedAt: startedAt,
+      turnCount: 0, agentTokens: 0, agentCostUsd: 0, reason: null, actions: [],
+      harnessPins: {
+        ...executionHarnessPins,
+        contextHash, referenceHash, mutationBaselineTree, labelSetHash: reference.labelSetHash,
+      },
+    };
+    if (state.harnessPins?.contextHash !== contextHash) throw new Error('investigator context was modified');
+    if (state.harnessPins?.referenceHash !== referenceHash) throw new Error('investigator score reference was modified');
+    this.database.addEvent(campaign.id, initialVariant.id, 'investigator.coordinator_started', {
+      ...executionHarnessPins, sessionId: state.sessionId, turnCount: state.turnCount, contextHash, referenceHash,
+    });
+    const leaseOwner = this.database.database.prepare('SELECT lease_owner FROM campaigns WHERE id = ?').get(campaign.id)?.lease_owner;
+    const assertActive = () => {
+      if (leaseOwner && !this.database.database.prepare('SELECT id FROM campaigns WHERE id = ? AND lease_owner = ? AND lease_expires_at > ?').get(campaign.id, String(leaseOwner), Date.now())) {
+        throw new Error('investigator coordinator lease lost; no further actions admitted');
+      }
+    };
+    const save = (next: InvestigationState) => {
+      state = next;
+      this.database.updateVariant(initialVariant.id, { investigation: next });
+      this.database.addEvent(campaign.id, initialVariant.id, 'investigator.updated', {
+        status: next.status, turnCount: next.turnCount, actionId: next.actions.at(-1)?.id,
+      });
+    };
+    const runner = new AgentRunner(campaign);
+    const completed = await runInvestigatorLoop(state, limits, {
+      save,
+      assertActive,
+      stopped: () => this.database.getCampaign(campaign.id).status === 'stopped_by_user',
+      turn: async (current, feedback, onSession) => {
+        this.database.updateVariant(initialVariant.id, { status: 'mutating' });
+        return await runner.investigate(this.database.getVariant(initialVariant.id), worktree,
+          artifactDirectory, contextPath, current, feedback, onSession);
+      },
+      execute: async (action, record, current) => {
+        const directory = path.join(artifactDirectory, 'investigation', record.id);
+        await mkdir(directory, { recursive: true });
+        const relativeDirectory = path.relative(artifactDirectory, directory);
+        await writeFile(path.join(directory, 'request.json'), `${JSON.stringify(action, null, 2)}\n`, { flag: 'wx' });
+        const variant = this.database.updateVariant(initialVariant.id, {
+          hypothesis: action.hypothesis, status: 'gating',
+          hypothesisComplianceStatus: 'not_required', hypothesisCompliance: null,
+          hypothesisComplianceResultHash: null, hypothesisComplianceError: null,
+        });
+        let candidateHash: string | null = null;
+        try {
+          if ((await sha256File(contextPath)) !== contextHash || (await sha256File(referencePath)) !== referenceHash) throw new Error('investigator modified frozen context or score reference');
+          const treatment = await captureMutationDiff(campaign, variant, worktree, directory, mutationBaselineTree);
+          const candidate = await captureAndGateDiff(campaign, variant, worktree, directory);
+          candidateHash = await sha256File(candidate.patchPath);
+          record.patchHash = candidateHash;
+          record.artifactDirectory = relativeDirectory;
+          save({ ...current, actions: current.actions.map((item) => item.id === record.id ? { ...record } : item) });
+          this.database.updateVariant(variant.id, { patchPath: candidate.patchPath, patchHash: candidateHash });
+          if (action.action !== 'abandon' && treatment.result.changedFiles.length === 0) throw new Error('No treatment beyond inherited parent. Make a bounded change or abandon.');
+          if (action.action === 'abandon') {
+            const receipt = { patchHash: candidateHash, artifactDirectory: relativeDirectory, result: { reason: action.rationale } };
+            await writeFile(path.join(directory, 'receipt.json'), `${JSON.stringify(receipt, null, 2)}\n`, { flag: 'wx' });
+            return receipt;
+          }
+          const prior = current.actions.slice(0, -1);
+          if (action.action === 'evaluate_primary' && !prior.some((item) => item.kind === 'test' && item.status === 'completed' && item.patchHash === candidateHash)) {
+            throw new Error('Request trusted tests for this exact patch before primary evaluation.');
+          }
+          const evaluatedTrial = prior.findLast((item) => item.kind === 'evaluate_primary' && item.status === 'completed' && item.patchHash === candidateHash && canonicalHash(item.hypothesis) === canonicalHash(action.hypothesis));
+          if (action.action === 'finalize' && !evaluatedTrial) {
+            throw new Error('Finalize requires a completed primary evaluation of this exact patch and preregistered hypothesis. Test/evaluate revised patches first.');
+          }
+          this.database.updateVariant(variant.id, { status: 'building' });
+          const built = await buildVariantImage(campaign, variant, worktree, directory, trustedPlanner);
+          const imageId = (await runCommand('docker', ['image', 'inspect', '--format', '{{.Id}}', built.imageTag])).stdout.trim();
+          await writeFile(path.join(directory, 'pins.json'), `${JSON.stringify({ hypothesis: action.hypothesis, candidateHash, treatmentHash: await sha256File(treatment.patchPath), contextHash, imageId, harness: { ...state.harnessPins, ...executionHarnessPins } }, null, 2)}\n`, { flag: 'wx' });
+          let result: unknown;
+          if (action.action === 'test' || action.action === 'finalize') {
+            this.database.updateVariant(variant.id, { status: 'gating' });
+            result = await runInvestigatorTests(campaign, built.testImageTag, directory, built.environment,
+              action.action === 'test' ? action.testFiles : undefined);
+          }
+          if (action.action === 'evaluate_primary') {
+            const target = this.database.getTargetExcludedConfig(campaign.id);
+            const resolved = target?.protocol === 'standard-primary-v2'
+              ? await this.resolveV2PrimaryBenchmark(campaign, primary, target.targetImplementationWorkflow, path.join(directory, 'questions'))
+              : await resolveBenchmarkQuestions({ campaign, benchmark: primary, workflowsSource, sharedDirectory: path.join(campaignDirectory(this.paths, campaign.id), 'resolved-packs'), artifactDirectory: path.join(directory, 'questions') });
+            let stack: StackHandle | null = null;
+            try {
+              stack = await startVariantStack(this.paths, campaign, variant, worktree, directory, built.imageTag, built.environment, trustedPlanner, `investigation-${record.id}`);
+              this.database.updateVariant(variant.id, { status: 'running', composeProject: stack.composeProject, baseUrl: stack.baseUrl });
+              const runs = await this.runBenchmarkReplicates(campaign, variant, stack, resolved.benchmark,
+                stack.environment.PLANNER_EVAL_API_TOKEN || stack.environment.PLANNER_API_TOKEN,
+                { replicateCount: limits.primaryReplicates ?? 1,
+                  ...(target ? { answerSourceTargetWorkflow: target.targetImplementationWorkflow } : {}) });
+              const score = computeReplicateMeanScore(runs.replicates, reference.labels, null);
+              score.cohortMismatches = [...new Set([...score.cohortMismatches, ...compareCohort(reference.baseline.facts!, runs.facts)])];
+              result = {
+                score, baselineScore: computeReplicateMeanScore(reference.baseline.replicateFacts!, reference.labels, null),
+                facts: runs.facts, replicateFacts: runs.replicates, labelSetHash: reference.labelSetHash,
+                questions: runs.questions,
+                comparisonNotes: ['Scores use frozen provisional labels and raw-replicate means.', 'Runtime answers and decision-set hashes can vary; this is a development trial, not fixed-evidence replay.'],
+                transitions: runs.facts.units.filter((unit) => reference.baseline.facts?.units.find((before) => before.key === unit.key)?.decision !== unit.decision).map((unit) => ({
+                  key: unit.key, before: reference.baseline.facts?.units.find((before) => before.key === unit.key)?.decision,
+                  after: unit.decision, expected: reference.labels.find((label) => label.unitKey === unit.key)?.expectedDecision,
+                  rationale: unit.rationale, sourceRefs: unit.sourceRefs,
+                })),
+              };
+            } finally {
+              if (stack) {
+                let collected = false;
+                try { await collectStackArtifacts(stack); collected = true; }
+                finally { await stopVariantStack(stack, collected); }
+              }
+            }
+          }
+          if (action.action === 'finalize') {
+            const finalContext = path.join(artifactDirectory, 'mutation-context.json');
+            await writeFile(finalContext, `${JSON.stringify({
+              kind: 'ainative-planner-eval/mutation-context', schemaVersion: 1,
+              interpretationPolicy: 'Investigator-owned preregistration. Historical diagnosis is advisory, not a mandatory intervention.',
+              parentVariantId: parent.id, explicitMissingParentOptOut: true, selectedFindings: [], citedEvidence: [],
+              hypothesis: action.hypothesis,
+              trustedTestResult: result,
+              evaluatedTrial,
+            }, null, 2)}\n`);
+            const rootTreatment = await captureMutationDiff(campaign, variant, worktree, artifactDirectory, mutationBaselineTree);
+            const rootCandidate = await captureAndGateDiff(campaign, variant, worktree, artifactDirectory);
+            await this.runHypothesisCompliance(campaign, this.database.getVariant(variant.id), worktree, artifactDirectory,
+              finalContext, rootTreatment.patchPath, rootCandidate.patchPath, await sha256File(finalContext), mutationBaselineTree);
+            this.database.updateVariant(variant.id, { patchPath: rootCandidate.patchPath, patchHash: await sha256File(rootCandidate.patchPath) });
+            result = { passed: true, tests: result, compliance: this.database.getVariant(variant.id).hypothesisCompliance };
+          }
+          const returned = { patchHash: candidateHash, artifactDirectory: relativeDirectory, result };
+          await writeFile(path.join(directory, 'receipt.json'), `${JSON.stringify(returned, null, 2)}\n`, { flag: 'wx' });
+          return returned;
+        } catch (error) {
+          await writeFile(path.join(directory, 'failure.json'), `${JSON.stringify({ patchHash: candidateHash, error: errorMessage(error) }, null, 2)}\n`, { flag: 'wx' });
+          record.patchHash = candidateHash;
+          record.artifactDirectory = relativeDirectory;
+          throw new Error(`${errorMessage(error)}\nArtifacts: ${relativeDirectory}`);
+        }
+      },
+    });
+    return this.database.updateVariant(initialVariant.id, {
+      investigation: completed,
+      status: completed.status === 'finalized' ? 'gating' : completed.status === 'stopped' ? 'mutating' : 'rejected',
+      error: completed.reason,
+    });
+  }
+
   private async runVariant(
     campaign: CampaignRecord,
     initialVariant: VariantRecord,
@@ -2341,7 +2745,9 @@ export class CampaignOrchestrator {
           patchHash: parentPatchHash,
         });
       }
-      const worktree = await prepareVariantWorktree(
+      const worktree = campaign.config.investigator?.enabled && variant.investigation && variant.worktreePath
+        ? variant.worktreePath
+        : await prepareVariantWorktree(
         this.paths,
         campaign,
         variant,
@@ -2349,7 +2755,13 @@ export class CampaignOrchestrator {
         parentPatchHash,
       );
       variant = this.database.updateVariant(variant.id, { worktreePath: worktree });
-      if (mutate) {
+      if (mutate && campaign.config.investigator?.enabled) {
+        const recordedIndex = variant.investigation?.harnessPins?.mutationBaselineTree;
+        mutationBaselineTree = typeof recordedIndex === 'string' ? recordedIndex : await stageMutationBaseline(worktree);
+        variant = await this.runInvestigatorCandidate(campaign, variant, worktree, artifactDirectory, mutationBaselineTree);
+        if (variant.investigation?.status !== 'finalized') return variant;
+      }
+      if (mutate && !campaign.config.investigator?.enabled) {
         mutationBaselineTree = await stageMutationBaseline(worktree);
         const parent = variant.parentVariantId
           ? this.database.getVariant(variant.parentVariantId)
@@ -2401,7 +2813,7 @@ export class CampaignOrchestrator {
         );
         variant = this.database.updateVariant(variant.id, { status: 'gating' });
       }
-      if (mutate) {
+      if (mutate && !campaign.config.investigator?.enabled) {
         if (!mutationContextPath) throw new Error('mutation context is unavailable for compliance');
         if (!mutationContextSha256) throw new Error('mutation context hash is unavailable for compliance');
         variant = await this.runMutationComplianceAttempts(
@@ -2796,6 +3208,7 @@ export class CampaignOrchestrator {
         facts,
         workflowsSource,
         path.join(artifactDirectory, primary.name),
+        primaryRuns.replicates,
       );
       const holdoutJudgments: Record<string, JudgeOutput> = {};
       const holdoutScores: Record<string, NonNullable<VariantRecord['score']>> = {};
@@ -2809,6 +3222,7 @@ export class CampaignOrchestrator {
           holdout,
           workflowsSource,
           path.join(artifactDirectory, benchmark.name),
+          holdoutReplicateFacts[benchmark.name],
         );
         holdoutJudgments[benchmark.name] = evaluation.judgment;
         holdoutScores[benchmark.name] = evaluation.score;
@@ -2822,6 +3236,7 @@ export class CampaignOrchestrator {
             targetExcludedRuns.facts,
             targetConfig,
             path.join(artifactDirectory, 'target-excluded', 'excluded', targetPair?.benchmark.name ?? primary.name),
+            targetExcludedRuns.replicates,
           );
           const baselineEvaluation = this.database.getTargetExcludedEvaluation(
             targetConfig.baselineVariantId,
@@ -3691,22 +4106,31 @@ export class CampaignOrchestrator {
         campaign.config.limits.phase2TimeoutMs,
         benchmark.sha256,
         async ({ question, consultations }) =>
-          await this.answerRuntimeQuestion(
-            campaign,
-            question,
-            consultations,
-            workflowsSource,
-            path.join(directory, 'questions'),
-            answerCache,
-            options.answerSourceTargetWorkflow
-              ? {
-                  targetWorkflow: options.answerSourceTargetWorkflow,
-                  variantId: variant.id,
-                  benchmark: executionBenchmark,
-                  replicate,
-                }
-              : undefined,
-          ),
+          await answerWithRuntimeLedger({
+            campaign, benchmark, database: this.database,
+            campaignDirectory: campaignDirectory(this.paths, campaign.id),
+            artifactDirectory: directory, variantId: variant.id, executionBenchmark, replicate,
+            question, requirementsAgentRequests: matchQuestionConsultations(consultations, question).length,
+            targetWorkflow: options.answerSourceTargetWorkflow,
+            selectOption: selectedOptionIdForAnswer,
+            resolve: () => this.answerRuntimeQuestion(
+              campaign,
+              question,
+              consultations,
+              workflowsSource,
+              path.join(directory, 'questions'),
+              // The campaign ledger owns investigator reuse; fresh entries retain original provenance.
+              campaign.config.investigator?.enabled ? new Map() : answerCache,
+              options.answerSourceTargetWorkflow
+                ? {
+                    targetWorkflow: options.answerSourceTargetWorkflow,
+                    variantId: variant.id,
+                    benchmark: executionBenchmark,
+                    replicate,
+                  }
+                : undefined,
+            ),
+          }),
         async (snapshot) => {
           const updatedAtMs = Date.now();
           latestSnapshot = {
@@ -3824,18 +4248,7 @@ export class CampaignOrchestrator {
   ): Promise<Phase2QuestionAnswer> {
     await mkdir(artifactDirectory, { recursive: true });
     const consultationRecords = matchQuestionConsultations(consultations, question);
-    const cacheKey = JSON.stringify({
-      responseKind: question.responseKind,
-      prompt: question.prompt,
-      type: question.type,
-      ownerRole: question.ownerRole,
-      coverageIds: question.coverageIds,
-      options: question.options?.map(({ label, description, consequences }) => ({
-        label,
-        description: description ?? null,
-        consequences: consequences ?? null,
-      })),
-    });
+    const cacheKey = runtimeQuestionCacheKey(question);
     const cacheAnswer = (value: Phase2QuestionAnswer): CachedRuntimeAnswer => {
       const selectedOptionIndex = value.selectedOptionId
         ? question.options?.findIndex(({ id }) => id === value.selectedOptionId) ?? -1
@@ -4355,6 +4768,7 @@ export class CampaignOrchestrator {
         excluded.facts,
         config,
         path.join(artifactDirectory, 'excluded', primary.name),
+        excluded.replicates,
       );
       const comparisonValid =
         comparisons.length === config.replicates &&
@@ -4436,7 +4850,17 @@ export class CampaignOrchestrator {
     facts: RunFacts,
     config: TargetExcludedConfig,
     artifactDirectory: string,
+    replicates?: readonly RunFacts[] | null,
   ): Promise<{ judgment: JudgeOutput; score: NonNullable<VariantRecord['score']> }> {
+    const investigator = campaign.config.investigator?.enabled;
+    if (investigator && (!Array.isArray(replicates) || replicates.length !== config.replicates)) {
+      throw new Error('investigator scoring requires complete raw replicate facts for target-excluded');
+    }
+    const baseline = investigator
+      ? this.database.getTargetExcludedEvaluation(config.baselineVariantId) : null;
+    if (investigator && variant.id !== config.baselineVariantId && !baseline?.judgment) {
+      throw new Error('investigator scoring requires the baseline excluded judgment');
+    }
     const workflowsSource = await this.ensureTargetExcludedWorkflowsSource(
       campaign,
       config.targetImplementationWorkflow,
@@ -4462,7 +4886,50 @@ export class CampaignOrchestrator {
     const labels = this.database
       .listTargetExcludedLabels(campaign.id)
       .map((label) => ({ ...label, benchmark: `${benchmark.name}:target-excluded` }));
-    return { judgment, score: computeScore(facts, labels, judgment) };
+    const referenceJudgment = investigator && variant.id !== config.baselineVariantId
+      ? baseline!.judgment! : judgment;
+    const score = investigator
+      ? computeReplicateMeanScore(replicates!, labels, referenceJudgment)
+      : computeScore(facts, labels, judgment);
+    if (investigator && baseline?.excludedFacts && variant.id !== config.baselineVariantId) {
+      score.cohortMismatches = [...new Set([
+        ...score.cohortMismatches, ...compareCohort(baseline.excludedFacts, facts),
+      ])];
+    }
+    const decisionSetHashes = (replicates ?? []).map((run) =>
+      typeof run.pins.decisionSetHash === 'string' ? run.pins.decisionSetHash : null);
+    const baselineDecisionSetHashes = (baseline?.excludedReplicateFacts ?? []).map((run) =>
+      typeof run.pins.decisionSetHash === 'string' ? run.pins.decisionSetHash : null);
+    const decisionSetHashVariation = new Set(
+      [...decisionSetHashes, ...baselineDecisionSetHashes].filter((hash) => hash !== null),
+    ).size > 1;
+    const comparison = {
+      mismatches: score.cohortMismatches,
+      decisionSetHashes,
+      baselineDecisionSetHashes,
+      decisionSetHashVariation,
+      notes: [
+        'Runtime answers are not globally frozen; input-cohort equality does not establish identical answers.',
+        ...(decisionSetHashVariation ? ['Decision-set hashes vary across the compared runs.'] : []),
+      ],
+    };
+    await Promise.all([
+      writeFile(path.join(artifactDirectory, 'cohort-comparison.json'), `${JSON.stringify(comparison, null, 2)}\n`),
+      writeFile(path.join(artifactDirectory, 'score-basis.json'), `${JSON.stringify({
+        schemaVersion: 1,
+        metricMode: investigator ? 'replicate-mean' : 'consensus',
+        benchmark: `${benchmark.name}:target-excluded`,
+        labelHash: canonicalHash(labels),
+        labels,
+        referenceJudgmentVariantId: investigator ? config.baselineVariantId : variant.id,
+        referenceJudgmentHash: canonicalHash(referenceJudgment),
+        referenceJudgment,
+        replicateCount: investigator ? replicates!.length : facts.sampleSize,
+        score,
+        comparison,
+      }, null, 2)}\n`),
+    ]);
+    return { judgment, score };
   }
 
   private async runHoldouts(
@@ -4513,6 +4980,7 @@ export class CampaignOrchestrator {
           holdoutFacts[benchmark.name]!,
           workflowsSource,
           path.join(directory, benchmark.name),
+          holdoutReplicateFacts[benchmark.name],
         );
         holdoutJudgments[benchmark.name] = evaluation.judgment;
         holdoutScores[benchmark.name] = evaluation.score;
@@ -4555,7 +5023,12 @@ export class CampaignOrchestrator {
     facts: RunFacts,
     workflowsSource: string,
     artifactDirectory: string,
+    replicates?: readonly RunFacts[] | null,
   ): Promise<{ judgment: JudgeOutput; score: NonNullable<VariantRecord['score']> }> {
+    const investigator = campaign.config.investigator?.enabled;
+    if (investigator && (!Array.isArray(replicates) || replicates.length !== campaign.config.evaluation.replicates)) {
+      throw new Error(`investigator scoring requires complete raw replicate facts for ${benchmark.name}`);
+    }
     const factsPath = path.join(artifactDirectory, 'facts.json');
     const judgment = await new AgentRunner(campaign).judge(
       variant,
@@ -4586,11 +5059,10 @@ export class CampaignOrchestrator {
         status: 'suggested',
       });
     }
-    const score = computeScore(
-      facts,
-      this.database.listLabels(campaign.id, benchmark.name),
-      judgment,
-    );
+    const labels = this.database.listLabels(campaign.id, benchmark.name);
+    const score = investigator
+      ? computeReplicateMeanScore(replicates!, labels, judgment)
+      : computeScore(facts, labels, judgment);
     const baseline = this.database
       .listVariants(campaign.id)
       .filter((candidate) => candidate.round === 0 && candidate.facts)
@@ -4598,13 +5070,45 @@ export class CampaignOrchestrator {
     const baselineFacts = benchmark.role === 'primary'
       ? baseline?.facts
       : baseline?.holdoutFacts?.[benchmark.name];
-    score.cohortMismatches = baselineFacts && baseline?.id !== variant.id
-      ? compareCohort(baselineFacts, facts)
-      : [];
-    await writeFile(
-      path.join(artifactDirectory, 'cohort-comparison.json'),
-      `${JSON.stringify({ mismatches: score.cohortMismatches }, null, 2)}\n`,
-    );
+    score.cohortMismatches = [...new Set([
+      ...score.cohortMismatches,
+      ...(baselineFacts && baseline?.id !== variant.id ? compareCohort(baselineFacts, facts) : []),
+    ])];
+    const baselineReplicates = benchmark.role === 'primary'
+      ? baseline?.replicateFacts : baseline?.holdoutReplicateFacts?.[benchmark.name];
+    const decisionSetHashes = (replicates ?? []).map((run) =>
+      typeof run.pins.decisionSetHash === 'string' ? run.pins.decisionSetHash : null);
+    const baselineDecisionSetHashes = (baselineReplicates ?? []).map((run) =>
+      typeof run.pins.decisionSetHash === 'string' ? run.pins.decisionSetHash : null);
+    const decisionSetHashVariation = new Set(
+      [...decisionSetHashes, ...baselineDecisionSetHashes].filter((hash) => hash !== null),
+    ).size > 1;
+    const comparison = {
+      mismatches: score.cohortMismatches,
+      decisionSetHashes,
+      baselineDecisionSetHashes,
+      decisionSetHashVariation,
+      notes: [
+        'Runtime answers are not globally frozen; input-cohort equality does not establish identical answers.',
+        ...(decisionSetHashVariation ? ['Decision-set hashes vary across the compared runs.'] : []),
+      ],
+    };
+    await Promise.all([
+      writeFile(path.join(artifactDirectory, 'cohort-comparison.json'), `${JSON.stringify(comparison, null, 2)}\n`),
+      writeFile(path.join(artifactDirectory, 'score-basis.json'), `${JSON.stringify({
+        schemaVersion: 1,
+        metricMode: investigator ? 'replicate-mean' : 'consensus',
+        benchmark: benchmark.name,
+        labelHash: canonicalHash(labels),
+        labels,
+        referenceJudgmentVariantId: variant.id,
+        referenceJudgmentHash: canonicalHash(judgment),
+        referenceJudgment: judgment,
+        replicateCount: investigator ? replicates!.length : facts.sampleSize,
+        score,
+        comparison,
+      }, null, 2)}\n`),
+    ]);
     return { judgment, score };
   }
 

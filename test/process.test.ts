@@ -13,3 +13,19 @@ test('runCommand reports nonzero exits', async () => {
     /command failed \(3\)/,
   );
 });
+
+test('runCommand streams complete stdout separately from bounded capture and stderr', async () => {
+  const chunks: Buffer[] = [];
+  const result = await runCommand(process.execPath, ['-e',
+    'process.stdout.write("x".repeat(6 * 1024 * 1024) + "FINAL"); process.stderr.write("error");',
+  ], { onStdout: (chunk) => { chunks.push(chunk); } });
+  assert.equal(result.stdout.length, 5 * 1024 * 1024);
+  assert.equal(Buffer.concat(chunks).toString(), 'x'.repeat(6 * 1024 * 1024) + 'FINAL');
+  assert.equal(result.stderr, 'error');
+});
+
+test('runCommand rejects streaming callback failures without an uncaught exception', async () => {
+  await assert.rejects(runCommand(process.execPath, ['-e',
+    'process.stdout.write("start"); setInterval(() => {}, 1000);',
+  ], { timeoutMs: 1_000, onStdout: () => { throw new Error('stream consumer failed'); } }), /stream consumer failed/);
+});

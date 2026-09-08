@@ -321,12 +321,22 @@ function forbiddenDiffAdditions(diff: string): Array<{ file: string; line: strin
   return matches;
 }
 
+function protectedExecutionPath(file: string): boolean {
+  return file.split('/').some((part) =>
+    /^(?:node_modules|\.git|\.github|\.husky|\.yarn|scripts|docker|infrastructure)$/i.test(part) ||
+    /^(?:package(?:-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-(?:lock\.yaml|workspace\.yaml)|\.npmrc|\.yarnrc(?:\.yml)?|\.pnp\..+|\.pnpmfile\..+)$/i.test(part) ||
+    /^(?:Dockerfile(?:\..+)?|.+\.dockerfile|(?:docker-)?compose(?:\..+)?\.ya?ml|\.dockerignore|\.git(?:attributes|ignore|modules)|\.env(?:\..+)?)$/i.test(part) ||
+    /^(?:[jt]sconfig(?:\..+)?\.json|(?:vite|vitest|webpack|rollup|esbuild|babel|jest|eslint|playwright)\.config\..+)$/i.test(part),
+  );
+}
+
 export async function captureAndGateDiff(
   campaign: CampaignRecord,
   _variant: VariantRecord,
   worktree: string,
   artifactDirectory: string,
 ): Promise<{ patchPath: string; result: DiffGateResult }> {
+  const patchPath = path.join(artifactDirectory, 'variant.patch');
   const temporaryIndex = await temporaryDiffIndex(worktree);
   let patch: Awaited<ReturnType<typeof runCommand>>;
   let names: Awaited<ReturnType<typeof runCommand>>;
@@ -347,20 +357,28 @@ export async function captureAndGateDiff(
         env: temporaryIndex.environment,
       }),
     ]);
+    if (Buffer.byteLength(patch.stdout) > campaign.config.limits.maxPatchBytes) {
+      throw new Error(`patch exceeds ${campaign.config.limits.maxPatchBytes} bytes`);
+    }
+    await writeFile(patchPath, patch.stdout);
+    await runCommand('git', gitDiffArguments('--check', '--no-ext-diff', 'HEAD'), {
+      cwd: worktree,
+      env: temporaryIndex.environment,
+      logPath: path.join(artifactDirectory, 'diff-check.log'),
+    });
   } finally {
     await temporaryIndex.dispose();
   }
-  const patchPath = path.join(artifactDirectory, 'variant.patch');
-  if (Buffer.byteLength(patch.stdout) > campaign.config.limits.maxPatchBytes) {
-    throw new Error(`patch exceeds ${campaign.config.limits.maxPatchBytes} bytes`);
-  }
-  await writeFile(patchPath, patch.stdout);
   const changedFiles = names.stdout.split(/\r?\n/).filter(Boolean);
   const disallowedFiles = changedFiles.filter(
     (file) => !campaign.config.gates.allowedPathPrefixes.some((prefix) => file.startsWith(prefix)),
   );
   if (disallowedFiles.length > 0) {
     throw new Error(`diff changes files outside the allowed paths: ${disallowedFiles.join(', ')}`);
+  }
+  const protectedFiles = changedFiles.filter(protectedExecutionPath);
+  if (protectedFiles.length > 0) {
+    throw new Error(`diff changes a protected execution surface: ${protectedFiles.join(', ')}`);
   }
   const head = (await runCommand('git', ['rev-parse', 'HEAD'], { cwd: worktree })).stdout.trim();
   if (head !== campaign.seedSha) throw new Error('mutator changed HEAD; commits are not allowed');
@@ -404,6 +422,51 @@ export async function captureAndGateDiff(
   return { patchPath, result };
 }
 
+async function runDockerGate(
+  testImageTag: string,
+  command: string,
+  args: string[],
+  timeoutMs: number,
+  logPath: string,
+  environment: NodeJS.ProcessEnv,
+): Promise<void> {
+  await runCommand('docker', [
+    'run',
+    '--rm',
+    '--network',
+    'none',
+    '--read-only',
+    '--cap-drop',
+    'ALL',
+    '--security-opt',
+    'no-new-privileges:true',
+    '--pids-limit',
+    '512',
+    '--memory',
+    '4g',
+    '--cpus',
+    '4',
+    '--tmpfs',
+    '/tmp:rw,exec,nosuid,size=1g',
+    '--tmpfs',
+    '/root/.npm:rw,noexec,nosuid,size=128m',
+    '--tmpfs',
+    '/app/.local:rw,noexec,nosuid,size=1g',
+    '--tmpfs',
+    '/app/server/node_modules/.vite-temp:rw,noexec,nosuid,size=256m',
+    '--env',
+    'CI=1',
+    '--entrypoint',
+    command,
+    testImageTag,
+    ...args,
+  ], {
+    timeoutMs,
+    logPath,
+    env: environment,
+  });
+}
+
 export async function runVariantGates(
   campaign: CampaignRecord,
   testImageTag: string,
@@ -426,42 +489,67 @@ export async function runVariantGates(
             'test/deployment.integration.test.ts',
           ]
         : gate.args;
-    await runCommand('docker', [
-      'run',
-      '--rm',
-      '--network',
-      'none',
-      '--read-only',
-      '--cap-drop',
-      'ALL',
-      '--security-opt',
-      'no-new-privileges:true',
-      '--pids-limit',
-      '512',
-      '--memory',
-      '4g',
-      '--cpus',
-      '4',
-      '--tmpfs',
-      '/tmp:rw,exec,nosuid,size=1g',
-      '--tmpfs',
-      '/root/.npm:rw,noexec,nosuid,size=128m',
-      '--tmpfs',
-      '/app/.local:rw,noexec,nosuid,size=1g',
-      '--tmpfs',
-      '/app/server/node_modules/.vite-temp:rw,noexec,nosuid,size=256m',
-      '--env',
-      'CI=1',
-      '--entrypoint',
-      gate.command,
-      testImageTag,
-      ...gateArgs,
-    ], {
-      timeoutMs: gate.timeoutMs,
-      logPath: path.join(artifactDirectory, `gate-${index + 1}.log`),
-      env: environment,
-    });
+    await runDockerGate(
+      testImageTag, gate.command, gateArgs, gate.timeoutMs,
+      path.join(artifactDirectory, `gate-${index + 1}.log`), environment,
+    );
   }
+}
+
+export async function runInvestigatorTests(
+  campaign: CampaignRecord,
+  testImageTag: string,
+  artifactDirectory: string,
+  environment: NodeJS.ProcessEnv,
+  testFiles?: string[],
+): Promise<{ passed: true; testFiles: string[]; logPaths: string[] }> {
+  if (testFiles === undefined) {
+    await runVariantGates(campaign, testImageTag, artifactDirectory, environment);
+    return {
+      passed: true,
+      testFiles: [],
+      logPaths: campaign.config.gates.commands.map((_, index) => path.join(artifactDirectory, `gate-${index + 1}.log`)),
+    };
+  }
+  if (!Array.isArray(testFiles) || testFiles.length < 1 || testFiles.length > 30 || new Set(testFiles).size !== testFiles.length) {
+    throw new Error('testFiles must contain between 1 and 30 unique test files');
+  }
+  for (const file of testFiles) {
+    if (
+      typeof file !== 'string' ||
+      !/^server\/test\/(?:[A-Za-z0-9_][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_][A-Za-z0-9_.-]*\.test\.ts$/.test(file) ||
+      file.split('/').some((part) => part.toLowerCase() === 'node_modules')
+    ) {
+      throw new Error(`unsafe test file: ${JSON.stringify(file)}`);
+    }
+  }
+  const selectedFiles = [...testFiles];
+  const validationLog = path.join(artifactDirectory, 'test-files.log');
+  const typecheckLog = path.join(artifactDirectory, 'typecheck.log');
+  const testsLog = path.join(artifactDirectory, 'tests.log');
+  // Validate in the built image, not the host worktree, without interpreting agent input as code.
+  await runDockerGate(testImageTag, 'node', ['--input-type=commonjs', '-e', `
+const { lstatSync, existsSync } = require('node:fs');
+const path = require('node:path');
+for (const file of process.argv.slice(1)) {
+  let current = '';
+  for (const part of file.split('/')) {
+    current = path.join(current, part);
+    const details = lstatSync(current);
+    if (details.isSymbolicLink()) throw new Error('test file cannot traverse a symbolic link: ' + file);
+    if (details.isDirectory() && existsSync(path.join(current, '.git'))) {
+      throw new Error('test file cannot traverse an embedded repository: ' + file);
+    }
+    if (current === file && !details.isFile()) throw new Error('test file must be a regular file: ' + file);
+  }
+}
+`, '--', ...selectedFiles], 30_000, validationLog, environment);
+  await runDockerGate(testImageTag, 'npm', ['run', 'typecheck'], 1_800_000, typecheckLog, environment);
+  await runDockerGate(testImageTag, 'npm', [
+    'exec', '--workspace', '@ainative-planner/server', '--', 'vitest', 'run',
+    ...selectedFiles.map((file) => file.slice('server/'.length)),
+  ], 1_800_000, testsLog, environment);
+  return { passed: true, testFiles: selectedFiles, logPaths: [validationLog, typecheckLog, testsLog] };
 }
 
 export async function buildVariantImage(
@@ -579,6 +667,7 @@ export async function startVariantStack(
   trustedPlannerPath: string,
   scope = 'evaluation',
 ): Promise<StackHandle> {
+  await mkdir(artifactDirectory, { recursive: true });
   const ports = await Promise.all([availablePort(), availablePort(), availablePort(), availablePort(), availablePort()]);
   const [plannerPort, redisPort, s3Port, s3ConsolePort, ddbPort] = ports as [
     number,

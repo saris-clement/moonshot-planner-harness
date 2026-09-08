@@ -5,8 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { expect, test } from '@playwright/test';
 import { HarnessDatabase } from '../src/db.js';
-import { computeScore, consensusRunFacts, extractRunFacts } from '../src/metrics.js';
+import { computeReplicateMeanScore, computeScore, consensusRunFacts, extractRunFacts } from '../src/metrics.js';
 import { CampaignOrchestrator } from '../src/orchestrator.js';
+import type { InvestigationState } from '../src/investigator.js';
 import type { HarnessPaths } from '../src/paths.js';
 import { runCommand } from '../src/process.js';
 import { startDashboard } from '../src/server.js';
@@ -35,6 +36,11 @@ const reviewId = 'ui-e2e-v002';
 const legacyCampaignId = 'legacy-ui-e2e';
 const legacyLiveId = 'legacy-ui-e2e-v001';
 const resolvedArtifactSha = `sha256:${'d'.repeat(64)}`;
+const investigatorCampaignId = 'investigator-ui-e2e';
+const investigatorId = `${investigatorCampaignId}-v001`;
+const zeroInvestigatorId = `${investigatorCampaignId}-v002`;
+const unknownInvestigatorId = `${investigatorCampaignId}-v003`;
+const longInvestigationText = 'Source eligibility remains an unverified hypothesis. '.repeat(24) + 'unbroken-source-reference-'.repeat(24);
 
 async function gitFixture(directory: string, remote = false): Promise<string> {
   await mkdir(directory, { recursive: true });
@@ -688,6 +694,81 @@ async function seedLegacyCampaign(): Promise<void> {
   database.updateCampaign(campaign.id, { status: 'running_round' });
 }
 
+async function seedInvestigatorCampaign(): Promise<void> {
+  await orchestrator.initializeFromInput({
+    id: investigatorCampaignId,
+    goal: 'Inspect autonomous investigator evidence without conflating test success with planner correctness.',
+    plannerRepo, workflowsRepo, environmentFile,
+    seedRevision: seedSha, workflowsRevision: workflowsSha,
+    benchmarks: [
+      { name: 'primary-pack', role: 'primary', zipPath: primaryZip },
+      { name: 'holdout-pack', role: 'holdout', zipPath: holdoutZip },
+    ],
+    investigator: { enabled: true },
+    evaluation: { replicates: 2, replicateConcurrency: 2 },
+  });
+  const hypothesis = {
+    title: 'Source evidence revision',
+    rationale: longInvestigationText,
+    instructions: 'Inspect generic eligibility without customer-specific production rules.',
+    expectedImpact: 'Potentially fewer unsupported decisions; not verified.',
+    risk: 'May reject a valid source.',
+    assumptions: ['The source inventory is complete.'],
+    findingIds: [],
+  };
+  const facts = consensusRunFacts([runFacts(primaryUsage()), runFacts(primaryUsage())]);
+  const score = {
+    ...computeScore(facts, [], null),
+    verified: { labeled: 1, correct: 0, errors: 1, accuracy: 0 },
+  };
+  const actionBase = {
+    hypothesis, rationale: 'Check this revision before spending a primary trial.',
+    startedAt: '2026-09-06T05:00:00.000Z', completedAt: '2026-09-06T05:01:00.000Z',
+    patchHash: `sha256:${'f'.repeat(64)}`, artifactDirectory: null, error: null,
+  };
+  const investigation: InvestigationState = {
+    schemaVersion: 1, sessionId: `session-${'a'.repeat(100)}`, status: 'running',
+    startedAt: new Date(Date.now() - 60_000).toISOString(), updatedAt: new Date().toISOString(),
+    turnCount: 4, agentTokens: null, agentCostUsd: null, reason: null,
+    actions: [
+      { ...actionBase, id: 'test-failed', kind: 'test', status: 'failed', result: { passed: false, testFiles: ['test/source.test.ts'], logPaths: ['investigation/test-failed/test.log'] }, artifactDirectory: 'investigation/test-failed', error: 'Source assertion failed.' },
+      { ...actionBase, id: 'test-passed', kind: 'test', status: 'completed', result: { passed: true, testFiles: ['test/source.test.ts'], logPaths: ['investigation/test-passed/test.log'] }, artifactDirectory: 'investigation/test-passed' },
+      { ...actionBase, id: 'primary-trial', kind: 'evaluate_primary', status: 'completed', result: {
+        score, baselineScore: { ...score, verified: { labeled: 1, correct: 1, errors: 0, accuracy: 1 } },
+        facts, replicateFacts: [runFacts(primaryUsage()), runFacts(primaryUsage())], labelSetHash: `sha256:${'1'.repeat(64)}`,
+        comparisonNotes: ['The result needs human interpretation.'],
+        transitions: [{ key: 'unit-a', before: 'reuse', after: 'build', expected: 'build', rationale: 'Planner interpretation, not verified causality.', sourceRefs: [] }],
+      } },
+      { ...actionBase, id: 'test-running', kind: 'test', status: 'running', completedAt: null, result: null },
+    ],
+  };
+  for (const [index, id] of [investigatorId, zeroInvestigatorId, unknownInvestigatorId].entries()) {
+    database.createVariant({ id, campaignId: investigatorCampaignId, parentVariantId: null, round: 1, ordinal: index + 1, hypothesis });
+    database.updateVariant(id, {
+      status: 'completed', facts, score,
+      investigation: index === 0 ? investigation : {
+        ...investigation,
+        sessionId: index === 1 ? null : 'unknown-result-session',
+        status: index === 1 ? 'budget_exhausted' : 'abandoned',
+        turnCount: index === 1 ? 0 : 1,
+        agentTokens: index === 1 ? 0 : null,
+        agentCostUsd: index === 1 ? 0 : null,
+        reason: longInvestigationText,
+        actions: index === 1 ? [] : [{
+          ...actionBase, id: 'unknown-result', kind: 'evaluate_primary', status: 'completed',
+          hypothesis: { ...hypothesis, title: longInvestigationText },
+          result: { futureResult: 'MODEL_OUTPUT_ONLY_MARKER', passed: true, unsupportedClaim: '<img src=x onerror="window.__investigationExecuted=true">' },
+        }],
+      },
+    });
+  }
+  for (const outcome of ['failed', 'passed']) {
+    const directory = path.join(paths.artifacts, investigatorCampaignId, investigatorId, `investigation/test-${outcome}`);
+    await mkdir(directory, { recursive: true });
+    await writeFile(path.join(directory, 'test.log'), `Seeded test ${outcome}. This is execution evidence only.\n`);
+  }
+}
+
 test.beforeAll(async () => {
   root = await mkdtemp(path.join(os.tmpdir(), 'planner-eval-ui-'));
   plannerRepo = path.join(root, 'planner');
@@ -718,6 +799,7 @@ test.beforeAll(async () => {
   orchestrator = new CampaignOrchestrator(paths, database);
   await seedCampaign();
   await seedLegacyCampaign();
+  await seedInvestigatorCampaign();
   const frozenWorkflows = path.join(paths.worktrees, campaignId, 'frozen-workflows');
   await mkdir(path.dirname(frozenWorkflows), { recursive: true });
   await runCommand('git', ['worktree', 'add', '--detach', frozenWorkflows, workflowsSha], {
@@ -1169,7 +1251,7 @@ test('isolates duplicate question IDs by benchmark and replicate and serves arti
   await expect(page.getByRole('link', { name: 'Open raw Markdown' })).toBeVisible();
   await markdownViewer.focus();
   await markdownViewer.evaluate((element) => {
-    element.scrollTop = 120;
+    element.scrollTo({ top: 120, behavior: 'instant' });
   });
   const humanNotesDirectory = path.join(paths.reports, campaignId, 'human');
   await mkdir(humanNotesDirectory, { recursive: true });
@@ -1281,6 +1363,450 @@ test('retains a central dirty review draft across SSE and guards navigation befo
   await expect(page).toHaveURL(`${baseUrl}/campaigns/${campaignId}/overview`);
 });
 
+test('keeps investigator budgets separate from planner usage and links compact trial summaries', async ({ page }) => {
+  await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/overview`);
+  const investigator = page.getByTestId(`investigator-${investigatorId}`);
+  await expect(investigator.getByLabel('Investigator session and budgets')).toBeVisible();
+  await expect(investigator).toContainText('1 primary trial / 3 tests; latest: Test running');
+  await expect(investigator.locator('dt', { hasText: /^Agent tokens$/ }).locator('..')).toContainText('Unknown / 2,000,000');
+  await expect(investigator.locator('dt', { hasText: /^Agent cost$/ }).locator('..')).toContainText('Unknown');
+  await expect(investigator.locator('dt', { hasText: /^Current action$/ }).locator('..')).toContainText('test-running / Test');
+  await expect(page.getByText('No active evaluations. Completed experiments remain in the ledger.')).toBeVisible();
+  await expect(page.getByLabel('Experiment timing and planner usage')).toHaveCount(0);
+  const zero = page.getByTestId(`investigator-${zeroInvestigatorId}`);
+  await expect(zero.locator('dt', { hasText: /^Agent tokens$/ }).locator('..')).toContainText('0 / 2,000,000');
+  await expect(zero.locator('dt', { hasText: /^Agent cost$/ }).locator('..')).toContainText('$0.00');
+  await expect(zero.locator('dt', { hasText: /^Session$/ }).locator('..')).toContainText('Not assigned');
+
+  await page.getByRole('link', { name: 'Experiments', exact: true }).click();
+  const row = page.getByTestId(`experiment-row-${investigatorId}`);
+  await expect(row).toContainText('Consensus decisions');
+  await expect(row).toContainText('Score: replicate mean');
+  await row.getByRole('link', { name: /1 primary trial/ }).click();
+  await expect(page).toHaveURL(/tab=investigation$/);
+  await page.getByRole('link', { name: 'Summary', exact: true }).click();
+  await expect(page.getByLabel('Truthful score dimensions')).toContainText('Verified (replicate mean)');
+  await expect(page.getByLabel('Truthful score dimensions')).toContainText('Consensus agreement');
+  await expect(page.getByRole('link', { name: /1 primary trial/ })).toBeVisible();
+});
+
+test('uses one full-primary screening slot and restores repeated final cohorts without stale trial runs', async ({ page }) => {
+  const original = database.getVariant(investigatorId);
+  const investigation = original.investigation!;
+  const trial = { ...investigation.actions[2]!, status: 'running' as const, result: null, startedAt: '2026-09-06T05:02:00.000Z', completedAt: null };
+  try {
+    database.updateVariant(investigatorId, {
+      status: 'running', facts: null, replicateFacts: null, executionState: null,
+      investigation: { ...investigation, actions: [trial] },
+    });
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/overview`);
+    const status = page.getByTestId(`investigator-${investigatorId}`);
+    await expect(status.locator('dt', { hasText: /^Primary screening$/ }).locator('..')).toContainText('1 configured / trial');
+    await expect(status.locator('dt', { hasText: /^Baseline and final$/ }).locator('..')).toContainText('2 / benchmark');
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${investigatorId}?tab=runs`);
+    await expect(page.getByRole('heading', { name: 'Full-primary screening' })).toBeVisible();
+    await expect(page.locator('[data-replicate-group="standard"]')).toHaveCount(1);
+    await expect(page.getByTestId(`replicate-${investigatorId}-primary-pack-1`)).toContainText('1 / 1');
+    await expect(page.locator('[data-testid*="holdout-pack-"]')).toHaveCount(0);
+
+    const snapshot = { ...execution({ benchmark: 'primary-pack', role: 'primary', replicate: 1, replicateCount: 1, status: 'running' }), startedAt: '2026-09-06T05:02:10.000Z', updatedAt: '2026-09-06T05:02:20.000Z' };
+    database.updateVariant(investigatorId, { executionState: { executions: [
+      execution({ benchmark: 'primary-pack', role: 'primary', replicate: 2, replicateCount: 2 }), snapshot,
+    ] } });
+    await page.reload();
+    await expect(page.locator('[data-replicate-group="standard"]')).toHaveCount(1);
+    await expect(page.getByTestId(`replicate-${investigatorId}-primary-pack-1`)).toContainText('1 / 1');
+
+    const single = runFacts(primaryUsage());
+    database.updateVariant(investigatorId, { investigation: { ...investigation, actions: [{
+      ...trial, status: 'completed', completedAt: '2026-09-06T05:03:00.000Z',
+      result: { score: original.score, facts: single, replicateFacts: [single] },
+    }] } });
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${investigatorId}?tab=investigation`);
+    await page.getByTestId('investigation-action-primary-trial').getByText('Hypothesis, result and logs', { exact: true }).click();
+    await expect(page.locator('.investigation-evaluation')).toContainText('Consensus agreement: Not measured (n=1)');
+    await expect(page.locator('.investigation-evaluation')).not.toContainText('Consensus agreement: 100.0%');
+
+    database.updateVariant(investigatorId, { investigation: { ...investigation, status: 'finalized', actions: [
+      { ...trial, status: 'completed', completedAt: '2026-09-06T05:03:00.000Z' },
+      { ...trial, id: 'finalize-screening', kind: 'finalize', status: 'completed', completedAt: '2026-09-06T05:04:00.000Z' },
+    ] } });
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${investigatorId}?tab=runs`);
+    await expect(page.getByRole('heading', { name: 'Configured run matrix' })).toBeVisible();
+    await expect(page.locator('[data-replicate-group="standard"]')).toHaveCount(4);
+    await expect(page.locator('[data-replicate-state="pending"]')).toHaveCount(4);
+    await expect(page.getByTestId(`replicate-${investigatorId}-primary-pack-2`)).toContainText('2 / 2');
+    database.updateVariant(investigatorId, { executionState: { executions: [{
+      ...snapshot, replicateCount: 2, startedAt: '2026-09-06T05:05:00.000Z', updatedAt: '2026-09-06T05:05:01.000Z',
+    }] } });
+    await page.reload();
+    await expect(page.locator('[data-replicate-state="current"]')).toHaveCount(1);
+    await expect(page.locator('[data-replicate-state="pending"]')).toHaveCount(3);
+  } finally {
+    database.updateVariant(investigatorId, { status: original.status, facts: original.facts, replicateFacts: original.replicateFacts, executionState: original.executionState, investigation });
+  }
+});
+
+test('preserves two recorded screening replicates in legacy campaigns and trusts live snapshot counts', async ({ page }) => {
+  const original = database.getVariant(investigatorId);
+  const investigation = original.investigation!;
+  const trial = investigation.actions[2]!;
+  await page.route(`**/api/campaigns/${investigatorCampaignId}`, async (route) => {
+    const response = await route.fetch();
+    const details = await response.json();
+    delete details.campaign.config.investigator.primaryReplicates;
+    await route.fulfill({ json: details });
+  });
+  try {
+    database.updateVariant(investigatorId, {
+      status: 'rejected', facts: null, replicateFacts: null,
+      investigation: { ...investigation, status: 'abandoned', actions: [trial] },
+      executionState: { executions: [execution({ benchmark: 'primary-pack', role: 'primary', replicate: 1, replicateCount: 1 })] },
+    });
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/overview`);
+    await expect(page.getByTestId(`investigator-${investigatorId}`)).toContainText('2 recorded / trial');
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${investigatorId}?tab=runs`);
+    await page.reload();
+    await expect(page.locator('[data-replicate-group="standard"]')).toHaveCount(2);
+    await expect(page.locator('[data-replicate-state="completed"]')).toHaveCount(2);
+    await expect(page.getByTestId(`replicate-${investigatorId}-primary-pack-2`)).toContainText('2 / 2');
+    await expect(page).toHaveURL(/tab=runs$/);
+
+    database.updateVariant(investigatorId, { status: 'running', investigation: { ...investigation, actions: [{ ...trial, status: 'running', result: null, completedAt: null }] },
+      executionState: { executions: [{ ...execution({ benchmark: 'primary-pack', role: 'primary', replicate: 1, replicateCount: 2, status: 'running' }), startedAt: trial.startedAt, updatedAt: trial.startedAt }] },
+    });
+    await page.reload();
+    await expect(page.locator('[data-replicate-group="standard"]')).toHaveCount(2);
+    await expect(page.locator('[data-replicate-state="pending"]')).toHaveCount(1);
+    await expect(page.locator('[data-replicate-state="current"]')).toHaveCount(1);
+  } finally {
+    database.updateVariant(investigatorId, { status: original.status, facts: original.facts, replicateFacts: original.replicateFacts, executionState: original.executionState, investigation });
+  }
+});
+
+test('shows fractional mean correct counts without rounding or clipping in ledger and lineage', async ({ page }) => {
+  const original = database.getVariant(investigatorId);
+  const base = runFacts(primaryUsage());
+  const reuse = runFacts(primaryUsage(), 'reuse');
+  const replicates: RunFacts[] = [32, 33].map((correct) => ({
+    ...base, unitCount: 65,
+    decisions: { ...base.decisions, build: correct, reuse: 65 - correct },
+    units: Array.from({ length: 65 }, (_, index) => ({
+      ...(index < correct ? base : reuse).units[0]!, id: `mean-${index}`, key: `mean-${index}`,
+      ref: { entity: 'workflow', anchor: `mean-${index}` },
+      decision: index < correct ? 'build' : 'reuse',
+    })),
+  }));
+  const label = database.listLabels(campaignId, 'primary-pack')[0]!;
+  const score = computeReplicateMeanScore(replicates, replicates[0]!.units.map((unit) => ({
+    ...label, unitKey: unit.key, status: 'suggested', expectedDecision: 'build',
+  })), null);
+  expect(score.provisional.correct).toBe(32.5);
+  try {
+    database.updateVariant(investigatorId, { score, facts: consensusRunFacts(replicates), replicateFacts: replicates });
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({ width, height: 1000 });
+      await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments`);
+      await expect(page.getByTestId(`experiment-row-${investigatorId}`)).toContainText('50.0% · 32.5/65 mean correct');
+      await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/lineage?view=${width === 1440 ? 'graph' : 'list'}`);
+      const count = page.locator(`[data-lineage-id="${investigatorId}"] .mean-score`).nth(1);
+      await expect(count).toHaveText('50.0% · 32.5/65 mean correct');
+      expect(await count.evaluate((node) => node.scrollHeight - node.clientHeight)).toBeLessThanOrEqual(1);
+      expect(await page.evaluate<number>('document.documentElement.scrollWidth')).toBe(width);
+    }
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${investigatorId}`);
+    await expect(page.getByLabel('Truthful score dimensions')).toContainText('50.0% · 32.5/65 mean correct');
+  } finally {
+    database.updateVariant(investigatorId, { score: original.score, facts: original.facts, replicateFacts: original.replicateFacts });
+  }
+});
+
+test('explains Investigation and Markdown in a compact keyboard-accessible help dialog on desktop and mobile', async ({ page }) => {
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 844 });
+    for (const [tab, label] of [['investigation', 'Investigation'], ['markdown', 'Markdown']]) {
+      await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${investigatorId}?tab=${tab}`);
+      const trigger = page.locator('.section-heading').getByRole('button', { name: `Help with ${label}` });
+      await expect(trigger).toBeVisible();
+      await expect(trigger).toHaveAttribute('aria-haspopup', 'dialog');
+      await trigger.focus();
+      await page.keyboard.press('Enter');
+      const dialog = page.getByRole('dialog', { name: 'One experiment, two views' });
+      await expect(dialog).toBeVisible();
+      await expect(dialog).toContainText('Investigation: follow the attempts');
+      await expect(dialog).toContainText('Markdown: read the summary');
+      await expect(dialog).toContainText('Try A. Results get worse. Adjust it to B and test again.');
+      await expect(dialog).toContainText('B is the latest revision, but has no score yet.');
+      await expect(dialog).toContainText('Later revisions do not rewrite earlier results.');
+      await expect(dialog.getByRole('button', { name: 'Close help' })).toBeFocused();
+      const bounds = await dialog.boundingBox();
+      expect(bounds!.x).toBeGreaterThanOrEqual(0);
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width);
+      expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(844);
+      expect(await dialog.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
+      await page.keyboard.press('Escape');
+      await expect(dialog).toHaveCount(0);
+      await expect(trigger).toBeFocused();
+      await trigger.click();
+      await dialog.getByRole('button', { name: 'Close help' }).click();
+      await expect(dialog).toHaveCount(0);
+      await expect(trigger).toBeFocused();
+      await trigger.click();
+      await page.mouse.click(5, 5);
+      await expect(dialog).toHaveCount(0);
+      await expect(trigger).toBeFocused();
+    }
+  }
+});
+
+test('help remains open during live refresh, restores focus, and closes on history navigation', async ({ page }) => {
+  await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${investigatorId}?tab=markdown`);
+  await page.getByRole('link', { name: 'Investigation', exact: true }).click();
+  const trigger = page.getByRole('button', { name: 'Help with Investigation' });
+  const previousTrigger = await trigger.elementHandle();
+  await trigger.click();
+  const dialog = page.getByRole('dialog', { name: 'One experiment, two views' });
+  database.addEvent(investigatorCampaignId, investigatorId, 'investigator.updated', { helpRefreshTest: true });
+  await expect.poll(() => previousTrigger!.evaluate((node) => node.isConnected)).toBe(false);
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole('button', { name: 'Close help' })).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(trigger).toBeFocused();
+  await trigger.click();
+  await page.goBack();
+  await expect(page).toHaveURL(/tab=markdown$/);
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Help with Markdown' })).toBeVisible();
+});
+
+test('lineage attributes abandoned screening metrics to the measured trial, not the unevaluated revision', async ({ page }) => {
+  const original = database.getVariant(investigatorId);
+  const investigation = original.investigation!;
+  const score = {
+    ...original.score!,
+    verified: { labeled: 0, correct: 0, errors: 0, accuracy: null },
+    provisional: { labeled: 125, correct: 41.5, errors: 83.5, accuracy: 0.332 },
+  };
+  const trial = {
+    ...investigation.actions[2]!, id: 'action-005',
+    hypothesis: { ...original.hypothesis, title: 'Measured earlier treatment' },
+    result: { score, baselineScore: { ...score, provisional: { ...score.provisional, correct: 44, accuracy: 0.352 } },
+      facts: { ...original.facts!, sampleSize: 2, decisionAgreement: 0.8 },
+      replicateFacts: [runFacts(primaryUsage()), runFacts(primaryUsage())],
+    },
+  };
+  try {
+    database.updateVariant(investigatorId, {
+      status: 'rejected', facts: null, score: null, patchHash: `sha256:${'b'.repeat(64)}`,
+      hypothesis: { ...original.hypothesis, title: 'Unevaluated latest revision' },
+      investigation: { ...investigation, status: 'abandoned', reason: 'Remaining budget could not cover another evaluation.', actions: [trial, {
+        ...investigation.actions[3]!, kind: 'test', status: 'completed', result: { passed: true },
+      }] },
+    });
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({ width, height: 1000 });
+      await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/lineage?view=${width === 1440 ? 'graph' : 'list'}`);
+      const card = page.locator(`[data-lineage-id="${investigatorId}"]`);
+      await expect(card).toContainText('Latest screening: action-005');
+      await expect(card).toContainText('Measured earlier treatment');
+      await expect(card).toContainText('Latest revision not evaluated');
+      await expect(card.locator('dt', { hasText: /^Verified$/ }).locator('..')).toContainText('No reviewed labels');
+      await expect(card.locator('dt', { hasText: /^Provisional$/ }).locator('..')).toContainText('33.2% · 41.5/125 mean correct');
+      await expect(card.locator('dt', { hasText: /^Agreement$/ }).locator('..')).toContainText('80.0%');
+      await expect(card).toContainText('Baseline 35.2% · -2.0 pp');
+      await expect(card).toContainText('Abandoned before final evaluation');
+      await expect(card).toContainText('Remaining budget could not cover another evaluation.');
+      await expect(card.locator('dt', { hasText: /^Sibling rank$/ }).locator('..')).toContainText('Unranked');
+      expect(await page.evaluate<number>('document.documentElement.scrollWidth')).toBe(width);
+    }
+    await page.locator(`[data-lineage-id="${investigatorId}"]`).getByRole('link', { name: 'View investigation' }).click();
+    await expect(page).toHaveURL(/tab=investigation$/);
+    await expect(page.locator('.investigation-panel')).toContainText('Each trial freezes its hypothesis and patch before evaluation');
+    await orchestrator.refreshReports(investigatorCampaignId);
+    await page.getByRole('link', { name: 'Markdown', exact: true }).click();
+    await expect(page.locator('.markdown-panel')).toContainText('Living experiment report');
+    await expect(page.locator('.markdown-panel')).toContainText('not a finalized plan');
+
+    database.updateVariant(investigatorId, { facts: original.facts, score: original.score });
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/lineage`);
+    const finalCard = page.locator(`[data-lineage-id="${investigatorId}"]`);
+    await expect(finalCard).toContainText('Final evaluation');
+    await expect(finalCard).not.toContainText('Latest screening: action-005');
+    await expect(finalCard).not.toContainText('33.2%');
+
+    database.updateVariant(investigatorId, { facts: null, score: null, investigation: {
+      ...investigation, status: 'abandoned', actions: [{ ...trial, result: { ...trial.result,
+        facts: { ...trial.result.facts, sampleSize: 1, decisionAgreement: 1 }, replicateFacts: [runFacts(primaryUsage())],
+      } }],
+    } });
+    await page.reload();
+    await expect(finalCard.locator('dt', { hasText: /^Agreement$/ }).locator('..')).toContainText('Not measured (n=1)');
+    database.updateVariant(investigatorId, { investigation: {
+      ...investigation, status: 'abandoned', reason: 'No testable treatment was produced.', actions: [investigation.actions[0]!],
+    } });
+    await page.reload();
+    await expect(finalCard).toContainText('No evaluation recorded');
+    await expect(finalCard.locator('dt', { hasText: /^Provisional$/ }).locator('..')).toContainText('Not measured');
+    await expect(finalCard).toContainText('No testable treatment was produced.');
+  } finally {
+    database.updateVariant(investigatorId, { status: original.status, hypothesis: original.hypothesis,
+      facts: original.facts, score: original.score, patchHash: original.patchHash, investigation });
+  }
+});
+
+test('renders failed then passing tests and primary evaluation with lazy archive links and reloadable tab', async ({ page }) => {
+  const artifactRequests: string[] = [];
+  page.on('request', (request) => { if (request.url().includes('/artifacts')) artifactRequests.push(request.url()); });
+  await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${investigatorId}?tab=investigation`);
+  await page.reload();
+  await expect(page.getByRole('link', { name: 'Investigation', exact: true })).toHaveAttribute('aria-current', 'page');
+  const timeline = page.getByRole('table', { name: 'Investigation action timeline', exact: true });
+  await expect(timeline.getByRole('rowheader')).toHaveText([
+    '1. Testtest-failed', '2. Testtest-passed', '3. Primary evaluationprimary-trial', '4. Testtest-running',
+  ]);
+  const failed = page.getByTestId('investigation-action-test-failed');
+  const passed = page.getByTestId('investigation-action-test-passed');
+  const trial = page.getByTestId('investigation-action-primary-trial');
+  await expect(failed).toContainText('Test failed');
+  await expect(passed).toContainText('Tests passed (not correctness)');
+  await expect(trial).toContainText('Primary score recorded');
+  await expect(page.locator('.investigation-raw')).toHaveCount(0);
+  expect(artifactRequests).toEqual([]);
+  await failed.getByText('Hypothesis, result and logs', { exact: true }).click();
+  await expect(failed.getByText('Source assertion failed.', { exact: true })).toBeVisible();
+  await expect(failed.getByText('Agent interpretation / unverified')).toBeVisible();
+  await trial.getByText('Hypothesis, result and logs', { exact: true }).click();
+  const scores = trial.getByRole('table', { name: 'Primary trial score comparison' });
+  await expect(scores.getByRole('row', { name: /Verified accuracy/ })).toContainText('0.0%');
+  await expect(scores.getByRole('row', { name: /Verified accuracy/ })).toContainText('100.0%');
+  await expect(scores.getByRole('row', { name: /Provisional accuracy/ })).toContainText('Unknown');
+  await expect(trial).toContainText('Score basis: replicate mean. Consensus decisions are separate.');
+  await expect(trial).toContainText('Recorded decision transitions: 1.');
+  await expect(trial).toContainText('The runtime answer ledger freezes repeated semantic answers within a pinned context.');
+  await expect(page.locator('.investigation-raw')).toHaveCount(0);
+  expect(artifactRequests).toEqual([]);
+  await failed.getByText('Artifact paths and logs', { exact: true }).click();
+  const log = failed.getByRole('link', { name: 'investigation/test-failed/test.log', exact: true });
+  await expect(log).toHaveAttribute('target', '_blank');
+  const response = await page.request.get(`${baseUrl}${await log.getAttribute('href')}`);
+  expect(response.ok()).toBe(true);
+  expect(await response.text()).toContain('Seeded test failed. This is execution evidence only.');
+  expect(artifactRequests.some((url) => url.includes('?path='))).toBe(false);
+});
+
+test('reads integrated failed-action archives and nested finalization test results', async ({ page }) => {
+  const original = database.getVariant(zeroInvestigatorId).investigation!;
+  const source = database.getVariant(investigatorId).investigation!;
+  const directory = path.join(paths.artifacts, investigatorCampaignId, zeroInvestigatorId, 'investigation/action-001');
+  const finalDirectory = path.join(paths.artifacts, investigatorCampaignId, zeroInvestigatorId, 'investigation/action-002');
+  await mkdir(directory, { recursive: true });
+  await mkdir(finalDirectory, { recursive: true });
+  await writeFile(path.join(directory, 'gate-1.log'), 'Trusted gate output, not correctness evidence.\n');
+  await writeFile(path.join(finalDirectory, 'gate-1.log'), 'Final configured gate passed.\n');
+  try {
+    database.updateVariant(zeroInvestigatorId, { investigation: {
+      ...original, status: 'finalized', turnCount: 2,
+      actions: [
+        { ...source.actions[0]!, id: 'action-001', artifactDirectory: 'investigation/action-001', result: null, error: 'Trusted test failed.\nArtifacts: investigation/action-001' },
+        { ...source.actions[1]!, id: 'action-002', kind: 'finalize', artifactDirectory: 'investigation/action-002', result: {
+          passed: true, tests: { passed: true, testFiles: [], logPaths: [path.join(finalDirectory, 'gate-1.log')] }, compliance: { status: 'passed' },
+        } },
+      ],
+    } });
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${zeroInvestigatorId}?tab=investigation`);
+    const failed = page.getByTestId('investigation-action-action-001');
+    await failed.getByText('Hypothesis, result and logs', { exact: true }).click();
+    await expect(failed).toContainText(`Patch: ${source.actions[0]!.patchHash}`);
+    await failed.getByText('Artifact paths and logs', { exact: true }).click();
+    await expect(failed.getByRole('link', { name: 'investigation/action-001/gate-1.log', exact: true })).toBeVisible();
+    const finalized = page.getByTestId('investigation-action-action-002');
+    await finalized.getByText('Hypothesis, result and logs', { exact: true }).click();
+    await expect(finalized).toContainText('Full configured tests: Passed. Semantic review: passed (unverified model judgment).');
+    await expect(finalized).toContainText('Finalization is not promotion.');
+    await finalized.getByText('Artifact paths and logs', { exact: true }).click();
+    await expect(finalized.getByRole('link', { name: 'investigation/action-002/gate-1.log', exact: true })).toBeVisible();
+  } finally {
+    database.updateVariant(zeroInvestigatorId, { investigation: original });
+  }
+});
+
+test('polls running investigations with finished variant lifecycles without losing open details or focus', async ({ page }) => {
+  await page.route('**/events?*', (route) => route.abort());
+  const original = database.getVariant(investigatorId).investigation!;
+  try {
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${investigatorId}?tab=investigation`);
+    const details = page.getByTestId('investigation-action-test-failed').locator('details').first();
+    await details.locator('summary').first().click();
+    const rationale = details.getByText(longInvestigationText, { exact: true });
+    await expect(rationale).toBeVisible();
+    await details.locator('summary').first().focus();
+    await page.evaluate('window.scrollTo(0, 250)');
+    const scrollY = await page.evaluate<number>('window.scrollY');
+    database.updateVariant(investigatorId, { investigation: { ...original, turnCount: 5, agentTokens: 0, agentCostUsd: 0 } });
+    const status = page.getByTestId(`investigator-${investigatorId}`);
+    await expect(status.locator('dt', { hasText: /^Turns$/ }).locator('..')).toContainText('5 / 12', { timeout: 8_000 });
+    await expect(status.locator('dt', { hasText: /^Agent cost$/ }).locator('..')).toContainText('$0.00');
+    await expect(details).toHaveAttribute('open', '');
+    await expect(details.locator('summary').first()).toBeFocused();
+    expect(Math.abs(await page.evaluate<number>('window.scrollY') - scrollY)).toBeLessThan(2);
+  } finally {
+    database.updateVariant(investigatorId, { investigation: original });
+  }
+});
+
+test('refreshes on investigator-specific SSE events', async ({ page }) => {
+  // Isolate the new event from the existing variant.updated listener and polling fallback.
+  await page.addInitScript({ content: `
+    const NativeEventSource = window.EventSource;
+    window.EventSource = class extends NativeEventSource {
+      addEventListener(...args) {
+        if (args[0] === 'investigator.updated') super.addEventListener(...args);
+      }
+    };
+    window.setInterval = () => 0;
+  ` });
+  const original = database.getVariant(zeroInvestigatorId).investigation!;
+  try {
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${zeroInvestigatorId}?tab=investigation`);
+    await expect(page.getByRole('heading', { name: 'Investigation', exact: true })).toBeVisible();
+    database.updateVariant(zeroInvestigatorId, { investigation: { ...original, reason: 'Investigator-specific live update.' } });
+    database.addEvent(investigatorCampaignId, zeroInvestigatorId, 'investigator.updated', {});
+    await page.getByText('Recorded reason (unverified interpretation)', { exact: true }).click();
+    await expect(page.getByText('Investigator-specific live update.', { exact: true })).toBeVisible({ timeout: 8_000 });
+  } finally {
+    database.updateVariant(zeroInvestigatorId, { investigation: original });
+  }
+});
+
+test('keeps unknown results, long hypotheses, and raw details readable on desktop and mobile', async ({ page }) => {
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 1000 });
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${unknownInvestigatorId}?tab=investigation`);
+    const action = page.getByTestId('investigation-action-unknown-result');
+    await expect(action).toContainText('Primary result unknown');
+    await expect(action).not.toContainText('Tests passed');
+    await expect(page.locator('.investigation-raw')).toHaveCount(0);
+    await expect(page.getByText('MODEL_OUTPUT_ONLY_MARKER', { exact: true })).toHaveCount(0);
+    await page.getByText('Recorded reason (unverified interpretation)', { exact: true }).click();
+    await expect(page.locator('.investigation-status .investigation-prose')).toHaveText(longInvestigationText);
+    await action.getByText('Hypothesis, result and logs', { exact: true }).click();
+    await expect(action.getByText('No readable score recorded. No improvement can be inferred.')).toBeVisible();
+    await expect(action.getByRole('table')).toHaveCount(0);
+    await action.getByText('Raw result (unverified; may include model output)', { exact: true }).click();
+    await expect(action.locator('pre')).toContainText('MODEL_OUTPUT_ONLY_MARKER');
+    await expect(page.locator('.investigation-panel img')).toHaveCount(0);
+    expect(await page.evaluate('window.__investigationExecuted')).toBeUndefined();
+    expect(await page.evaluate<number>('document.documentElement.scrollWidth')).toBe(width);
+    const table = page.locator('.investigation-table-wrap');
+    expect(await table.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
+    await expect(action.locator('.investigation-action-title')).toHaveCSS('overflow-wrap', 'anywhere');
+    await expect(action).toHaveCSS('font-size', '12px');
+    if (width === 390) {
+      expect((await action.locator('summary').first().boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    }
+  }
+});
+
 test('provides a mobile drawer, defaults lineage to list, and preserves campaign creation', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${baselineId}?tab=markdown`);
@@ -1308,6 +1834,7 @@ test('provides a mobile drawer, defaults lineage to list, and preserves campaign
   await expect(page.getByLabel('Mobile Search experiments')).toBeVisible();
 
   await page.goto(`${baseUrl}/campaigns/new`);
+  await expect(page.getByLabel('Enable autonomous investigator')).toBeChecked();
   await page.getByLabel('Campaign ID').fill('created-in-ui');
   await page
     .getByLabel('Research goal')
@@ -1335,6 +1862,8 @@ test('provides a mobile drawer, defaults lineage to list, and preserves campaign
   await page.getByRole('button', { name: 'Create frozen campaign' }).click();
   const creationRequest = await creationRequestPromise;
   expect(creationRequest.postDataJSON()).toMatchObject({
+    mode: 'supervised',
+    investigator: { enabled: true, primaryReplicates: 1, maxTurns: 12, maxPrimaryEvaluations: 3, maxWallTimeMs: 7_200_000, maxAgentTokens: 2_000_000 },
     evaluation: { replicates: 2 },
     targetExcluded: {
       protocol: 'standard-primary-v2',
@@ -1360,3 +1889,54 @@ test('provides a mobile drawer, defaults lineage to list, and preserves campaign
   });
   expect(rejected.status()).toBe(400);
 });
+
+for (const enabled of [true, false]) {
+  test(`creates automatic campaigns with investigator ${enabled ? 'custom budgets' : 'disabled'}`, async ({ page }) => {
+    const id = enabled ? 'custom-investigator-ui' : 'disabled-investigator-ui';
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.goto(`${baseUrl}/campaigns/new`);
+    await page.getByLabel('Campaign ID').fill(id);
+    await page.getByLabel('Research goal').fill('Keep autonomous investigation independent of campaign control mode and planner budgets.');
+    await page.getByLabel('Control mode').selectOption('automatic');
+    await page.getByLabel('Planner repository').fill(plannerRepo);
+    await page.getByLabel('Workflows repository').fill(workflowsRepo);
+    await page.getByLabel('Planner environment file').fill(environmentFile);
+    await page.getByLabel('Planner seed revision').fill(seedSha);
+    await page.getByLabel('Workflows revision').fill(workflowsSha);
+    await page.getByLabel('Primary requirements ZIP').setInputFiles(primaryZip);
+    await page.getByLabel('Holdout requirements ZIP').setInputFiles(holdoutZip);
+    await page.getByText('Advanced investigator budgets', { exact: true }).click();
+    const screening = page.getByLabel('Primary screening replicates');
+    await expect(screening).toHaveValue('1');
+    await expect(screening).toHaveAttribute('min', '1');
+    await expect(screening).toHaveAttribute('max', '3');
+    await screening.fill('2');
+    await page.getByLabel('Maximum investigator turns').fill('6');
+    await page.getByLabel('Maximum primary evaluations').fill('2');
+    await page.getByLabel('Investigator wall time (minutes)').fill('45');
+    await page.getByLabel('Maximum investigator tokens').fill('120000');
+    await page.getByLabel('Enable autonomous investigator').uncheck();
+    await expect(page.getByLabel('Maximum investigator turns')).toBeDisabled();
+    await expect(screening).toBeDisabled();
+    if (enabled) {
+      await page.getByLabel('Enable autonomous investigator').check();
+      await expect(page.getByLabel('Maximum investigator turns')).toHaveValue('6');
+      await page.getByLabel('Maximum investigator turns').fill('0');
+      await page.getByText('Advanced investigator budgets', { exact: true }).click();
+      await page.getByRole('button', { name: 'Create frozen campaign' }).click();
+      await expect(page.getByLabel('Maximum investigator turns')).toBeVisible();
+      await page.getByLabel('Maximum investigator turns').fill('6');
+    }
+    expect(await page.evaluate<number>('document.documentElement.scrollWidth')).toBe(390);
+    const request = page.waitForRequest((request) => request.method() === 'POST' && request.url() === `${baseUrl}/api/campaigns`);
+    await page.getByRole('button', { name: 'Create frozen campaign' }).click();
+    const input = (await request).postDataJSON();
+    expect(input.mode).toBe('automatic');
+    expect(input.evaluation).toEqual({ replicates: 3, replicateConcurrency: 2 });
+    expect(input.investigator).toEqual(enabled
+      ? { enabled: true, primaryReplicates: 2, maxTurns: 6, maxPrimaryEvaluations: 2, maxWallTimeMs: 2_700_000, maxAgentTokens: 120_000 }
+      : { enabled: false });
+    await expect(page).toHaveURL(`${baseUrl}/campaigns/${id}/overview`);
+    expect(database.getCampaign(id).config.investigator?.enabled).toBe(enabled);
+  });
+}

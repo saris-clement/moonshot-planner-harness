@@ -39,6 +39,18 @@ The harness uses a three-wide beam search rather than a genetic algorithm. Every
 
 Patch crossover is intentionally excluded: combining independent source-policy changes creates merge noise and makes an observed result impossible to assign to one mechanism.
 
+### Optional Investigator Loop
+
+`investigator.enabled` opts CLI/API campaigns into persistent per-candidate investigation instead of strategist/mutator attempts; absent or disabled configuration retains existing behavior. New campaign UI defaults to enabled. Campaign control mode and unattended tool permission remain independent.
+
+An investigator owns revisable hypotheses, not the harness's execution policy. The coordinator records each request before execution, enforces exact-patch test prerequisites for primary trials, and archives action-specific requests, pins, patches, receipts/failures, logs, and planner artifacts under `investigation/action-NNN/`. Finalization requires an unchanged evaluated patch and matching preregistration, full configured tests, and semantic review before the final primary/holdout/configured excluded cohorts. Test success and session finalization are not correctness or promotion decisions.
+
+Screening evaluates the entire primary pack with `investigator.primaryReplicates` (integer 1..3, default 1 for future trials). Baseline and final cohorts retain `evaluation.replicates` (2 in V2); screening is not a substitute for those final cohorts. Provisional reference labels are sufficient to screen and finalize. Human-reviewed labels are not an admission prerequisite, and the semantic review is a model judgment, not a human gate. One screening replicate provides no agreement/stability measurement.
+
+Per-session budgets bound turns, primary evaluation attempts, wall time, and agent tokens independently of planner telemetry. SQLite stores session identity, action status, unknown usage, reasons, and harness/context pins. Stop/resume retains this history; interrupted actions are identified rather than replayed.
+
+`runtimeAnswerLedger.ts` freezes repeated semantic answers in investigator campaigns. Its key binds the semantic question (including coverage and option meanings) to campaign/benchmark, resolved pack, workflows, environment, model/variant, versioned answer policy, and target-source context. Transient variant, replicate, run, and question IDs are provenance, not distinct answer scopes. An exclusive immutable file is bound to a SQLite commit event; later reuse checks its file, input, and answer hashes, remaps selected option IDs, and records a per-run receipt. Unbound, missing, or altered entries fail closed. New questions/contexts can still resolve new answers, and complete decision sets are not fixed. Ledger receipts, question audits, decision-set hashes, and cohort comparisons diagnose those limits; this is neither strict global replay nor verified product truth.
+
 ## Sources Of Truth
 
 | Data | Authority |
@@ -71,7 +83,7 @@ The harness archives stack logs and S3 objects before invoking graceful planner 
 - A mutator receives one hypothesis and the genericity constraints. It edits only its disposable planner worktree.
 - The blind judge receives requirement-level run facts and read-only access to the frozen workflows source. It does not see the mutation or experiment score.
 - After judging and stack teardown, a read-only diagnostician receives a bounded immutable reconstruction with explicit durable, Langfuse, deterministic, model-inference, and not-captured provenance. Its findings remain unverified and cannot affect scoring.
-- The strategist must cite current-parent diagnosis finding IDs. The mutator receives only those selected findings and their cited evidence, counterevidence, limitations, and falsification tests.
+- In default search, the strategist must cite current-parent diagnosis finding IDs. The mutator receives only those selected findings and their cited evidence, counterevidence, limitations, and falsification tests. An opt-in investigator can challenge that diagnosis and preregister a different intervention; its revisions remain unverified.
 - The user accepts or replaces judge suggestions in the dashboard. Accepted labels are not overwritten by later agents.
 
 This separation reduces, but cannot eliminate, correlated errors from using one model family for implementation and evaluation.
@@ -80,7 +92,7 @@ This separation reduces, but cannot eliminate, correlated errors from using one 
 
 Primary scoring is lexicographic: verified accuracy, verified errors, provisional accuracy, then provisional errors. Cost and latency remain comparison dimensions rather than correctness weights.
 
-Every variant runs two repetitions of the primary pack and every unrelated holdout in parallel. Scoring uses a deterministic per-unit consensus while preserving all individual run facts and total cost. A holdout regression against the current parent blocks promotion. Provider output is stochastic, so decision agreement remains a first-class result rather than being hidden by the consensus.
+Final evaluation runs the configured repetitions of the primary pack and every holdout; V2 fixes two per cohort. Default search scores deterministic per-unit consensus. Investigator-enabled campaigns score raw-replicate mean accuracy and errors against shared labels, while retaining consensus decisions and agreement as separate descriptive measurements. Normal provisional references come from persisted baseline suggestions, and the excluded arm uses its separate baseline excluded judgment/labels; human verification retains precedence. Primary development trials use the label snapshot pinned in investigator context. Per-benchmark score-basis and cohort-comparison artifacts record references and runtime-context differences. A holdout regression against the current parent blocks promotion. Provider output is stochastic; agreement is not correctness, and repeatedly inspected holdouts are regression data rather than unseen validation.
 
 ## Security
 
@@ -118,7 +130,11 @@ The frontend is native ES modules under `public/`, with no framework or runtime 
 
 The shell uses a compact collapsible desktop sidebar and an accessible mobile drawer. Overview owns campaign operations and active replicate matrices. Experiments owns the filterable ledger. Lineage renders round columns with dependency connectors and an equivalent list. Experiment detail keeps Summary as its default and adds a Markdown tab beside run, question, target-excluded, and artifact views. The server renders GitHub-style Markdown through an allowlisted sanitizer, shifts report headings below the page title, and attaches stable anchors to original Markdown H1-H3 headings. The browser builds a dynamic "On this page" rail from those anchors; deeper headings do not enter the rail. Raw Markdown remains available separately. Human review is a separate route with one central dirty-draft model; navigation, campaign changes, filters, units, and operations all pass through the same guard. SSE refreshes update persisted facts without replacing the draft.
 
-Variant creation writes the initial report before mutation or evaluation starts. The immutable hypothesis record supplies assumptions, selected parent diagnosis findings, instructions, expected impact, and risk. Later refreshes add parent comparisons, protocol-aware normal/excluded measurements, human-label coverage, diagnosis status, and a deterministic conclusion. A lower build count or provisional score is never phrased as verified improvement. Optional human notes are read from a separate sidecar and embedded verbatim without becoming scoring truth.
+Variant creation writes the initial report before mutation or evaluation starts. Default search keeps an immutable hypothesis; investigator mode exposes the latest preregistration and retains per-action revisions in its archive. Later refreshes add parent comparisons, protocol-aware normal/excluded measurements, human-label coverage, diagnosis status, and a deterministic conclusion. Investigator reports also record session/action/budget state and distinguish raw-replicate score basis from consensus observations. Missing final facts yield an explicit failed or incomplete conclusion, not a pending or inferred successful result. A lower build count or provisional score is never phrased as verified improvement. Optional human notes are read from a separate sidecar and embedded verbatim without becoming scoring truth.
+
+The Overview investigator section and Investigation detail tab keep agent budgets separate from planner usage. The timeline renders known result fields compactly, leaves unknown results uninterpreted, and loads artifact paths/raw details only on expansion. `investigator.updated` and running-session polling refresh the view while preserving scoped disclosure, scroll, and focus state. Session chat is not a dashboard surface.
+
+Screening matrices use the latest primary action's completed replicate facts first, then its current execution snapshot count, then screening configuration. Action timestamps separate successive trials and prevent stale screening snapshots from appearing as completed final runs. Final matrices keep the complete baseline/final configured slots. The new one-replicate default does not rewrite archived measurements: legacy trials with two recorded runs remain two-run trials even without the new config field.
 
 Replicate matrices are configured-slot projections, not lists of observed runs. For each benchmark and replicate number, the view left-joins execution state and final `replicateFacts`/`holdoutReplicateFacts`. Final facts take precedence for planner usage, live execution usage fills the current slot, and aggregate consensus usage is never added again. This keeps primary and holdout planner totals once-per-execution and excludes all harness-agent usage.
 
@@ -144,6 +160,10 @@ retry reruns only excluded work. Diagnosis and strategist history include the bi
 not as an independent observation.
 
 ## Change History
+
+### 2026-09-08 - Lightweight Full-Primary Screening
+
+The PR47 autonomous run completed one two-replicate screening in approximately 82 minutes. Its provisional accuracy fell from 35.2% to 33.2%; a revised patch passed 103 targeted tests but was not evaluated. The session abandoned at turn 7 with approximately 25 minutes remaining, without finalization or an improvement claim. Future screening therefore defaults to one full-primary replicate while preserving repeated baseline/final cohorts. See the [aggregate investigation summary](docs/experiments/pr47-autonomous-1/investigation-summary.md); generated records and the archived live configuration remain unchanged.
 
 ### 2026-09-05 - Initial UI-first harness
 

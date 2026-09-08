@@ -26,6 +26,14 @@
     "targetImplementationWorkflow": "client/workflow"
   },
   "mode": "supervised",
+  "investigator": {
+    "enabled": true,
+    "primaryReplicates": 1,
+    "maxTurns": 12,
+    "maxPrimaryEvaluations": 3,
+    "maxWallTimeMs": 7200000,
+    "maxAgentTokens": 2000000
+  },
   "evaluation": {
     "replicates": 2,
     "replicateConcurrency": 2,

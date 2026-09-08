@@ -1,6 +1,8 @@
 import {
   element,
+  formatAgreement,
   formatDuration,
+  formatMeanScore,
   formatNumber,
   formatPercent,
   option,
@@ -17,6 +19,24 @@ import { campaignHeading, routeLink, sectionHeading } from '../ui.js';
 
 function lineageCard(campaign, variants, variant, rank, onPath) {
   const usage = plannerTotals(campaign, variant);
+  // Screening is a preview of a specific immutable trial, never a replacement promotion score.
+  const finalEvaluation = variant.score && variant.facts;
+  const trial = finalEvaluation ? null : variant.investigation?.actions?.findLast((action) =>
+    action.kind === 'evaluate_primary' && action.status === 'completed' && action.result?.score && action.result?.facts,
+  );
+  const score = finalEvaluation ? variant.score : trial?.result.score;
+  const facts = finalEvaluation ? variant.facts : trial?.result.facts;
+  const mean = Boolean(trial) || campaign.config.investigator?.enabled || score?.metricMode === 'replicate_mean';
+  const baselineAccuracy = trial?.result.baselineScore?.provisional?.accuracy;
+  const accuracy = score?.provisional?.accuracy;
+  const delta = Number.isFinite(baselineAccuracy) && Number.isFinite(accuracy) ? (accuracy - baselineAccuracy) * 100 : null;
+  const differentRevision = trial && (
+    (variant.patchHash && trial.patchHash && variant.patchHash !== trial.patchHash) ||
+    (trial.hypothesis && JSON.stringify(variant.hypothesis) !== JSON.stringify(trial.hypothesis))
+  );
+  const reason = variant.investigation?.reason || variant.error;
+  const abandoned = variant.investigation?.status === 'abandoned';
+  const investigationUrl = `/campaigns/${encodeURIComponent(campaign.id)}/experiments/${encodeURIComponent(variant.id)}?tab=investigation`;
   const card = element('article', {
     className: `lineage-card${onPath ? ' current-path' : ''}${variant.id === campaign.currentParentVariantId ? ' current-head' : ''}`,
     attributes: { 'data-lineage-id': variant.id, 'data-parent-id': variant.parentVariantId ?? '' },
@@ -31,16 +51,30 @@ function lineageCard(campaign, variants, variant, rank, onPath) {
       'lineage-card-title',
     ),
     element('p', { className: 'identifier', text: variant.id }),
+    element('div', { className: 'lineage-measurement' }, [
+      element('p', { className: 'overline', text: trial ? `Latest screening: ${trial.id}` : finalEvaluation ? variant.round === 0 ? 'Baseline evaluation' : 'Final evaluation' : 'No evaluation recorded' }),
+      trial ? element('p', { text: trial.hypothesis?.title ?? 'Recorded screening hypothesis' }) : null,
+      differentRevision ? element('p', { className: 'muted', text: 'Latest revision not evaluated. Metrics below belong to the earlier trial.' }) : null,
+    ]),
     element('dl', { className: 'lineage-metrics' }, [
-      element('div', {}, [element('dt', { text: 'Sibling rank' }), element('dd', { text: rank ? `${rank}` : 'Unscored' })]),
-      element('div', {}, [element('dt', { text: 'Verified' }), element('dd', { text: `${formatPercent(variant.score?.verified.accuracy)} · ${variant.score?.verified.labeled ?? 0}/${variant.facts?.unitCount ?? 0}` })]),
-      element('div', {}, [element('dt', { text: 'Provisional' }), element('dd', { text: `${formatPercent(variant.score?.provisional.accuracy)} · ${variant.score?.provisional.labeled ?? 0}` })]),
-      element('div', {}, [element('dt', { text: 'Agreement' }), element('dd', { text: formatPercent(variant.facts?.decisionAgreement) })]),
-      element('div', {}, [element('dt', { text: 'Holdout' }), element('dd', { text: holdoutState(campaign, variant, variants) })]),
-      element('div', {}, [element('dt', { text: 'Cohort drift' }), element('dd', { text: variant.score ? (variant.score.cohortMismatches?.length ? variant.score.cohortMismatches.join(', ') : 'None observed') : 'Not evaluated' })]),
-      element('div', {}, [element('dt', { text: 'Elapsed' }), element('dd', { text: formatDuration(effectiveElapsed(variant.elapsedMs, variant.startedAt, variant.completedAt)) })]),
+      element('div', {}, [element('dt', { text: 'Sibling rank' }), element('dd', { text: rank ? `${rank}` : 'Unranked' })]),
+      element('div', {}, [element('dt', { text: 'Verified' }), element('dd', { className: mean ? 'mean-score' : '', text: !score ? 'Not measured' : score.verified?.labeled === 0 ? 'No reviewed labels' : mean ? formatMeanScore(score.verified) : `${formatPercent(score.verified?.accuracy)} · ${score.verified?.labeled ?? 0}/${facts?.unitCount ?? 0}` })]),
+      element('div', {}, [element('dt', { text: 'Provisional' }), element('dd', { className: mean ? 'mean-score' : '', text: !score ? 'Not measured' : mean ? formatMeanScore(score.provisional) : `${formatPercent(score.provisional?.accuracy)} · ${score.provisional?.labeled ?? 0}` })]),
+      element('div', {}, [element('dt', { text: 'Agreement' }), element('dd', { className: 'agreement-value', text: formatAgreement(facts, trial?.result.replicateFacts?.length || facts?.sampleSize) })]),
+      element('div', {}, [element('dt', { text: 'Holdout' }), element('dd', { text: !finalEvaluation && abandoned ? 'Not run' : holdoutState(campaign, variant, variants) })]),
+      element('div', {}, [element('dt', { text: 'Cohort drift' }), element('dd', { text: score ? (score.cohortMismatches?.length ? score.cohortMismatches.join(', ') : 'None observed') : 'Not evaluated' })]),
+      element('div', {}, [element('dt', { text: variant.investigation ? 'Investigation time' : 'Elapsed' }), element('dd', { text: formatDuration(variant.investigation
+        ? effectiveElapsed(null, variant.investigation.startedAt, variant.investigation.status === 'running' ? null : variant.investigation.updatedAt)
+        : effectiveElapsed(variant.elapsedMs, variant.startedAt, variant.completedAt)) })]),
       element('div', {}, [element('dt', { text: 'Planner tokens' }), element('dd', { text: formatNumber(usage.observations ? usage.totalTokens : null) })]),
     ]),
+    delta !== null ? element('p', { className: 'lineage-comparison', text: `Baseline ${formatPercent(baselineAccuracy)} · ${delta > 0 ? '+' : ''}${delta.toFixed(1)} pp provisional` }) : null,
+    reason ? element('section', { className: 'lineage-outcome' }, [
+      element('h3', { text: abandoned && !finalEvaluation ? 'Abandoned before final evaluation' : 'Recorded outcome' }),
+      element('p', { className: 'muted', text: variant.investigation?.reason ? 'Agent explanation, not verified causality' : 'Coordinator record' }),
+      element('p', { text: reason }),
+    ]) : null,
+    variant.investigation ? routeLink('View investigation', investigationUrl, 'lineage-investigation-link') : null,
     variant.id === campaign.currentParentVariantId
       ? element('div', { className: 'head-flag', text: 'Current campaign head' })
       : null,
@@ -158,7 +192,9 @@ export function lineagePage(context, route) {
   return element('div', { className: 'page lineage-page' }, [
     campaignHeading(campaign, context),
     element('div', { className: 'lineage-heading' }, [
-      sectionHeading('Lineage', `${variants.length} experiment nodes`, 'Sibling rank follows the primary lexicographic score rubric. No composite score is shown.'),
+      sectionHeading('Lineage', `${variants.length} experiment nodes`, campaign.config.investigator?.enabled
+        ? 'Rank uses baseline/final scores only. Screening previews identify the measured trial and do not score an unevaluated revision. Agreement measures consistency across replicas.'
+        : 'Sibling rank follows the primary lexicographic score rubric. No composite score is shown.'),
       controls,
     ]),
     view === 'graph'

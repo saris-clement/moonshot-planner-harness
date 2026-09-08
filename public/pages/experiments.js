@@ -1,6 +1,8 @@
 import {
   element,
+  formatAgreement,
   formatDuration,
+  formatMeanScore,
   formatMoney,
   formatNumber,
   formatPercent,
@@ -17,6 +19,7 @@ import {
   scopedQuestions,
 } from '../models.js';
 import { campaignHeading, routeLink, sectionHeading } from '../ui.js';
+import { investigationSummary } from '../investigation.js';
 
 function readFilters(query) {
   return {
@@ -150,6 +153,7 @@ function ledger(campaign, variants) {
   const body = element('tbody');
   for (const variant of variants) {
     const usage = plannerTotals(campaign, variant);
+    const mean = campaign.config.investigator?.enabled || variant.score?.metricMode === 'replicate_mean';
     body.append(
       element('tr', { attributes: { 'data-testid': `experiment-row-${variant.id}` } }, [
         tableCell(String(variant.ordinal).padStart(3, '0'), 'mono'),
@@ -161,13 +165,21 @@ function ledger(campaign, variants) {
           ),
           element('small', { text: variant.hypothesis.expectedImpact }),
           element('span', { className: 'identifier', text: variant.id }),
+          variant.investigation ? routeLink(
+            investigationSummary(variant.investigation),
+            `/campaigns/${encodeURIComponent(campaign.id)}/experiments/${encodeURIComponent(variant.id)}?tab=investigation`,
+            'ledger-investigation',
+          ) : null,
         ]),
         tableCell(`R${variant.round} · ${variant.parentVariantId ?? 'seed'}`, 'mono'),
         element('td', {}, [statusLabel(variant.status)]),
-        tableCell(resultState(variant)),
-        tableCell(`${formatPercent(variant.score?.verified.accuracy)} · ${variant.score?.verified.labeled ?? 0}`, 'mono'),
-        tableCell(`${formatPercent(variant.score?.provisional.accuracy)} · ${variant.score?.provisional.labeled ?? 0}`, 'mono'),
-        tableCell(formatPercent(variant.facts?.decisionAgreement), 'mono'),
+        element('td', {}, [
+          element('span', { text: resultState(variant) === 'consensus' ? 'Consensus decisions' : resultState(variant) }),
+          mean ? element('small', { className: 'score-basis', text: 'Score: replicate mean' }) : null,
+        ]),
+        tableCell(mean ? formatMeanScore(variant.score?.verified) : `${formatPercent(variant.score?.verified.accuracy)} · ${variant.score?.verified.labeled ?? 0}`, 'mono'),
+        tableCell(mean ? formatMeanScore(variant.score?.provisional) : `${formatPercent(variant.score?.provisional.accuracy)} · ${variant.score?.provisional.labeled ?? 0}`, 'mono'),
+        tableCell(formatAgreement(variant.facts), 'mono'),
         tableCell(holdoutState(campaign, variant, campaign.variants)),
         tableCell(formatNumber(scopedQuestions(variant).length), 'mono numeric'),
         tableCell(formatDuration(effectiveElapsed(variant.elapsedMs, variant.startedAt, variant.completedAt)), 'mono'),

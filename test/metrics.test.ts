@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   compareCohort,
+  compareScores,
+  computeReplicateMeanScore,
   computeTargetExcludedGate,
   computeScore,
   consensusRunFacts,
@@ -55,6 +57,23 @@ const run = {
     durationMs: 1_000,
   },
 };
+
+function referenceLabel(
+  unitKey: string,
+  expectedDecision: LabelRecord['expectedDecision'],
+  status: LabelRecord['status'] = 'verified',
+): LabelRecord {
+  return {
+    campaignId: 'campaign',
+    benchmark: 'primary',
+    unitKey,
+    expectedDecision,
+    classification: 'system_error',
+    rationale: 'Fixed reference expectation',
+    status,
+    updatedAt: '2026-09-07T00:00:00.000Z',
+  };
+}
 
 test('extractRunFacts preserves unit-level evidence and measured totals', () => {
   const facts = extractRunFacts(analysis, run);
@@ -149,6 +168,162 @@ test('consensus uses majority decisions and retains replicate cost', () => {
   assert.equal(consensus.decisions.reuse, 1);
   assert.equal(consensus.decisionAgreement, 0.5);
   assert.equal(consensus.usage.totalTokens, 360);
+});
+
+test('replicate mean avoids pessimistic and optimistic two-replica consensus tie bias', () => {
+  const first = extractRunFacts(analysis, run);
+  const second = structuredClone(first);
+  second.units[0]!.decision = 'reuse';
+  second.units[0]!.sourceRefs = [{ path: 'src/shared/a.ts' }];
+  second.decisions = { build: 0, reuse: 1, extend: 1, defer: 0, question: 0 };
+  const runs = [first, second];
+  const before = structuredClone(runs);
+  const labels = [referenceLabel('unit-a', 'reuse')];
+  const consensus = consensusRunFacts(runs);
+  assert.equal(computeScore(consensus, labels, null).verified.accuracy, 0);
+  const mean = computeReplicateMeanScore(runs, labels, null);
+  assert.deepEqual(mean.verified, { labeled: 1, correct: 0.5, errors: 0.5, accuracy: 0.5 });
+  assert.deepEqual(mean.decisionErrors, { build: 0.5, reuse: 0, extend: 0, defer: 0, question: 0 });
+  assert.deepEqual(mean, computeReplicateMeanScore([second, first], labels, null));
+  const threeReplicates = computeReplicateMeanScore([first, second, second], labels, null);
+  assert.deepEqual(threeReplicates.verified, {
+    labeled: 1, correct: 2 / 3, errors: 1 / 3, accuracy: 2 / 3,
+  });
+  assert.equal(threeReplicates.decisionErrors.build, 1 / 3);
+
+  const buildLabels = [referenceLabel('unit-a', 'build')];
+  assert.equal(computeScore(consensus, buildLabels, null).verified.accuracy, 1);
+  assert.equal(computeReplicateMeanScore(runs, buildLabels, null).verified.accuracy, 0.5);
+  assert.deepEqual(runs, before);
+});
+
+test('replicate mean uses a fixed label denominator instead of averaging shrinking labeled sets', () => {
+  const complete = extractRunFacts(analysis, run);
+  const incomplete = structuredClone(complete);
+  incomplete.units.pop();
+  incomplete.unitCount = 1;
+  incomplete.decisions.extend = 0;
+
+  for (const status of ['verified', 'suggested'] as const) {
+    const labels = [referenceLabel('unit-a', 'build', status), referenceLabel('unit-b', 'reuse', status)];
+    const category = status === 'verified' ? 'verified' : 'provisional';
+    const naiveMean = (
+      computeScore(complete, labels, null)[category].accuracy! +
+      computeScore(incomplete, labels, null)[category].accuracy!
+    ) / 2;
+    assert.equal(naiveMean, 0.75);
+    const mean = computeReplicateMeanScore([complete, incomplete], labels, null);
+    assert.deepEqual(mean[category], { labeled: 2, correct: 1, errors: 1, accuracy: 0.5 });
+    assert.deepEqual(mean.cohortMismatches, ['requirement units']);
+    // Missing units count as errors, but do not invent a measured planner decision.
+    assert.deepEqual(mean.decisionErrors, { build: 0, reuse: 0, extend: 0.5, defer: 0, question: 0 });
+    assert.deepEqual(mean, computeReplicateMeanScore([incomplete, complete], labels, null));
+  }
+});
+
+test('replicate mean retains labels absent from every run and includes completely missing labeled sets', () => {
+  const complete = extractRunFacts(analysis, run);
+  const empty = structuredClone(complete);
+  empty.units = [];
+  empty.unitCount = 0;
+  empty.decisions = { build: 0, reuse: 0, extend: 0, defer: 0, question: 0 };
+  const labels = [referenceLabel('unit-a', 'build'), referenceLabel('unit-b', 'extend')];
+  const mean = computeReplicateMeanScore([complete, empty], labels, null);
+  assert.deepEqual(mean.verified, { labeled: 2, correct: 1, errors: 1, accuracy: 0.5 });
+  assert.deepEqual(mean.cohortMismatches, ['requirement units']);
+  assert.deepEqual(computeReplicateMeanScore([empty, empty], labels, null).verified, {
+    labeled: 2, correct: 0, errors: 2, accuracy: 0,
+  });
+  assert.deepEqual(
+    computeReplicateMeanScore([complete, complete], [referenceLabel('missing', 'reuse')], null).verified,
+    { labeled: 1, correct: 0, errors: 1, accuracy: 0 },
+  );
+});
+
+test('replicate mean preserves verified, persisted suggestion, then judge precedence', () => {
+  const first = extractRunFacts(analysis, run);
+  const second = structuredClone(first);
+  second.units[0]!.decision = 'reuse';
+  second.units[1]!.decision = 'build';
+  const labels = [
+    referenceLabel('unit-a', 'build', 'suggested'),
+    referenceLabel('unit-a', 'reuse'),
+    referenceLabel('unit-b', 'extend', 'suggested'),
+  ];
+  const judgment: JudgeOutput = {
+    summary: 'Unverified judge suggestions must not override reference labels.',
+    verdicts: ['unit-a', 'unit-b'].map((unitKey) => ({
+      unitKey,
+      expectedDecision: 'build',
+      classification: 'real_gap',
+      confidence: 'high',
+      rationale: 'Judge suggestion',
+      evidence: ['fixture evidence'],
+    })),
+  };
+  const before = structuredClone({ labels, judgment });
+  const mean = computeReplicateMeanScore([first, second], labels, judgment);
+  assert.deepEqual(mean.verified, { labeled: 1, correct: 0.5, errors: 0.5, accuracy: 0.5 });
+  assert.deepEqual(mean.provisional, { labeled: 1, correct: 0.5, errors: 0.5, accuracy: 0.5 });
+  assert.deepEqual(mean.decisionErrors, { build: 1, reuse: 0, extend: 0, defer: 0, question: 0 });
+  assert.deepEqual({ labels, judgment }, before);
+
+  const judgeOnly = computeReplicateMeanScore([first, second], [], judgment);
+  assert.deepEqual(judgeOnly.verified, { labeled: 0, correct: 0, errors: 0, accuracy: null });
+  assert.deepEqual(judgeOnly.provisional, { labeled: 2, correct: 1, errors: 1, accuracy: 0.5 });
+  const missingVerdict = structuredClone(judgment);
+  missingVerdict.verdicts[1]!.unitKey = 'missing';
+  assert.deepEqual(computeReplicateMeanScore([first, second], [], missingVerdict).provisional, {
+    labeled: 2, correct: 0.5, errors: 1.5, accuracy: 0.25,
+  });
+});
+
+test('replicate mean returns null accuracy without labels and rejects an empty replicate collection', () => {
+  const facts = extractRunFacts(analysis, run);
+  for (const judgment of [null, { summary: 'No suggestions', verdicts: [] }]) {
+    assert.deepEqual(computeReplicateMeanScore([facts, facts], [], judgment), {
+      cohortMismatches: [],
+      verified: { labeled: 0, correct: 0, errors: 0, accuracy: null },
+      provisional: { labeled: 0, correct: 0, errors: 0, accuracy: null },
+      decisionErrors: { build: 0, reuse: 0, extend: 0, defer: 0, question: 0 },
+    });
+  }
+  assert.throws(() => computeReplicateMeanScore([], [], null), /without replicate facts/);
+});
+
+test('replicate mean attaches deduplicated pin and semantic mismatches across all runs', () => {
+  const first = extractRunFacts(analysis, run);
+  const second = structuredClone(first);
+  second.pins = { source: 'other' };
+  const third = structuredClone(second);
+  third.units[0]!.semantics = 'Different meaning';
+  assert.deepEqual(computeReplicateMeanScore([first, second, third], [], null).cohortMismatches, [
+    'analysis pins', 'requirement units',
+  ]);
+
+  first.pins = { inputSetHash: 'same', decisionSetVersion: 1, decisionSetHash: 'a' };
+  second.pins = { inputSetHash: 'same', decisionSetVersion: 7, decisionSetHash: 'b' };
+  second.units.reverse();
+  assert.deepEqual(computeReplicateMeanScore([first, second], [], null).cohortMismatches, []);
+});
+
+test('replicate mean matches single-run scoring for a complete labeled cohort', () => {
+  const facts = extractRunFacts(analysis, run);
+  const labels = [referenceLabel('unit-a', 'reuse'), referenceLabel('unit-b', 'extend', 'suggested')];
+  assert.deepEqual(computeReplicateMeanScore([facts], labels, null), computeScore(facts, labels, null));
+});
+
+test('score comparison still prioritizes verified mean accuracy over provisional accuracy', () => {
+  const first = extractRunFacts(analysis, run);
+  const second = structuredClone(first);
+  second.units[0]!.decision = 'reuse';
+  second.units[1]!.decision = 'build';
+  const labels = [referenceLabel('unit-a', 'reuse'), referenceLabel('unit-b', 'extend', 'suggested')];
+  const betterVerified = computeReplicateMeanScore([first, second], labels, null);
+  const betterProvisional = computeReplicateMeanScore([first, first], labels, null);
+  assert.ok(compareScores(betterVerified, betterProvisional) < 0);
+  assert.ok(compareScores(betterProvisional, betterVerified) > 0);
+  assert.equal(compareScores(betterVerified, betterVerified), 0);
 });
 
 test('target-excluded gate compares mean raw build rates without rewarding increases', () => {

@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { HarnessDatabase } from '../src/db.js';
+import { AgentRunner } from '../src/agents.js';
 import {
   CampaignOrchestrator,
   complianceBatchExhausted,
@@ -30,6 +31,7 @@ import {
   type Benchmark,
   type BenchmarkQuestionResolution,
   type CampaignRecord,
+  type JudgeOutput,
   type Phase2RunSnapshot,
   type RunFacts,
   type TargetExcludedConfig,
@@ -177,7 +179,7 @@ function imageInspectCommand(imageId: string): typeof runCommand {
   });
 }
 
-async function v2LifecycleFixture(id: string): Promise<{
+async function v2LifecycleFixture(id: string, investigator = false): Promise<{
   root: string;
   paths: HarnessPaths;
   database: HarnessDatabase;
@@ -215,6 +217,7 @@ async function v2LifecycleFixture(id: string): Promise<{
     seedRevision: 'seed',
     workflowsRevision: 'workflows',
     evaluation: { replicates: 2, replicateConcurrency: 2 },
+    ...(investigator ? { investigator: { enabled: true } } : {}),
     targetExcluded: {
       protocol: 'standard-primary-v2',
       targetImplementationWorkflow: 'trumark/deceased-accounts',
@@ -284,6 +287,289 @@ async function v2LifecycleFixture(id: string): Promise<{
   });
   return { root, paths, database, campaign, variant, targetConfig };
 }
+
+type ScoringInternals = {
+  judgeBenchmark: (
+    campaign: CampaignRecord, variant: VariantRecord, benchmark: Benchmark, facts: RunFacts,
+    workflowsSource: string, directory: string, replicates?: readonly RunFacts[] | null,
+  ) => Promise<{ judgment: JudgeOutput; score: NonNullable<VariantRecord['score']> }>;
+  judgeTargetExcluded: (
+    campaign: CampaignRecord, variant: VariantRecord, benchmark: Benchmark, facts: RunFacts,
+    config: TargetExcludedConfig, directory: string, replicates?: readonly RunFacts[] | null,
+  ) => Promise<{ judgment: JudgeOutput; score: NonNullable<VariantRecord['score']> }>;
+  ensureTargetExcludedWorkflowsSource: () => Promise<string>;
+  ensureFrozenWorkflowsSource: () => Promise<string>;
+  recoverEvaluation: (campaign: CampaignRecord, variant: VariantRecord) => Promise<VariantRecord>;
+  runDiagnosis: () => Promise<void>;
+  refreshReports: () => Promise<void>;
+};
+
+function scoringJudgment(expectedDecision: 'build' | 'reuse'): JudgeOutput {
+  return {
+    summary: 'Unverified fixture reference',
+    verdicts: [{
+      unitKey: 'unit-a', expectedDecision, classification: 'uncertain', confidence: 'medium',
+      rationale: 'Fixture expectation', evidence: ['fixture evidence'],
+    }],
+  };
+}
+
+test('investigator judging scores raw replicates with stable labels and archives the score basis', async (t) => {
+  const fixture = await v2LifecycleFixture('investigator-score-basis', true);
+  try {
+    const { database, campaign, variant, paths } = fixture;
+    const source = path.join(fixture.root, 'source');
+    campaign.workflowsSha = await gitFixture(source);
+    const first = completedFacts();
+    first.pins = { inputSetHash: 'same-input', decisionSetHash: 'answer-a' };
+    const second = structuredClone(first);
+    second.units[0]!.decision = 'reuse';
+    second.decisions = { build: 0, reuse: 1, extend: 0, defer: 0, question: 0 };
+    second.pins.decisionSetHash = 'answer-b';
+    database.upsertLabel({
+      campaignId: campaign.id, benchmark: 'primary', unitKey: 'unit-a', expectedDecision: 'reuse',
+      status: 'suggested', classification: 'uncertain', rationale: 'Persisted reference',
+    });
+    t.mock.method(AgentRunner.prototype, 'judge', async () => scoringJudgment('build'));
+    const internal = new CampaignOrchestrator(paths, database) as unknown as ScoringInternals;
+    const directory = path.join(paths.artifacts, campaign.id, variant.id, 'primary');
+    const result = await internal.judgeBenchmark(
+      campaign, variant, campaign.config.benchmarks[0]!, first, source, directory, [first, second],
+    );
+    assert.deepEqual(result.score.provisional, { labeled: 1, correct: 0.5, errors: 0.5, accuracy: 0.5 });
+    assert.equal(result.judgment.verdicts[0]!.expectedDecision, 'build');
+    const basis = JSON.parse(await readFile(path.join(directory, 'score-basis.json'), 'utf8'));
+    assert.equal(basis.schemaVersion, 1);
+    assert.equal(basis.metricMode, 'replicate-mean');
+    assert.equal(basis.labelHash, canonicalHash(database.listLabels(campaign.id, 'primary')));
+    assert.deepEqual(basis.score, result.score);
+    assert.equal(basis.replicateCount, 2);
+    const comparison = JSON.parse(await readFile(path.join(directory, 'cohort-comparison.json'), 'utf8'));
+    assert.equal(comparison.decisionSetHashVariation, true);
+    assert.match(comparison.notes.join(' '), /not globally frozen/);
+    assert.match(comparison.notes.join(' '), /hashes vary/i);
+
+    second.units[0]!.semantics = 'Drift within replicates';
+    const baselineFacts = structuredClone(first);
+    baselineFacts.pins.inputSetHash = 'other-input';
+    database.updateVariant(variant.id, { facts: baselineFacts });
+    const candidate = { ...variant, id: `${campaign.id}-v001`, round: 1 };
+    const drifted = await internal.judgeBenchmark(
+      campaign, candidate, campaign.config.benchmarks[0]!, first, source, directory, [first, second],
+    );
+    assert.deepEqual(new Set(drifted.score.cohortMismatches), new Set(['requirement units', 'analysis pins']));
+
+    const legacy = { ...campaign, config: { ...campaign.config, investigator: { ...campaign.config.investigator!, enabled: false } } };
+    const oldScore = await internal.judgeBenchmark(
+      legacy, variant, campaign.config.benchmarks[0]!, first, source, directory,
+    );
+    assert.equal(oldScore.score.provisional.accuracy, 0);
+    assert.equal(JSON.parse(await readFile(path.join(directory, 'score-basis.json'), 'utf8')).metricMode, 'consensus');
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('investigator excluded scoring freezes the baseline judgment rather than the candidate oracle', async (t) => {
+  const fixture = await v2LifecycleFixture('investigator-excluded-reference', true);
+  try {
+    const { database, campaign, variant, paths, targetConfig } = fixture;
+    const facts = completedFacts();
+    const second = structuredClone(facts);
+    second.units[0]!.decision = 'reuse';
+    second.decisions = { build: 0, reuse: 1, extend: 0, defer: 0, question: 0 };
+    const baselineJudgment = scoringJudgment('reuse');
+    database.createTargetExcludedConfig(campaign.id, targetConfig);
+    database.createTargetExcludedEvaluation(campaign.id, variant.id);
+    database.updateTargetExcludedEvaluation(variant.id, {
+      excludedFacts: facts, excludedReplicateFacts: [facts, facts], judgment: baselineJudgment,
+    });
+    const candidate = { ...variant, id: `${campaign.id}-v001`, round: 1 };
+    const internal = new CampaignOrchestrator(paths, database) as unknown as ScoringInternals;
+    internal.ensureTargetExcludedWorkflowsSource = async () => fixture.root;
+    const judge = t.mock.method(AgentRunner.prototype, 'judge', async () => scoringJudgment('build'));
+    const directory = path.join(paths.artifacts, campaign.id, variant.id, 'primary');
+    const result = await internal.judgeTargetExcluded(
+      campaign, candidate, campaign.config.benchmarks[0]!, facts, targetConfig, directory, [facts, second],
+    );
+    assert.equal(result.judgment.verdicts[0]!.expectedDecision, 'build');
+    assert.equal(result.score.provisional.accuracy, 0.5);
+    const basis = JSON.parse(await readFile(path.join(directory, 'score-basis.json'), 'utf8'));
+    assert.equal(basis.referenceJudgmentVariantId, variant.id);
+    assert.equal(basis.referenceJudgmentHash, canonicalHash(baselineJudgment));
+    assert.deepEqual(basis.referenceJudgment, baselineJudgment);
+    judge.mock.mockImplementation(async () => scoringJudgment('reuse'));
+    const changedOracle = await internal.judgeTargetExcluded(
+      campaign, candidate, campaign.config.benchmarks[0]!, facts, targetConfig, directory, [facts, second],
+    );
+    assert.deepEqual(changedOracle.score, result.score);
+
+    database.updateTargetExcludedEvaluation(variant.id, { judgment: null });
+    await assert.rejects(
+      internal.judgeTargetExcluded(campaign, candidate, campaign.config.benchmarks[0]!, facts, targetConfig, directory, [facts, second]),
+      /baseline.*judgment/i,
+    );
+    const baseline = await internal.judgeTargetExcluded(
+      campaign, variant, campaign.config.benchmarks[0]!, facts, targetConfig, directory, [facts, second],
+    );
+    assert.equal(baseline.score.provisional.accuracy, 0.5);
+
+    const legacy = { ...campaign, config: { ...campaign.config, investigator: { ...campaign.config.investigator!, enabled: false } } };
+    judge.mock.mockImplementation(async () => scoringJudgment('build'));
+    const legacyResult = await internal.judgeTargetExcluded(
+      legacy, candidate, campaign.config.benchmarks[0]!, facts, targetConfig, directory,
+    );
+    assert.equal(legacyResult.score.provisional.accuracy, 1);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('investigator judging fails closed on missing or incomplete raw replicate arrays before invoking agents', async (t) => {
+  const fixture = await v2LifecycleFixture('investigator-missing-replicates', true);
+  try {
+    const internal = new CampaignOrchestrator(fixture.paths, fixture.database) as unknown as ScoringInternals;
+    const judge = t.mock.method(AgentRunner.prototype, 'judge', async () => { throw new Error('agent must not run'); });
+    const { campaign, variant, targetConfig } = fixture;
+    const facts = completedFacts();
+    for (const replicates of [undefined, null, [], [facts]]) {
+      await assert.rejects(
+        internal.judgeBenchmark(campaign, variant, campaign.config.benchmarks[0]!, facts, fixture.root, fixture.root, replicates),
+        /raw replicate facts/i,
+      );
+      await assert.rejects(
+        internal.judgeTargetExcluded(campaign, variant, campaign.config.benchmarks[0]!, facts, targetConfig, fixture.root, replicates),
+        /raw replicate facts/i,
+      );
+    }
+    assert.equal(judge.mock.callCount(), 0);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('investigator recovery forwards archived primary and holdout replicate arrays to judging', async (t) => {
+  const fixture = await v2LifecycleFixture('investigator-recovery-replicates', true);
+  try {
+    const internal = new CampaignOrchestrator(fixture.paths, fixture.database) as unknown as ScoringInternals;
+    internal.ensureFrozenWorkflowsSource = async () => fixture.root;
+    internal.runDiagnosis = async () => undefined;
+    const judgeBenchmark = internal.judgeBenchmark.bind(internal);
+    const observed: string[] = [];
+    internal.judgeBenchmark = async (_campaign, _variant, benchmark, facts, _source, _directory, replicates) => {
+      assert.deepEqual(replicates, [facts, facts]);
+      observed.push(benchmark.name);
+      return { judgment: scoringJudgment('build'), score: {
+        cohortMismatches: [], verified: { labeled: 0, correct: 0, errors: 0, accuracy: null },
+        provisional: { labeled: 1, correct: 1, errors: 0, accuracy: 1 },
+        decisionErrors: { build: 0, reuse: 0, extend: 0, defer: 0, question: 0 },
+      } };
+    };
+    const recovered = await internal.recoverEvaluation(fixture.campaign, fixture.variant);
+    assert.equal(recovered.status, 'review', recovered.error ?? undefined);
+    assert.deepEqual(observed, ['primary', 'holdout']);
+    internal.judgeBenchmark = judgeBenchmark;
+    const judge = t.mock.method(AgentRunner.prototype, 'judge', async () => { throw new Error('agent must not run'); });
+    await writeFile(path.join(fixture.paths.artifacts, fixture.campaign.id, fixture.variant.id, 'primary/replicates.json'), 'null');
+    const failed = await internal.recoverEvaluation(fixture.campaign, recovered);
+    assert.equal(failed.status, 'failed');
+    assert.match(failed.error!, /raw replicate facts/i);
+    assert.equal(judge.mock.callCount(), 0);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('investigator verified-label rescores use raw facts and retain mismatch evidence', async () => {
+  const fixture = await v2LifecycleFixture('investigator-label-rescore', true);
+  try {
+    const { database, campaign, variant } = fixture;
+    const first = completedFacts();
+    const second = structuredClone(first);
+    second.units[0]!.decision = 'reuse';
+    second.units[0]!.semantics = 'Replicate drift';
+    const score = {
+      cohortMismatches: ['analysis pins'], verified: { labeled: 0, correct: 0, errors: 0, accuracy: null },
+      provisional: { labeled: 1, correct: 1, errors: 0, accuracy: 1 },
+      decisionErrors: { build: 0, reuse: 0, extend: 0, defer: 0, question: 0 },
+    };
+    database.updateVariant(variant.id, {
+      replicateFacts: [first, second], judgment: scoringJudgment('build'), score,
+      holdoutReplicateFacts: { holdout: [first, second] },
+      holdoutJudgments: { holdout: scoringJudgment('build') }, holdoutScores: { holdout: score },
+    });
+    const orchestrator = new CampaignOrchestrator(fixture.paths, database);
+    (orchestrator as unknown as ScoringInternals).refreshReports = async () => undefined;
+    for (const benchmark of ['primary', 'holdout']) {
+      await orchestrator.saveVerifiedLabel({
+        campaignId: campaign.id, benchmark, unitKey: 'unit-a', expectedDecision: 'reuse',
+        classification: 'uncertain', rationale: 'Human reference',
+      });
+      const saved = database.getVariant(variant.id);
+      const rescored = benchmark === 'primary' ? saved.score! : saved.holdoutScores!.holdout!;
+      assert.equal(rescored.verified.accuracy, 0.5);
+      assert.deepEqual(new Set(rescored.cohortMismatches), new Set(['analysis pins', 'requirement units']));
+    }
+    database.updateVariant(variant.id, { replicateFacts: null, holdoutReplicateFacts: null });
+    for (const benchmark of ['primary', 'holdout']) {
+      await assert.rejects(orchestrator.saveVerifiedLabel({
+        campaignId: campaign.id, benchmark, unitKey: 'unit-a', expectedDecision: 'build',
+        classification: 'uncertain', rationale: 'Cannot rescore without raw facts',
+      }), /raw replicate facts/i);
+      assert.equal(database.listLabels(campaign.id, benchmark)[0]!.expectedDecision, 'reuse');
+    }
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('investigator excluded label rescores retain the baseline oracle and fail closed without raw facts', async () => {
+  const fixture = await v2LifecycleFixture('investigator-excluded-rescore', true);
+  try {
+    const { database, campaign, variant, targetConfig } = fixture;
+    const facts = completedFacts();
+    database.createTargetExcludedConfig(campaign.id, targetConfig);
+    database.createTargetExcludedEvaluation(campaign.id, variant.id);
+    database.updateTargetExcludedEvaluation(variant.id, {
+      excludedFacts: facts, excludedReplicateFacts: [facts, facts], judgment: scoringJudgment('reuse'),
+    });
+    const candidate = database.createVariant({
+      id: `${campaign.id}-v001`, campaignId: campaign.id, parentVariantId: variant.id,
+      round: 1, ordinal: 1, hypothesis: baselineHypothesisForTest,
+    });
+    database.createTargetExcludedEvaluation(campaign.id, candidate.id);
+    database.updateTargetExcludedEvaluation(candidate.id, {
+      excludedFacts: facts, excludedReplicateFacts: [facts, facts], judgment: scoringJudgment('build'),
+    });
+    const orchestrator = new CampaignOrchestrator(fixture.paths, database);
+    (orchestrator as unknown as ScoringInternals).refreshReports = async () => undefined;
+    await orchestrator.saveTargetExcludedVerifiedLabel({
+      campaignId: campaign.id, unitKey: 'other-unit', expectedDecision: 'build',
+      classification: 'uncertain', rationale: 'Independent human reference',
+    });
+    assert.equal(database.getTargetExcludedEvaluation(candidate.id)!.score!.provisional.accuracy, 0);
+    assert.equal(database.getTargetExcludedEvaluation(candidate.id)!.score!.verified.errors, 1);
+    await orchestrator.saveTargetExcludedVerifiedLabel({
+      campaignId: campaign.id, unitKey: 'unit-a', expectedDecision: 'build',
+      classification: 'uncertain', rationale: 'Verified labels override baseline judge suggestions',
+    });
+    assert.equal(database.getTargetExcludedEvaluation(candidate.id)!.score!.verified.correct, 1);
+    database.updateTargetExcludedEvaluation(candidate.id, { excludedReplicateFacts: null });
+    await assert.rejects(orchestrator.saveTargetExcludedVerifiedLabel({
+      campaignId: campaign.id, unitKey: 'unit-a', expectedDecision: 'reuse',
+      classification: 'uncertain', rationale: 'Cannot rescore without raw facts',
+    }), /raw replicate facts/i);
+    assert.equal(database.listTargetExcludedLabels(campaign.id).find(({ unitKey }) => unitKey === 'unit-a')!.expectedDecision, 'build');
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
 
 async function targetSnapshotFixture(id: string): Promise<{
   fixture: Awaited<ReturnType<typeof v2LifecycleFixture>>;

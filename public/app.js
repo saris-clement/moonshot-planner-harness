@@ -86,7 +86,7 @@ async function refreshCurrent() {
     state.campaigns = state.campaigns.map((campaign) =>
       campaign.id === campaignId ? { ...state.campaign } : campaign,
     );
-    if (!hasDirtyDraft()) await renderCurrent();
+    if (!hasDirtyDraft() && parseRoute().params.campaignId === campaignId) await renderCurrent(true);
   } catch (error) {
     notify(error.message);
   } finally {
@@ -119,6 +119,7 @@ function connectEvents() {
     'campaign.updated',
     'campaign.resumed',
     'variant.updated',
+    'investigator.updated',
     'variant.created',
     'variant.promoted',
     'label.updated',
@@ -258,7 +259,7 @@ function routeTitle(route) {
   return `${titles[route.name] ?? 'Not found'} · Planner Eval`;
 }
 
-async function renderCurrent() {
+async function renderCurrent(preserveLiveView = false) {
   const token = ++renderToken;
   const route = parseRoute();
   document.title = routeTitle(route);
@@ -266,6 +267,14 @@ async function renderCurrent() {
     if (state.campaigns.length === 0) await reloadCampaigns();
     if (route.params.campaignId) await loadCampaign(route.params.campaignId);
     if (token !== renderToken) return;
+    const preserve = preserveLiveView && (route.name === 'overview' || (route.name === 'experiment' && route.query.get('tab') === 'investigation'));
+    const scroll = preserve ? { x: window.scrollX, y: window.scrollY } : null;
+    const positions = preserve ? [...document.querySelectorAll('[data-live-key]')].map((node) => ({
+      key: node.dataset.liveKey, top: node.scrollTop, left: node.scrollLeft,
+    })) : [];
+    const focused = preserve ? document.activeElement : null;
+    const focusKey = focused?.closest('[data-live-key]')?.dataset.liveKey;
+    const focusHref = focused?.getAttribute('href');
     let content;
     if (route.name === 'campaigns') content = campaignsPage(context);
     else if (route.name === 'new-campaign') content = newCampaignPage(context);
@@ -279,6 +288,19 @@ async function renderCurrent() {
       element('p', { text: 'This path is not part of the local evaluation console.' }),
     ]);
     renderShell({ state, route, content, navigate });
+    if (preserve) {
+      for (const position of positions) {
+        const node = document.querySelector(`[data-live-key="${CSS.escape(position.key)}"]`);
+        if (node) { node.scrollTop = position.top; node.scrollLeft = position.left; }
+      }
+      const container = focusKey ? document.querySelector(`[data-live-key="${CSS.escape(focusKey)}"]`) : document;
+      const target = focusHref ? [...(container?.querySelectorAll('a') ?? [])].find((link) => link.getAttribute('href') === focusHref)
+        : focused?.tagName === 'SUMMARY' ? container?.querySelector('summary')
+        : focused?.matches('[data-live-key]') ? container
+        : focused?.id ? document.getElementById(focused.id) : null;
+      target?.focus({ preventScroll: true });
+      window.scrollTo(scroll.x, scroll.y);
+    }
   } catch (error) {
     if (token !== renderToken) return;
     renderShell({
@@ -301,7 +323,7 @@ window.addEventListener('beforeunload', (event) => {
 
 setInterval(() => {
   if (
-    state.campaign?.variants?.some((variant) => REFRESH_VARIANT_STATUSES.has(variant.status)) &&
+    state.campaign?.variants?.some((variant) => REFRESH_VARIANT_STATUSES.has(variant.status) || variant.investigation?.status === 'running') &&
     !state.refreshRunning
   ) refreshCurrent();
 }, 2_000);

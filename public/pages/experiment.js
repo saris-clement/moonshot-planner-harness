@@ -1,6 +1,6 @@
 import { api, apiText } from '../api.js';
 import { element, formatNumber, formatPercent, statusLabel } from '../dom.js';
-import { holdoutState, isPromotionEligible, scopedQuestions } from '../models.js';
+import { holdoutState, isPromotionEligible, primaryScreening, scopedQuestions } from '../models.js';
 import {
   experimentHeading,
   externalTraceLink,
@@ -12,9 +12,12 @@ import {
   usageSummary,
 } from '../ui.js';
 import { targetExcludedPanel } from './targetExcluded.js';
+import { investigationPanel, investigationSummary } from '../investigation.js';
+import { experimentHelpButton } from '../experimentHelp.js';
 
 const tabs = [
   ['summary', 'Summary'],
+  ['investigation', 'Investigation'],
   ['markdown', 'Markdown'],
   ['runs', 'Runs'],
   ['questions', 'Questions'],
@@ -231,7 +234,10 @@ function markdownPanel(campaign, variant, context) {
     sectionHeading(
       'Research record',
       'Experiment Markdown',
-      'Assumptions and model interpretations remain labeled separately from measured and human-verified evidence.',
+       variant.investigation
+         ? 'Living experiment report: the latest hypothesis, recorded trials, results, and outcome. This is not a finalized plan; finalization, when reached, is recorded explicitly. Investigation contains the detailed history.'
+         : 'Assumptions and model interpretations remain labeled separately from measured and human-verified evidence.',
+       experimentHelpButton('Markdown'),
     ),
     element('div', { className: 'artifact-toolbar' }, [rawLink]),
     element('div', { className: 'markdown-layout' }, [navigation, content]),
@@ -264,9 +270,12 @@ function summaryPanel(campaign, variant) {
     element('div', {}, [element('dt', { text: 'Holdout' }), element('dd', { text: holdoutState(campaign, variant, campaign.variants) })]),
     element('div', {}, [element('dt', { text: 'Artifact collection' }), element('dd', { text: variant.artifactCollectionComplete ? 'Complete' : 'Incomplete' })]),
     element('div', {}, [element('dt', { text: 'Replicate sample' }), element('dd', { text: formatNumber(variant.facts?.sampleSize) })]),
+    element('div', {}, [element('dt', { text: 'Investigation' }), element('dd', {}, [
+      routeLink(investigationSummary(variant.investigation), `/campaigns/${encodeURIComponent(campaign.id)}/experiments/${encodeURIComponent(variant.id)}?tab=investigation`),
+    ])]),
   ]);
   return element('div', { className: 'summary-grid' }, [
-    element('section', {}, [sectionHeading('Rubric', 'Accuracy and agreement'), scoreSummary(variant)]),
+    element('section', {}, [sectionHeading('Rubric', 'Accuracy and agreement'), scoreSummary(variant, campaign)]),
     element('section', {}, [sectionHeading('Telemetry', 'End-to-end and planner-only'), usageSummary(campaign, variant)]),
     element('section', { className: 'summary-wide' }, [sectionHeading('Provenance', 'Experiment position'), relationship]),
     variant.error
@@ -343,16 +352,21 @@ export function experimentPage(context, route) {
     }));
   }
   const questionCount = scopedQuestions(variant).length;
+  const screening = primaryScreening(campaign, variant);
   const panel = selectedTab === 'runs'
     ? element('section', {}, [
         sectionHeading(
           'Replicates',
-          'Configured run matrix',
-          'Planner totals count standard primary and holdout executions only; target-excluded guard runs are excluded from totals.',
+          screening.active ? 'Full-primary screening' : 'Configured run matrix',
+          screening.active
+            ? `${screening.replicateCount} ${screening.countSource} replicate(s) for the latest primary screening. These are full-pack development runs, not final results. Holdout and excluded cohorts run after finalization.`
+            : 'Planner totals count standard primary and holdout executions only; target-excluded guard runs are excluded from totals.',
         ),
         usageSummary(campaign, variant),
         replicateTable(campaign, variant),
       ])
+    : selectedTab === 'investigation'
+      ? investigationPanel(campaign, variant)
     : selectedTab === 'markdown'
       ? markdownPanel(campaign, variant, context)
       : selectedTab === 'questions'

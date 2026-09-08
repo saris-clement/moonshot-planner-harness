@@ -1,6 +1,7 @@
 import { api, uploadRequirementsZip } from '../api.js';
 import { element, option, text } from '../dom.js';
 import { pageHeading } from '../ui.js';
+import { investigatorDefaults } from '../investigation.js';
 
 function field(labelText, name, attributes = {}, className = '') {
   const tag = attributes.multiline ? 'textarea' : attributes.options ? 'select' : 'input';
@@ -76,12 +77,37 @@ export function newCampaignPage(context) {
     field('Concurrent replicates', 'replicateConcurrency', { required: true, type: 'number', min: 1, max: 3, value: 2 }),
     field('Parallel variants', 'concurrency', { required: true, type: 'number', min: 1, max: 3, value: 3 }),
     field('Maximum variants', 'maxVariants', { required: true, type: 'number', min: 1, max: 50, value: 9 }),
+    section('Autonomous investigation'),
+    element('label', { className: 'checkbox wide', attributes: { for: 'campaign-investigatorEnabled' } }, [
+      element('input', { attributes: { id: 'campaign-investigatorEnabled', name: 'investigatorEnabled', type: 'checkbox', checked: true, 'aria-describedby': 'investigator-help' } }),
+      text('Enable autonomous investigator'),
+    ]),
+    element('p', { className: 'wide investigator-help', text: 'Iterate on hypotheses, run tests, and evaluate primary trials within per-experiment budgets. Control mode and human review remain separate; passing tests do not verify correctness.', attributes: { id: 'investigator-help' } }),
+    element('details', { className: 'wide investigator-budget-controls' }, [
+      element('summary', { text: 'Advanced investigator budgets' }),
+      element('fieldset', { attributes: { id: 'investigator-budgets' } }, [
+        element('legend', { text: 'Limits per experiment' }),
+        field('Maximum investigator turns', 'maxTurns', { required: true, type: 'number', min: 1, step: 1, value: investigatorDefaults.maxTurns }),
+        field('Maximum primary evaluations', 'maxPrimaryEvaluations', { required: true, type: 'number', min: 1, step: 1, value: investigatorDefaults.maxPrimaryEvaluations }),
+        field('Primary screening replicates', 'primaryReplicates', { required: true, type: 'number', min: 1, max: 3, step: 1, value: investigatorDefaults.primaryReplicates, 'aria-describedby': 'screening-replicates-help' }),
+        element('p', { className: 'wide investigator-help', text: 'Full primary pack per screening replicate, not a subset. Baseline and final repetitions stay separate (2 for V2). Provisional labels are acceptable; no human-review prerequisite for screening or finalization.', attributes: { id: 'screening-replicates-help' } }),
+        field('Investigator wall time (minutes)', 'investigatorMinutes', { required: true, type: 'number', min: 1, max: 35791, step: 1, value: investigatorDefaults.maxWallTimeMs / 60_000 }),
+        field('Maximum investigator tokens', 'maxAgentTokens', { required: true, type: 'number', min: 1, step: 1, value: investigatorDefaults.maxAgentTokens }),
+      ]),
+    ]),
     element('label', { className: 'checkbox wide', attributes: { for: 'campaign-autoApprove' } }, [
       element('input', { attributes: { id: 'campaign-autoApprove', name: 'autoApprove', type: 'checkbox' } }),
       text('Allow unattended OpenCode tools'),
     ]),
   ]);
   const targetWorkflowInput = form.elements.namedItem('targetImplementationWorkflow');
+  form.elements.namedItem('investigatorEnabled').addEventListener('change', (event) => {
+    form.querySelector('#investigator-budgets').disabled = !event.target.checked;
+  });
+  form.addEventListener('invalid', (event) => {
+    const details = event.target.closest('details');
+    if (details) details.open = true;
+  }, true);
   const replicatesInput = form.elements.namedItem('replicates');
   let standardReplicates = replicatesInput.value;
   let targetEnabled = false;
@@ -157,6 +183,14 @@ export function newCampaignPage(context) {
             { name: values.get('holdoutName'), role: 'holdout', zipPath: holdoutUpload.path, sha256: holdoutUpload.sha256 },
           ],
           mode: values.get('mode'),
+          investigator: values.get('investigatorEnabled') === 'on' ? {
+            enabled: true,
+            maxTurns: Number(values.get('maxTurns')),
+            maxPrimaryEvaluations: Number(values.get('maxPrimaryEvaluations')),
+            primaryReplicates: Number(values.get('primaryReplicates')),
+            maxWallTimeMs: Number(values.get('investigatorMinutes')) * 60_000,
+            maxAgentTokens: Number(values.get('maxAgentTokens')),
+          } : { enabled: false },
           evaluation: {
             replicates: targetImplementationWorkflow ? 2 : Number(values.get('replicates')),
             replicateConcurrency: Number(values.get('replicateConcurrency')),

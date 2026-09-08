@@ -35,6 +35,7 @@ import {
   TargetNormalArmBindingSchema,
 } from './types.js';
 import { mergeExecutionSnapshot } from './executionState.js';
+import type { InvestigationState } from './investigator.js';
 
 type Row = Record<string, unknown>;
 
@@ -91,6 +92,8 @@ function variantFromRow(row: Row): VariantRecord {
     round: Number(row.round),
     ordinal: Number(row.ordinal),
     hypothesis: HypothesisSchema.parse(parseJson<Hypothesis>(row.hypothesis_json)),
+    investigation:
+      row.investigation_json === null ? null : parseJson<InvestigationState>(row.investigation_json),
     status: String(row.status) as VariantStatus,
     worktreePath: row.worktree_path === null ? null : String(row.worktree_path),
     imageTag: row.image_tag === null ? null : String(row.image_tag),
@@ -290,6 +293,7 @@ export class HarnessDatabase {
         round INTEGER NOT NULL,
         ordinal INTEGER NOT NULL,
         hypothesis_json TEXT NOT NULL,
+        investigation_json TEXT,
         status TEXT NOT NULL,
         worktree_path TEXT,
         image_tag TEXT,
@@ -407,6 +411,7 @@ export class HarnessDatabase {
     this.ensureColumn('campaigns', 'lease_owner', 'TEXT');
     this.ensureColumn('campaigns', 'lease_expires_at', 'INTEGER');
     this.ensureColumn('variants', 'holdout_facts_json', 'TEXT');
+    this.ensureColumn('variants', 'investigation_json', 'TEXT');
     this.ensureColumn('variants', 'patch_hash', 'TEXT');
     this.ensureColumn('variants', 'artifact_collection_complete', 'INTEGER NOT NULL DEFAULT 0');
     this.ensureColumn('variants', 'replicate_facts_json', 'TEXT');
@@ -656,6 +661,8 @@ export class HarnessDatabase {
   updateVariant(
     id: string,
     changes: Partial<{
+      hypothesis: HypothesisInput;
+      investigation: InvestigationState | null;
       status: VariantStatus;
       worktreePath: string | null;
       imageTag: string | null;
@@ -695,6 +702,8 @@ export class HarnessDatabase {
     }>,
   ): VariantRecord {
     const columns = {
+      hypothesis: 'hypothesis_json',
+      investigation: 'investigation_json',
       status: 'status',
       worktreePath: 'worktree_path',
       imageTag: 'image_tag',
@@ -733,6 +742,8 @@ export class HarnessDatabase {
       phase2ElapsedMs: 'phase2_elapsed_ms',
     } as const;
     const jsonFields = new Set([
+      'hypothesis',
+      'investigation',
       'facts',
       'replicateFacts',
       'holdoutFacts',
@@ -750,13 +761,13 @@ export class HarnessDatabase {
     const values: SQLInputValue[] = [];
     for (const [key, value] of Object.entries(changes)) {
       const column = columns[key as keyof typeof columns];
-      if (!column) continue;
+      if (!column || value === undefined) continue;
       assignments.push(`${column} = ?`);
       values.push(
         value === null
           ? null
           : jsonFields.has(key)
-            ? JSON.stringify(value)
+            ? JSON.stringify(key === 'hypothesis' ? HypothesisSchema.parse(value) : value)
             : typeof value === 'boolean'
               ? value
                 ? 1

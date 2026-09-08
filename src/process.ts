@@ -11,6 +11,7 @@ export interface RunCommandOptions {
   logPath?: string;
   allowFailure?: boolean;
   maxCapturedBytes?: number;
+  onStdout?: (chunk: Buffer) => void;
 }
 
 export interface CommandResult {
@@ -52,11 +53,28 @@ export async function runCommand(
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let timedOut = false;
+    let callbackError: Error | null = null;
     let killTimer: NodeJS.Timeout | undefined;
+    const kill = (signal: NodeJS.Signals) => {
+      try {
+        if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch {
+        child.kill(signal);
+      }
+    };
 
     child.stdout.on('data', (value: Buffer) => {
       stdoutBytes = appendBounded(stdout, value, stdoutBytes, maxCapturedBytes);
       log?.write(value);
+      if (!callbackError) {
+        try {
+          options.onStdout?.(value);
+        } catch (error) {
+          callbackError = error instanceof Error ? error : new Error(String(error));
+          kill('SIGKILL');
+        }
+      }
     });
     child.stderr.on('data', (value: Buffer) => {
       stderrBytes = appendBounded(stderr, value, stderrBytes, maxCapturedBytes);
@@ -71,14 +89,6 @@ export async function runCommand(
     const timeout = options.timeoutMs
       ? setTimeout(() => {
           timedOut = true;
-          const kill = (signal: NodeJS.Signals) => {
-            try {
-              if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, signal);
-              else child.kill(signal);
-            } catch {
-              child.kill(signal);
-            }
-          };
           kill('SIGTERM');
           killTimer = setTimeout(() => kill('SIGKILL'), 5_000);
         }, options.timeoutMs)
@@ -96,7 +106,9 @@ export async function runCommand(
         stderr: Buffer.concat(stderr).toString('utf8'),
         durationMs: Date.now() - started,
       };
-      if (timedOut) {
+      if (callbackError) {
+        reject(callbackError);
+      } else if (timedOut) {
         reject(new Error(`command timed out after ${options.timeoutMs}ms: ${formatCommand(command, args)}`));
       } else if (result.exitCode !== 0 && !options.allowFailure) {
         reject(

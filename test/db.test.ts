@@ -6,6 +6,61 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { HarnessDatabase } from '../src/db.js';
 import { CampaignConfigSchema, type TargetNormalArmBinding } from '../src/types.js';
+import type { InvestigationState } from '../src/investigator.js';
+
+test('database migrates and durably persists investigation state and revised hypotheses', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'planner-investigation-db-'));
+  const file = path.join(directory, 'test.sqlite');
+  let database = new HarnessDatabase(file);
+  try {
+    const config = CampaignConfigSchema.parse({
+      id: 'persistent-investigation', goal: 'Persist investigation history across coordinator restarts.',
+      plannerRepo: '/tmp/planner', workflowsRepo: '/tmp/workflows', environmentFile: '/tmp/environment.env',
+      seedRevision: 'seed', workflowsRevision: 'workflows',
+      benchmarks: [
+        { name: 'primary', role: 'primary', zipPath: '/tmp/primary.zip' },
+        { name: 'holdout', role: 'holdout', zipPath: '/tmp/holdout.zip' },
+      ],
+    });
+    database.createCampaign(config, 'seed', 'workflows', 'environment', 'remote');
+    const variant = database.createVariant({
+      id: 'persistent-investigation-v001', campaignId: config.id, parentVariantId: null, round: 1, ordinal: 1,
+      hypothesis: { title: 'Initial', rationale: 'Reason', instructions: 'Investigate', expectedImpact: 'Unknown', risk: 'Uncertain' },
+    });
+    database.database.exec('ALTER TABLE variants DROP COLUMN investigation_json');
+    database.close();
+    database = new HarnessDatabase(file);
+    assert.equal(database.getVariant(variant.id).investigation, null);
+    assert.equal(database.getCampaign(config.id).config.investigator, undefined);
+    const hypothesis = { ...variant.hypothesis, title: 'Revised after inspection' };
+    const timestamp = new Date().toISOString();
+    const investigation: InvestigationState = {
+      schemaVersion: 1, sessionId: 'ses_durable', status: 'stopped', startedAt: timestamp, updatedAt: timestamp,
+      turnCount: 2, agentTokens: null, agentCostUsd: 0.25, reason: 'Coordinator stopped',
+      harnessPins: { model: config.agent.model, prompt: 'sha256:prompt' },
+      actions: [{
+        id: 'action-1', kind: 'test', hypothesis: variant.hypothesis, rationale: 'Test the old hypothesis',
+        status: 'interrupted', startedAt: timestamp, completedAt: null, patchHash: 'sha256:patch',
+        artifactDirectory: '.data/turn-1', result: { tests: ['server/test/evidence.test.ts'] }, error: null,
+      }],
+    };
+    database.updateVariant(variant.id, { investigation, hypothesis });
+    database.close();
+    database = new HarnessDatabase(file);
+    assert.deepEqual(database.getVariant(variant.id).investigation, investigation);
+    assert.deepEqual(database.listVariants(config.id)[0]?.hypothesis, hypothesis);
+    assert.equal(database.getVariant(variant.id).investigation?.actions[0]?.hypothesis?.title, 'Initial');
+    assert.throws(() => database.updateVariant(variant.id, { hypothesis: { ...hypothesis, title: '' } }));
+    assert.deepEqual(database.getVariant(variant.id).hypothesis, hypothesis);
+    database.updateVariant(variant.id, {});
+    assert.deepEqual(database.getVariant(variant.id).investigation, investigation);
+    database.updateVariant(variant.id, { investigation: null });
+    assert.equal(database.getVariant(variant.id).investigation, null);
+  } finally {
+    database.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test('database persists campaign lineage, labels, and ordered events', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'planner-eval-db-'));

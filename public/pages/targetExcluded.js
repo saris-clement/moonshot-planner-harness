@@ -298,6 +298,7 @@ export function targetExcludedPanel(context, campaign, variant) {
       : null,
     element('section', {}, [
       sectionHeading('Target-blind review', 'Separate evaluation truth', 'These suggestions never enter normal or holdout scoring.'),
+      campaign.config.investigator?.enabled ? element('p', { className: 'muted', text: 'Excluded scores use raw-replicate means with the separate baseline excluded judgment and labels. Consensus decisions above are descriptive; the fresh judge interpretation below does not replace the scoring reference.' }) : null,
       element('p', { text: evaluation.judgment?.summary ?? 'The target-blind judge has not completed.' }),
       evaluation.excludedFacts
         ? routeLink(
