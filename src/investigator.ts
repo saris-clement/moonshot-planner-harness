@@ -1,6 +1,7 @@
 import { StringDecoder } from 'node:string_decoder';
 import { z } from 'zod';
 import { HypothesisSchema, type Hypothesis } from './types.js';
+import type { InvestigatorTokenGrant } from './investigatorBudget.js';
 
 const actionFields = {
   rationale: z.string().trim().min(1).max(8_000),
@@ -48,6 +49,7 @@ export interface InvestigationState {
   actions: InvestigationActionRecord[];
   latestHypothesis?: Hypothesis;
   harnessPins?: Record<string, unknown>;
+  tokenGrants?: InvestigatorTokenGrant[];
 }
 
 export interface InvestigatorTurnResult {

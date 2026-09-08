@@ -4,10 +4,12 @@ import { HarnessDatabase } from './db.js';
 import { CampaignOrchestrator } from './orchestrator.js';
 import { ensureHarnessPaths, harnessPaths } from './paths.js';
 import { startDashboard } from './server.js';
+import { InvestigatorTokenGrantInputSchema } from './investigatorBudget.js';
 
 function option(arguments_: readonly string[], name: string): string | undefined {
   const index = arguments_.indexOf(name);
-  return index >= 0 ? arguments_[index + 1] : undefined;
+  const value = index >= 0 ? arguments_[index + 1] : undefined;
+  return value?.startsWith('--') ? undefined : value;
 }
 
 function usage(): never {
@@ -17,6 +19,7 @@ function usage(): never {
   npm run cli -- diagnose <campaign-id> <variant-id>
   npm run cli -- round <campaign-id>
   npm run cli -- auto <campaign-id>
+  npm run cli -- extend-tokens <campaign-id> <variant-id> --tokens <additional> --reason <reason> --request-id <id>
   npm run cli -- promote <campaign-id> <variant-id>
   npm run cli -- target-config <campaign-id> <baseline-variant-id> <client/workflow>
   npm run cli -- target-run <campaign-id> <variant-id>
@@ -59,6 +62,21 @@ async function main(): Promise<void> {
     if (!campaignId || !variantId) usage();
     const variant = await orchestrator.diagnoseVariant(campaignId, variantId);
     process.stdout.write(`${JSON.stringify(variant, null, 2)}\n`);
+    database.close();
+    return;
+  }
+
+  if (command === 'extend-tokens') {
+    const campaignId = arguments_[1];
+    const variantId = arguments_[2];
+    if (!campaignId || !variantId) usage();
+    const request = InvestigatorTokenGrantInputSchema.parse({
+      requestId: option(arguments_, '--request-id'),
+      additionalTokens: Number(option(arguments_, '--tokens')),
+      reason: option(arguments_, '--reason'),
+    });
+    const { variant, grant } = await orchestrator.extendInvestigatorTokens(campaignId, variantId, request);
+    process.stdout.write(`${JSON.stringify({ variantId: variant.id, status: variant.status, grant }, null, 2)}\n`);
     database.close();
     return;
   }

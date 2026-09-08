@@ -63,6 +63,8 @@ export function investigationStatus(campaign, variant) {
   const actions = investigation.actions ?? [];
   const current = actions.findLast((action) => action.status === 'running');
   const limits = { ...investigatorDefaults, ...campaign.config.investigator };
+  const grants = investigation.tokenGrants ?? [];
+  const tokenLimit = grants.at(-1)?.effectiveLimit ?? limits.maxAgentTokens;
   const screening = primaryScreening(campaign, variant);
   const start = Date.parse(investigation.startedAt);
   const end = investigation.status === 'running' ? Date.now() : Date.parse(investigation.updatedAt);
@@ -75,7 +77,7 @@ export function investigationStatus(campaign, variant) {
     ['Primary screening', `${formatNumber(screening.replicateCount)} ${screening.countSource} / trial`],
     ['Baseline and final', `${formatNumber(campaign.config.evaluation.replicates)} / benchmark`],
     ['Wall time', `${knownNumber(Number.isFinite(start) && Number.isFinite(end) ? Math.max(0, end - start) : null, formatDuration)} / ${formatDuration(limits.maxWallTimeMs)}`],
-    ['Agent tokens', `${knownNumber(investigation.agentTokens)} / ${formatNumber(limits.maxAgentTokens)}`],
+    ['Agent tokens', `${knownNumber(investigation.agentTokens)} / ${knownNumber(tokenLimit)}`],
     ['Agent cost', knownNumber(investigation.agentCostUsd, formatMoney)],
   ];
   return element('div', { className: 'investigation-status', attributes: { 'data-testid': `investigator-${variant.id}` } }, [
@@ -86,6 +88,21 @@ export function investigationStatus(campaign, variant) {
     element('dl', { className: 'investigation-metrics', attributes: { 'aria-label': 'Investigator session and budgets' } }, values.map(([label, value]) =>
       element('div', {}, [element('dt', { text: label }, label === 'Wall time' ? [helpButton(label)] : []), element('dd', { text: value })]),
     )),
+    grants.length ? disclosure(`${variant.id}:token-grants`, 'Operator budget extensions', () =>
+      element('div', {}, [
+        element('p', { className: 'muted investigation-prose', text: 'Budget authorization only, not human-verified planner truth. Cumulative usage is retained; the session clock is unchanged.' }),
+        element('p', { className: 'investigation-prose', text: `Frozen base cap: ${formatNumber(limits.maxAgentTokens)} tokens.` }),
+        ...grants.map((grant) => element('div', { className: 'investigation-action-detail', attributes: { 'data-live-key': `${variant.id}:token-grant:${grant.id}` } }, [
+          element('p', { className: 'identifier' }, [element('time', {
+            text: `${new Date(grant.grantedAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'UTC' })} UTC`,
+            attributes: { datetime: grant.grantedAt },
+          })]),
+          element('p', { className: 'investigation-prose', text: `+${knownNumber(grant.additionalTokens)} tokens / New cap: ${knownNumber(grant.effectiveLimit)}` }),
+          element('p', { className: 'muted investigation-prose', text: `Used at grant: ${knownNumber(grant.tokensAtGrant)} / Previous cap: ${knownNumber(grant.previousLimit)}` }),
+          element('p', { className: 'investigation-prose', text: `Reason: ${sanitizeDiagnosticValue(grant.reason) ?? 'Not recorded'}` }),
+        ])),
+      ]), JSON.stringify([limits.maxAgentTokens, grants]),
+    ) : null,
     investigation.reason ? disclosure(`${variant.id}:reason`, 'Recorded reason (unverified interpretation)', () =>
       element('p', { className: 'investigation-prose', text: investigation.reason }),
       investigation.reason,

@@ -15,6 +15,8 @@ import { AgentRunner, type SourceQuestionAnswer } from './agents.js';
 import { normalizeExecutionFailure } from './failures.js';
 import { runInvestigatorLoop } from './investigatorLoop.js';
 import type { InvestigationState } from './investigator.js';
+import { effectiveInvestigatorLimits, InvestigatorTokenGrantInputSchema, verifyInvestigatorTokenGrantReceipts,
+  type InvestigatorTokenGrant } from './investigatorBudget.js';
 import {
   canonicalHash,
   compareCohort,
@@ -2219,6 +2221,120 @@ export class CampaignOrchestrator {
     return campaign;
   }
 
+  async extendInvestigatorTokens(
+    campaignId: string,
+    variantId: string,
+    input: { requestId: string; additionalTokens: number; reason: string },
+  ): Promise<{ variant: VariantRecord; grant: InvestigatorTokenGrant }> {
+    return await this.withCampaignLock(campaignId, async () => {
+      const request = InvestigatorTokenGrantInputSchema.parse(input);
+      const campaign = this.database.getCampaign(campaignId);
+      const variant = this.database.getVariant(variantId);
+      const owner = this.database.database.prepare('SELECT lease_owner FROM campaigns WHERE id = ?').get(campaignId)?.lease_owner;
+      if (!campaign.config.investigator?.enabled) throw new Error('Campaign investigator is not enabled');
+      if (variant.campaignId !== campaignId) throw new Error('Variant belongs to another campaign');
+      const state = variant.investigation;
+      if (!state) throw new Error('Variant has no existing investigator session');
+      const oldLimits = effectiveInvestigatorLimits(campaign.config.investigator, state);
+      const artifacts = variantArtifactDirectory(this.paths, campaignId, variantId);
+      await verifyInvestigatorTokenGrantReceipts(this.database, campaign, variant, artifacts);
+      const existing = state.tokenGrants?.find((grant) => grant.id === request.requestId);
+      if (existing) {
+        if (existing.additionalTokens !== request.additionalTokens || existing.reason !== request.reason) {
+          throw new Error('Investigator token grant request ID was already used with different arguments');
+        }
+        return { variant: this.database.getVariant(variantId), grant: existing };
+      }
+      if (!variant.parentVariantId || variant.parentVariantId !== campaign.currentParentVariantId) {
+        throw new Error('Investigator variant parent is no longer the current campaign parent');
+      }
+      if (state.status !== 'budget_exhausted' || state.agentTokens === null ||
+          !Number.isSafeInteger(state.agentTokens) || state.agentTokens < oldLimits.maxAgentTokens) {
+        throw new Error('Token grant requires budget_exhausted with known usage at or above the previous token limit');
+      }
+      const started = Date.parse(state.startedAt);
+      const assertRemainingBudgets = () => {
+        if (!Number.isFinite(started) || started > Date.now() || Date.now() - started >= oldLimits.maxWallTimeMs) {
+          throw new Error('Investigator wall-time budget is exhausted or unknown; token grants cannot extend it');
+        }
+        if (!Number.isSafeInteger(state.turnCount) || state.turnCount < 0 || state.turnCount >= oldLimits.maxTurns) {
+          throw new Error('Investigator turn budget is exhausted or unknown');
+        }
+        if (state.actions.filter((action) => action.kind === 'evaluate_primary').length >= oldLimits.maxPrimaryEvaluations) {
+          throw new Error('Investigator primary evaluation budget is exhausted');
+        }
+      };
+      assertRemainingBudgets();
+      const variants = this.database.listVariants(campaignId);
+      if (variants.some((candidate) =>
+        (candidate.id !== variantId && ['queued', 'mutating', 'gating', 'building', 'starting', 'running', 'judging'].includes(candidate.status)) ||
+        candidate.investigation?.status === 'running' ||
+        candidate.investigation?.actions.some((action) => ['running', 'interrupted'].includes(action.status))) ||
+        !['rejected', 'stopped'].includes(variant.status) || variant.hypothesisComplianceAttempts.length > 0 ||
+        state.actions.some((action) => action.kind === 'evaluate_primary' && action.status === 'failed' && variant.composeProject)) {
+        throw new Error('Reconcile active or interrupted actions before granting investigator tokens');
+      }
+      const baseline = state.harnessPins?.mutationBaselineTree;
+      if (!state.sessionId?.trim() || !variant.worktreePath ||
+          !(await stat(variant.worktreePath).catch(() => null))?.isDirectory() ||
+          typeof baseline !== 'string' || !baseline) {
+        throw new Error('Token grant requires the known session, retained worktree, and mutation baseline');
+      }
+      if (!variant.patchPath || !variant.patchHash || await sha256File(variant.patchPath) !== variant.patchHash) {
+        throw new Error('Retained investigator patch is missing or changed');
+      }
+      for (const [file, pin] of [['investigator-context.json', 'contextHash'], ['investigator-reference.json', 'referenceHash']] as const) {
+        if (await sha256File(path.join(artifacts, file)) !== state.harnessPins?.[pin]) {
+          throw new Error(`Investigator ${pin} is missing or changed`);
+        }
+      }
+      const grant: InvestigatorTokenGrant = {
+        id: request.requestId, grantedAt: new Date().toISOString(), additionalTokens: request.additionalTokens,
+        tokensAtGrant: state.agentTokens, previousLimit: oldLimits.maxAgentTokens,
+        effectiveLimit: state.agentTokens + request.additionalTokens, reason: request.reason,
+      };
+      const next: InvestigationState = { ...state, tokenGrants: [...(state.tokenGrants ?? []), grant],
+        status: 'stopped', updatedAt: grant.grantedAt, reason: `Operator token extension: ${request.reason}` };
+      const newLimits = effectiveInvestigatorLimits(campaign.config.investigator, next);
+      const directory = path.join(artifacts, 'investigation', 'budget-grants');
+      const receiptPath = path.join(directory, `${grant.id}.json`);
+      if (await stat(receiptPath).catch(() => null)) throw new Error('Orphan investigator token grant receipt exists; reconcile it first');
+      await mkdir(directory, { recursive: true });
+      const snapshot = path.join(directory, grant.id);
+      await mkdir(snapshot); // An orphan snapshot also fails closed; never overwrite an earlier attempt.
+      await captureMutationDiff(campaign, variant, variant.worktreePath, snapshot, baseline);
+      const captured = await captureAndGateDiff(campaign, variant, variant.worktreePath, snapshot);
+      if (await sha256File(captured.patchPath) !== variant.patchHash) throw new Error('Retained investigator worktree patch changed');
+      await writeFile(receiptPath, `${JSON.stringify({
+        kind: 'investigator_token_grant', campaignId, variantId, grant,
+        priorState: state, priorStateHash: canonicalHash(state), oldLimits, newLimits, patchHash: variant.patchHash,
+      }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+      const receiptHash = await sha256File(receiptPath);
+      // Files first, then a synchronous transaction including events. A failed commit leaves a closed orphan.
+      this.database.database.exec('BEGIN IMMEDIATE');
+      try {
+        if (!owner || !this.database.database.prepare(
+          'SELECT id FROM campaigns WHERE id = ? AND lease_owner = ? AND lease_expires_at > ?',
+        ).get(campaignId, String(owner), Date.now()) ||
+            !isDeepStrictEqual(this.database.getCampaign(campaignId), campaign) ||
+            !isDeepStrictEqual(this.database.getVariant(variantId), variant)) {
+          throw new Error('Investigator campaign lease or state changed while archiving the grant');
+        }
+        assertRemainingBudgets();
+        const updated = this.database.updateVariant(variantId, { investigation: next, status: 'mutating', error: null });
+        this.database.updateCampaign(campaignId, { status: 'ready' });
+        this.database.addEvent(campaignId, variantId, 'investigator.tokens_extended', {
+          grant, receiptHash, receiptPath: path.relative(artifacts, receiptPath),
+        });
+        this.database.database.exec('COMMIT');
+        return { variant: updated, grant };
+      } catch (error) {
+        this.database.database.exec('ROLLBACK');
+        throw error;
+      }
+    });
+  }
+
   resume(campaignId: string): CampaignRecord {
     if (this.isActive(campaignId)) throw new Error('campaign is still active');
     const leased = this.database.database.prepare(
@@ -2521,7 +2637,8 @@ export class CampaignOrchestrator {
     artifactDirectory: string,
     mutationBaselineTree: string,
   ): Promise<VariantRecord> {
-    const limits = campaign.config.investigator!;
+    const limits = effectiveInvestigatorLimits(campaign.config.investigator!, initialVariant.investigation);
+    await verifyInvestigatorTokenGrantReceipts(this.database, campaign, initialVariant, artifactDirectory);
     const parent = this.database.getVariant(initialVariant.parentVariantId!);
     const primary = primaryBenchmark(campaign);
     const trustedPlanner = await this.ensureFrozenPlannerSource(campaign);
@@ -2590,7 +2707,7 @@ export class CampaignOrchestrator {
         status: next.status, turnCount: next.turnCount, actionId: next.actions.at(-1)?.id,
       });
     };
-    const runner = new AgentRunner(campaign);
+    const runner = new AgentRunner({ ...campaign, config: { ...campaign.config, investigator: limits } });
     const completed = await runInvestigatorLoop(state, limits, {
       save,
       assertActive,
@@ -2754,14 +2871,15 @@ export class CampaignOrchestrator {
     if (initialVariant.hypothesisComplianceAttempts.length > 0) {
       throw new Error('cannot restart an existing hypothesis compliance attempt loop');
     }
-    const variantStartedAtMs = Date.now();
+    const previousStart = initialVariant.investigation && initialVariant.startedAt ? Date.parse(initialVariant.startedAt) : NaN;
+    const variantStartedAtMs = Number.isFinite(previousStart) ? previousStart : Date.now();
     let variant = this.database.updateVariant(initialVariant.id, {
       startedAt: new Date(variantStartedAtMs).toISOString(),
       completedAt: null,
       elapsedMs: null,
-      phase2StartedAt: null,
-      phase2CompletedAt: null,
-      phase2ElapsedMs: null,
+      phase2StartedAt: initialVariant.investigation ? initialVariant.phase2StartedAt : null,
+      phase2CompletedAt: initialVariant.investigation ? initialVariant.phase2CompletedAt : null,
+      phase2ElapsedMs: initialVariant.investigation ? initialVariant.phase2ElapsedMs : null,
     });
     let stack: StackHandle | null = null;
     let artifactDirectory = '';

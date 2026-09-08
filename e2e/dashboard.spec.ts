@@ -1721,6 +1721,7 @@ test('keeps investigator budgets separate from planner usage and links compact t
   await expect(zero.locator('dt', { hasText: /^Agent tokens$/ }).locator('..')).toContainText('0 / 2,000,000');
   await expect(zero.locator('dt', { hasText: /^Agent cost$/ }).locator('..')).toContainText('$0.00');
   await expect(zero.locator('dt', { hasText: /^Session$/ }).locator('..')).toContainText('Not assigned');
+  await expect(page.getByText('Operator budget extensions', { exact: true })).toHaveCount(0);
 
   await page.getByRole('link', { name: 'Experiments', exact: true }).click();
   const row = page.getByTestId(`experiment-row-${investigatorId}`);
@@ -1732,6 +1733,90 @@ test('keeps investigator budgets separate from planner usage and links compact t
   await expect(page.getByLabel('Truthful score dimensions')).toContainText('Verified (replicate mean)');
   await expect(page.getByLabel('Truthful score dimensions')).toContainText('Consensus agreement');
   await expect(page.getByRole('link', { name: /1 primary trial/ })).toBeVisible();
+});
+
+test('shows operator budget extensions without resetting usage, frozen limits or live disclosures', async ({ page }) => {
+  const original = database.getVariant(investigatorId);
+  const config = database.getCampaign(investigatorCampaignId).config;
+  const labels = database.listLabels(investigatorCampaignId, 'primary-pack');
+  const investigation: InvestigationState = {
+    ...original.investigation!, status: 'budget_exhausted', agentTokens: 4_092_956,
+    startedAt: '2026-09-08T09:00:00.000Z', updatedAt: '2026-09-08T10:00:00.000Z',
+    tokenGrants: [{
+      id: 'operator-extension-1', grantedAt: '2026-09-08T10:00:00.000Z', additionalTokens: 4_000_000,
+      tokensAtGrant: 4_092_956, previousLimit: 2_000_000, effectiveLimit: 8_092_956,
+      reason: 'Continue the same investigation. Authorization: Bearer grant-secret-value; api_key=grant-key-value; <img src=x onerror="window.__grantExecuted=true">',
+    }],
+  };
+  const posts: string[] = [];
+  page.on('request', (request) => { if (request.method() === 'POST') posts.push(request.url()); });
+  try {
+    database.updateVariant(investigatorId, { investigation });
+    for (const width of [1440, 390, 320]) {
+      await page.setViewportSize({ width, height: 1000 });
+      for (const route of ['overview', `experiments/${investigatorId}?tab=investigation`]) {
+        await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/${route}`);
+        const status = page.getByTestId(`investigator-${investigatorId}`);
+        await expect(status.locator('dt', { hasText: /^Agent tokens$/ }).locator('..').locator('dd')).toHaveText('4,092,956 / 8,092,956');
+        await expect(status.locator('dt', { hasText: /^Primary screening$/ }).locator('..')).toContainText('2 recorded / trial');
+        await expect(status.locator('dt', { hasText: /^Baseline and final$/ }).locator('..')).toContainText('2 / benchmark');
+        await expect(status.locator('dt', { hasText: /^Wall time/ }).locator('..')).toContainText('60m 0s / 240m 0s');
+        const extensions = status.locator('details').filter({ has: page.locator('summary', { hasText: /^Operator budget extensions$/ }) });
+        await expect(extensions).not.toHaveAttribute('open');
+        await extensions.locator('summary').click();
+        await expect(extensions).toContainText('Frozen base cap: 2,000,000 tokens');
+        await expect(extensions).toContainText('Budget authorization only, not human-verified planner truth');
+        await expect(extensions).toContainText('Cumulative usage is retained; the session clock is unchanged');
+        await expect(extensions.locator('time')).toHaveAttribute('datetime', '2026-09-08T10:00:00.000Z');
+        await expect(extensions.locator('time')).toContainText('Sep 8, 2026');
+        await expect(extensions).toContainText('+4,000,000 tokens / New cap: 8,092,956');
+        await expect(extensions).toContainText('Used at grant: 4,092,956 / Previous cap: 2,000,000');
+        await expect(extensions).toContainText('Reason: Continue the same investigation.');
+        await expect(extensions).toContainText('[redacted]');
+        await expect(extensions).not.toContainText('grant-secret-value');
+        await expect(extensions).not.toContainText('grant-key-value');
+        await expect(extensions.locator('img')).toHaveCount(0);
+        expect(await page.evaluate('window.__grantExecuted')).toBeUndefined();
+        expect(await page.evaluate<number>('document.documentElement.scrollWidth')).toBe(width);
+        if (route === 'overview') {
+          const zero = page.getByTestId(`investigator-${zeroInvestigatorId}`);
+          const unknown = page.getByTestId(`investigator-${unknownInvestigatorId}`);
+          await expect(zero.locator('dt', { hasText: /^Agent tokens$/ }).locator('..').locator('dd')).toHaveText('0 / 2,000,000');
+          await expect(unknown.locator('dt', { hasText: /^Agent tokens$/ }).locator('..').locator('dd')).toHaveText('Unknown / 2,000,000');
+          await expect(page.getByText('Operator budget extensions', { exact: true })).toHaveCount(1);
+        }
+      }
+    }
+    const status = page.getByTestId(`investigator-${investigatorId}`);
+    const extensions = status.locator('details').filter({ has: page.locator('summary', { hasText: /^Operator budget extensions$/ }) });
+    const mounted = await extensions.elementHandle();
+    await extensions.locator('summary').focus();
+    const scrollY = await page.evaluate<number>('window.scrollY');
+    const refreshed = page.waitForResponse(`${baseUrl}/api/campaigns/${investigatorCampaignId}`);
+    database.updateVariant(investigatorId, { investigation: {
+      ...investigation, agentTokens: 8_192_956,
+      tokenGrants: [...investigation.tokenGrants!, {
+        id: 'operator-extension-2', grantedAt: '2026-09-08T10:01:00.000Z', additionalTokens: 1_000_000,
+        tokensAtGrant: 8_192_956, previousLimit: 8_092_956, effectiveLimit: 9_192_956,
+        reason: 'Explicit second extension.',
+      }],
+    } });
+    database.addEvent(investigatorCampaignId, investigatorId, 'investigator.updated', {});
+    await refreshed;
+    await expect(status.locator('dt', { hasText: /^Agent tokens$/ }).locator('..').locator('dd')).toHaveText('8,192,956 / 9,192,956');
+    await expect(extensions).toContainText('Explicit second extension.');
+    await expect(extensions.locator('time')).toHaveCount(2);
+    await expect(extensions).toHaveAttribute('open', '');
+    await expect(extensions.locator('summary')).toBeFocused();
+    expect(await mounted!.evaluate((node) => node.isConnected)).toBe(true);
+    expect(await page.evaluate<number>('window.scrollY')).toBe(scrollY);
+    expect(database.getCampaign(investigatorCampaignId).config).toEqual(config);
+    expect(config.investigator!.maxAgentTokens).toBe(2_000_000);
+    expect(database.listLabels(investigatorCampaignId, 'primary-pack')).toEqual(labels);
+    expect(posts).toEqual([]);
+  } finally {
+    database.updateVariant(investigatorId, { investigation: original.investigation ?? null });
+  }
 });
 
 test('uses one full-primary screening slot and restores repeated final cohorts without stale trial runs', async ({ page }) => {

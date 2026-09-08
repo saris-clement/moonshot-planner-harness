@@ -1,18 +1,22 @@
 import assert from 'node:assert/strict';
+import { once } from 'node:events';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { S3Client } from '@aws-sdk/client-s3';
 import { AgentRunner } from '../src/agents.js';
-import { sha256File } from '../src/config.js';
+import { sha256File, writeResolvedCampaignConfig } from '../src/config.js';
 import { HarnessDatabase } from '../src/db.js';
 import { hypothesisComplianceResultPath } from '../src/hypothesisCompliance.js';
+import { canonicalHash } from '../src/metrics.js';
 import { runInvestigatorLoop } from '../src/investigatorLoop.js';
 import type { InvestigationActionRecord, InvestigationState, InvestigatorAction } from '../src/investigator.js';
 import { CampaignOrchestrator } from '../src/orchestrator.js';
 import { ensureHarnessPaths, harnessPaths, variantArtifactDirectory } from '../src/paths.js';
 import { runCommand } from '../src/process.js';
+import { startDashboard } from '../src/server.js';
 import { captureAndGateDiff, prepareVariantWorktree, stageMutationBaseline, type StackHandle } from '../src/stack.js';
 import { CampaignConfigSchema, HypothesisSchema, HypothesisComplianceOutputV2Schema, type Benchmark,
   type CampaignRecord, type RunFacts, type TargetExcludedConfig, type TargetExcludedEvaluationRecord,
@@ -146,6 +150,427 @@ test('post-turn budget stops archive the latest unexecuted mutation and hypothes
     assert.equal(receipt.patchHash, result.patchHash);
     assert.equal(result.facts, null);
     assert.equal(result.artifactCollectionComplete, false);
+  } finally { await f.close(); }
+});
+
+async function exhaustedFixture() {
+  const f = await fixture('automatic');
+  f.state.status = 'budget_exhausted';
+  f.state.turnCount = 2; // Turn 2 overshot the cap before its returned action could be recorded.
+  f.state.agentTokens = 4_092_956;
+  f.state.agentCostUsd = 12.34;
+  f.state.reason = 'Investigation token budget exhausted.';
+  f.state.actions.push(record(f.state, 'test', 'completed', f.patchHash));
+  f.database.updateVariant(f.variant.id, { investigation: f.state, status: 'rejected', error: f.state.reason,
+    patchPath: path.join(f.artifacts, 'variant.patch'), patchHash: f.patchHash });
+  f.database.updateCampaign(f.campaign.id, { status: 'stopped_max_variants' });
+  return f;
+}
+
+const tokenExtension = { requestId: 'operator-4m', additionalTokens: 4_000_000, reason: 'Operator authorized four million additional tokens.' };
+
+async function budgetDashboard(t: TestContext) {
+  const f = await exhaustedFixture();
+  const server = startDashboard({ port: 0, publicDirectory: path.resolve('public'), database: f.database, orchestrator: f.orchestrator });
+  t.after(async () => {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => error ? reject(error) : resolve());
+      server.closeAllConnections();
+    });
+    await f.close();
+  });
+  await once(server, 'listening');
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const endpoint = `${origin}/api/campaigns/${f.campaign.id}/variants/${f.variant.id}/extend-tokens`;
+  const post = (body: unknown = tokenExtension, headers: Record<string, string> = {}, url = endpoint) =>
+    fetch(url, { method: 'POST', headers: { origin, 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
+  return { ...f, origin, endpoint, post };
+}
+
+test('token grant HTTP rejects cross-origin requests and invalid JSON arguments before invoking mutation', async (t) => {
+  const f = await budgetDashboard(t);
+  const extend = t.mock.method(f.orchestrator, 'extendInvestigatorTokens');
+  const variant = f.database.getVariant(f.variant.id);
+  const campaign = f.database.getCampaign(f.campaign.id);
+  const events = f.database.listEvents(f.campaign.id);
+  for (const [headers, expected] of [
+    [{ origin: 'https://foreign.invalid' }, /cross-origin mutation rejected/],
+    [{ origin: f.origin, 'sec-fetch-site': 'cross-site' }, /cross-site mutation rejected/],
+    [{ origin: f.origin, 'content-type': 'text/plain' }, /application\/json/],
+  ] as const) {
+    // Invalid JSON proves the origin/content-type guard runs before body parsing, not just before persistence.
+    const response = await fetch(f.endpoint, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: '{invalid' });
+    assert.equal(response.status, 400);
+    assert.match((await response.json() as { error: string }).error, expected);
+  }
+  const malformed = await fetch(f.endpoint, { method: 'POST', headers: { origin: f.origin, 'content-type': 'application/json' }, body: '{invalid' });
+  assert.equal(malformed.status, 400);
+  await malformed.json();
+  for (const body of [
+    null, {}, { ...tokenExtension, additionalTokens: 0 }, { ...tokenExtension, additionalTokens: -1 },
+    { ...tokenExtension, additionalTokens: 1.5 }, { ...tokenExtension, additionalTokens: '4000000' },
+    { ...tokenExtension, additionalTokens: Number.MAX_SAFE_INTEGER + 1 },
+    { ...tokenExtension, requestId: '../escape' }, { ...tokenExtension, requestId: '' },
+    { ...tokenExtension, reason: '  ' }, { ...tokenExtension, reason: 'x'.repeat(8_001) },
+    { ...tokenExtension, variantId: 'body-cannot-override-path' },
+  ]) {
+    const response = await f.post(body);
+    assert.equal(response.status, 400);
+    assert.equal(typeof (await response.json() as { error: string }).error, 'string');
+  }
+  assert.equal(extend.mock.callCount(), 0);
+  assert.deepEqual(f.database.getVariant(f.variant.id), variant);
+  assert.deepEqual(f.database.getCampaign(f.campaign.id), campaign);
+  assert.deepEqual(f.database.listEvents(f.campaign.id), events);
+});
+
+test('token grant HTTP binds the URL campaign and current parent before changing the requested variant', async (t) => {
+  const f = await budgetDashboard(t);
+  f.database.createCampaign({ ...f.campaign.config, id: 'other' }, f.campaign.seedSha, f.campaign.workflowsSha, f.campaign.environmentSha, 'fixture');
+  for (const [url, expected] of [
+    [f.endpoint.replace(`/campaigns/${f.campaign.id}/`, '/campaigns/other/'), /another campaign/],
+    [f.endpoint.replace(`/variants/${f.variant.id}/`, '/variants/missing-variant/'), /variant not found/],
+    [f.endpoint.replace(`/variants/${f.variant.id}/`, `/variants/${f.variant.parentVariantId}/`), /no existing investigator session/],
+  ] as const) {
+    const before = f.database.getVariant(f.variant.id);
+    const events = f.database.listEvents(f.campaign.id);
+    const response = await f.post(tokenExtension, {}, url);
+    assert.equal(response.status, 400);
+    assert.match((await response.json() as { error: string }).error, expected);
+    assert.deepEqual(f.database.getVariant(f.variant.id), before);
+    assert.deepEqual(f.database.listEvents(f.campaign.id), events);
+  }
+  f.database.updateCampaign(f.campaign.id, { currentParentVariantId: f.variant.id });
+  const before = f.database.getVariant(f.variant.id);
+  const campaign = f.database.getCampaign(f.campaign.id);
+  const stale = await f.post();
+  assert.equal(stale.status, 400);
+  assert.match((await stale.json() as { error: string }).error, /no longer the current campaign parent/);
+  assert.deepEqual(f.database.getVariant(f.variant.id), before);
+  assert.deepEqual(f.database.getCampaign(f.campaign.id), campaign);
+});
+
+test('token grant HTTP is idempotent, returns only the requested grant and current status, and never autoexecutes', async (t) => {
+  const f = await budgetDashboard(t);
+  const frozen = f.database.getCampaign(f.campaign.id).config;
+  const prior = f.database.getVariant(f.variant.id).investigation!;
+  const auto = t.mock.method(f.orchestrator, 'runAutomatic', async () => { throw new Error('must not autoexecute'); });
+  const round = t.mock.method(f.orchestrator, 'runRound', async () => { throw new Error('must not start a round'); });
+  const run = t.mock.method(f.internal, 'runVariant', async () => { throw new Error('must not execute a variant'); });
+  const agent = t.mock.method(AgentRunner.prototype, 'investigate', async () => { throw new Error('must not invoke the agent'); });
+  const initial = await f.post();
+  assert.equal(initial.status, 200);
+  const grant = f.database.getVariant(f.variant.id).investigation!.tokenGrants![0]!;
+  const expected = { variantId: f.variant.id, status: 'mutating', grant };
+  assert.deepEqual(await initial.json(), expected);
+  assert.equal(grant.effectiveLimit, 8_092_956);
+  const granted = f.database.getVariant(f.variant.id);
+  const events = f.database.listEvents(f.campaign.id);
+  const duplicate = await f.post();
+  assert.equal(duplicate.status, 200);
+  assert.deepEqual(await duplicate.json(), expected);
+  assert.deepEqual(f.database.getVariant(f.variant.id), granted);
+  assert.deepEqual(f.database.listEvents(f.campaign.id), events);
+  for (const changes of [{ reason: 'Changed authorization' }, { additionalTokens: 1 }]) {
+    const changed = await f.post({ ...tokenExtension, ...changes });
+    assert.equal(changed.status, 400);
+    assert.match((await changed.json() as { error: string }).error, /different arguments/);
+  }
+  assert.deepEqual(f.database.getVariant(f.variant.id), granted);
+  assert.deepEqual(f.database.listEvents(f.campaign.id), events);
+  for (const key of ['sessionId', 'agentTokens', 'agentCostUsd', 'turnCount', 'startedAt', 'actions', 'harnessPins'] as const) {
+    assert.deepEqual(granted.investigation![key], prior[key], key);
+  }
+  assert.equal(granted.investigation!.status, 'stopped');
+  assert.equal(f.database.getCampaign(f.campaign.id).status, 'ready');
+  assert.deepEqual(f.database.getCampaign(f.campaign.id).config, frozen);
+  assert.equal(f.database.listVariants(f.campaign.id).length, 2);
+  f.database.updateVariant(f.variant.id, { status: 'stopped' });
+  const current = await f.post();
+  assert.equal(current.status, 200);
+  assert.deepEqual(await current.json(), { ...expected, status: 'stopped' });
+  for (const mock of [auto, round, run, agent]) assert.equal(mock.mock.callCount(), 0);
+});
+
+function budgetCli(f: Awaited<ReturnType<typeof exhaustedFixture>>, args: string[]) {
+  return runCommand(process.execPath, ['--import', import.meta.resolve('tsx'), fileURLToPath(new URL('../src/cli.ts', import.meta.url)), 'extend-tokens', ...args], {
+    cwd: f.root, env: { ...process.env, HARNESS_DATA_DIR: f.orchestrator.paths.root }, allowFailure: true, timeoutMs: 10_000,
+  });
+}
+
+test('token grant CLI validates arguments and preserves the frozen config and session while returning only the grant summary', async () => {
+  const f = await exhaustedFixture();
+  try {
+    const ids = [f.campaign.id, f.variant.id];
+    const flags = ['--tokens', '4000000', '--reason', tokenExtension.reason, '--request-id', tokenExtension.requestId];
+    const campaign = f.database.getCampaign(f.campaign.id);
+    const prior = f.database.getVariant(f.variant.id);
+    const beforeEvents = f.database.listEvents(f.campaign.id);
+    const configBytes = f.database.database.prepare('SELECT config_json FROM campaigns WHERE id = ?').get(f.campaign.id)?.config_json;
+    const configPath = path.join(f.orchestrator.paths.campaigns, campaign.id, 'campaign.json');
+    await mkdir(path.dirname(configPath), { recursive: true });
+    await writeResolvedCampaignConfig(configPath, campaign.config, campaign.seedSha, campaign.workflowsSha);
+    const frozenConfig = await readFile(configPath);
+    for (const args of [
+      [], [f.campaign.id], [...ids, '--tokens', '4000000', '--request-id', tokenExtension.requestId],
+      [...ids, '--tokens', '4000000', '--reason', tokenExtension.reason],
+      [...ids, '--reason', tokenExtension.reason, '--request-id', tokenExtension.requestId],
+      ...['0', '-1', '1.5', 'Infinity', 'NaN', '9007199254740992'].map((value) => [...ids, '--tokens', value, ...flags.slice(2)]),
+      [...ids, ...flags.slice(0, 4), '--request-id', '../escape'],
+    ]) {
+      const result = await budgetCli(f, args);
+      assert.notEqual(result.exitCode, 0, JSON.stringify(args));
+      assert.equal(result.stdout, '');
+      assert.deepEqual(f.database.getVariant(f.variant.id), prior);
+      assert.deepEqual(f.database.getCampaign(f.campaign.id), campaign);
+      assert.deepEqual(f.database.listEvents(f.campaign.id), beforeEvents);
+    }
+    const result = await budgetCli(f, [...ids, ...flags]);
+    assert.equal(result.exitCode, 0, result.stderr);
+    const variant = f.database.getVariant(f.variant.id);
+    const grant = variant.investigation!.tokenGrants![0]!;
+    assert.deepEqual(JSON.parse(result.stdout), { variantId: variant.id, status: 'mutating', grant });
+    assert.equal(grant.effectiveLimit, 8_092_956);
+    assert.deepEqual(variant.investigation, { ...prior.investigation, tokenGrants: [grant], status: 'stopped',
+      updatedAt: grant.grantedAt, reason: `Operator token extension: ${tokenExtension.reason}` });
+    assert.equal(variant.error, null);
+    assert.equal(f.database.getCampaign(f.campaign.id).status, 'ready');
+    assert.equal(f.database.database.prepare('SELECT config_json FROM campaigns WHERE id = ?').get(f.campaign.id)?.config_json, configBytes);
+    assert.equal(f.database.listVariants(f.campaign.id).length, 2);
+    const events = f.database.listEvents(f.campaign.id);
+    assert.deepEqual(events.slice(beforeEvents.length).map(({ type }) => type),
+      ['variant.updated', 'campaign.updated', 'investigator.tokens_extended']);
+    const repeated = await budgetCli(f, [...ids, ...flags]);
+    assert.equal(repeated.exitCode, 0, repeated.stderr);
+    assert.equal(repeated.stdout, result.stdout);
+    assert.deepEqual(f.database.getVariant(f.variant.id), variant);
+    assert.deepEqual(f.database.listEvents(f.campaign.id), events);
+    assert.deepEqual(await readFile(configPath), frozenConfig);
+  } finally { await f.close(); }
+});
+
+test('token grant CLI rejects a reason flag without its own value before granting tokens', async () => {
+  const f = await exhaustedFixture();
+  try {
+    const before = f.database.getVariant(f.variant.id);
+    const campaign = f.database.getCampaign(f.campaign.id);
+    const result = await budgetCli(f, [f.campaign.id, f.variant.id, '--tokens', '4000000', '--reason', '--request-id', 'missing-reason']);
+    assert.notEqual(result.exitCode, 0, 'A following option name must not be accepted as the authorization reason');
+    assert.equal(result.stdout, '');
+    assert.deepEqual(f.database.getVariant(f.variant.id), before);
+    assert.deepEqual(f.database.getCampaign(f.campaign.id), campaign);
+  } finally { await f.close(); }
+});
+
+test('operator token grant preserves session history and resumes the existing variant past maxVariants', async (t) => {
+  const f = await exhaustedFixture();
+  try {
+    const startedAt = new Date(Date.now() - 90_000).toISOString();
+    f.database.updateVariant(f.variant.id, { startedAt, completedAt: new Date().toISOString(), elapsedMs: 90_000 });
+    const frozen = f.database.getCampaign(f.campaign.id).config;
+    const prior = f.database.getVariant(f.variant.id).investigation!;
+    const patch = (await runCommand('git', ['diff', 'HEAD'], { cwd: f.worktree })).stdout;
+    const index = (await runCommand('git', ['ls-files', '--stage', '-v'], { cwd: f.worktree })).stdout;
+    const granted = await f.orchestrator.extendInvestigatorTokens(f.campaign.id, f.variant.id, tokenExtension);
+    assert.deepEqual(granted.grant, { id: tokenExtension.requestId, grantedAt: granted.grant.grantedAt,
+      additionalTokens: 4_000_000, tokensAtGrant: 4_092_956, previousLimit: 2_000_000,
+      effectiveLimit: 8_092_956, reason: tokenExtension.reason });
+    const next = granted.variant.investigation!;
+    for (const key of ['sessionId', 'agentTokens', 'agentCostUsd', 'turnCount', 'startedAt', 'actions', 'harnessPins'] as const) {
+      assert.deepEqual(next[key], prior[key], key);
+    }
+    assert.equal(next.status, 'stopped');
+    assert.equal(granted.variant.status, 'mutating');
+    assert.equal(granted.variant.error, null);
+    assert.equal(f.database.getCampaign(f.campaign.id).status, 'ready');
+    assert.deepEqual(f.database.getCampaign(f.campaign.id).config, frozen);
+    assert.equal((await runCommand('git', ['diff', 'HEAD'], { cwd: f.worktree })).stdout, patch);
+    assert.equal((await runCommand('git', ['ls-files', '--stage', '-v'], { cwd: f.worktree })).stdout, index);
+    const receiptPath = path.join(f.artifacts, 'investigation/budget-grants/operator-4m.json');
+    const receipt = JSON.parse(await readFile(receiptPath, 'utf8'));
+    assert.equal(receipt.priorStateHash, canonicalHash(prior));
+    assert.deepEqual(receipt.priorState, prior);
+    assert.equal(receipt.patchHash, f.patchHash);
+    assert.deepEqual(receipt.oldLimits, frozen.investigator);
+    assert.deepEqual(receipt.newLimits, { ...frozen.investigator, maxAgentTokens: 8_092_956 });
+    const events = f.database.listEvents(f.campaign.id);
+    assert.deepEqual(await f.orchestrator.extendInvestigatorTokens(f.campaign.id, f.variant.id, tokenExtension), granted);
+    assert.deepEqual(f.database.listEvents(f.campaign.id), events);
+    for (const changes of [{ additionalTokens: 1 }, { reason: 'Different authorization' }]) {
+      await assert.rejects(f.orchestrator.extendInvestigatorTokens(f.campaign.id, f.variant.id,
+        { ...tokenExtension, ...changes }), /request.*different|changed.*request/i);
+    }
+    const agent = t.mock.method(AgentRunner.prototype, 'investigate', async function (
+      this: AgentRunner, _variant: VariantRecord, _worktree: string, _artifacts: string, _context: string,
+      current: InvestigationState, feedback: unknown,
+    ) {
+      const runtime = (this as unknown as { campaign: CampaignRecord }).campaign;
+      assert.equal(runtime.config.investigator!.maxAgentTokens - current.agentTokens!, 4_000_000);
+      assert.deepEqual(runtime.config, { ...frozen, investigator: { ...frozen.investigator, maxAgentTokens: 8_092_956 } });
+      assert.equal(current.sessionId, prior.sessionId);
+      assert.equal(current.turnCount, 2);
+      assert.equal(current.agentCostUsd, 12.34);
+      assert.deepEqual(feedback, prior.actions[0]);
+      return { sessionId: current.sessionId!, usage: { tokens: 10, costUsd: 0.5 },
+        action: { action: 'abandon' as const, rationale: 'Counterevidence refutes the mechanism', hypothesis } };
+    });
+    await f.orchestrator.runAutomatic(f.campaign.id);
+    const result = f.database.getVariant(f.variant.id);
+    assert.equal(agent.mock.callCount(), 1);
+    assert.equal(f.database.listVariants(f.campaign.id).length, 2);
+    assert.equal(result.investigation!.agentTokens, 4_092_966);
+    assert.equal(result.investigation!.agentCostUsd, 12.84);
+    assert.equal(result.investigation!.turnCount, 3);
+    assert.equal(result.investigation!.startedAt, prior.startedAt);
+    assert.equal(result.startedAt, startedAt);
+    assert.ok(result.elapsedMs! >= 90_000);
+    assert.deepEqual(result.investigation!.actions[0], prior.actions[0]);
+    assert.deepEqual(result.investigation!.actions.map(({ id }) => id), ['action-001', 'action-003']);
+    assert.deepEqual(f.database.getCampaign(f.campaign.id).config, frozen);
+    assert.deepEqual(await f.orchestrator.extendInvestigatorTokens(f.campaign.id, f.variant.id, tokenExtension),
+      { variant: result, grant: granted.grant });
+  } finally { await f.close(); }
+});
+
+test('token grants reject non-token exhaustion, unsafe sessions, altered patches, and invalid inputs without state changes', async (t) => {
+  for (const invalid of ['wall-time', 'invalid-time', 'turn-cap', 'trial-cap', 'unknown-usage', 'unsafe-usage',
+    'not-exhausted', 'not-terminal', 'no-session', 'no-worktree', 'no-baseline', 'other-parent', 'other-campaign',
+    'disabled', 'running-action', 'interrupted-action', 'changed-patch', 'changed-archive', 'changed-index',
+    'active-lease', 'bad-request', 'fractional-grant', 'overflow', 'empty-reason'] as const) {
+    await t.test(invalid, async () => {
+      const f = await exhaustedFixture();
+      try {
+        const state = structuredClone(f.state);
+        let input = { ...tokenExtension };
+        if (invalid === 'wall-time') state.startedAt = new Date(Date.now() - f.campaign.config.investigator!.maxWallTimeMs).toISOString();
+        if (invalid === 'invalid-time') state.startedAt = 'unknown';
+        if (invalid === 'turn-cap') state.turnCount = f.campaign.config.investigator!.maxTurns;
+        if (invalid === 'trial-cap') state.actions = Array.from({ length: f.campaign.config.investigator!.maxPrimaryEvaluations },
+          () => record(state, 'evaluate_primary', 'failed', f.patchHash));
+        if (invalid === 'unknown-usage') state.agentTokens = null;
+        if (invalid === 'unsafe-usage') state.agentTokens = 4_092_956.5;
+        if (invalid === 'not-exhausted') state.agentTokens = 1_999_999;
+        if (invalid === 'not-terminal') state.status = 'running';
+        if (invalid === 'no-session') state.sessionId = null;
+        if (invalid === 'no-baseline') state.harnessPins = {};
+        if (invalid === 'running-action' || invalid === 'interrupted-action') state.actions[0]!.status = invalid === 'running-action' ? 'running' : 'interrupted';
+        f.database.updateVariant(f.variant.id, { investigation: state });
+        if (invalid === 'no-worktree') f.database.updateVariant(f.variant.id, { worktreePath: path.join(f.root, 'missing') });
+        if (invalid === 'other-parent') f.database.updateCampaign(f.campaign.id, { currentParentVariantId: f.variant.id });
+        if (invalid === 'other-campaign') {
+          f.database.createCampaign({ ...f.campaign.config, id: 'other' }, f.campaign.seedSha, f.campaign.workflowsSha, f.campaign.environmentSha, 'fixture');
+          f.database.database.prepare('UPDATE variants SET campaign_id = ? WHERE id = ?').run('other', f.variant.id);
+        }
+        if (invalid === 'disabled') f.database.database.prepare('UPDATE campaigns SET config_json = ? WHERE id = ?')
+          .run(JSON.stringify({ ...f.campaign.config, investigator: { ...f.campaign.config.investigator, enabled: false } }), f.campaign.id);
+        if (invalid === 'changed-patch') await writeFile(path.join(f.worktree, 'server/src/evidence.ts'), 'export const evidence = 42;\n');
+        if (invalid === 'changed-archive') await writeFile(path.join(f.artifacts, 'variant.patch'), 'changed');
+        if (invalid === 'changed-index') await runCommand('git', ['add', 'server/src/evidence.ts'], { cwd: f.worktree });
+        if (invalid === 'active-lease') f.database.acquireLease(f.campaign.id, 'other-coordinator', 60_000);
+        if (invalid === 'bad-request') input.requestId = '../escape';
+        if (invalid === 'fractional-grant') input.additionalTokens = 1.5;
+        if (invalid === 'overflow') input.additionalTokens = Number.MAX_SAFE_INTEGER;
+        if (invalid === 'empty-reason') input.reason = '   ';
+        const beforeVariant = f.database.getVariant(f.variant.id);
+        const beforeCampaign = f.database.getCampaign(f.campaign.id);
+        await assert.rejects(f.orchestrator.extendInvestigatorTokens(f.campaign.id, f.variant.id, input));
+        assert.deepEqual(f.database.getVariant(f.variant.id), beforeVariant);
+        assert.deepEqual(f.database.getCampaign(f.campaign.id), beforeCampaign);
+      } finally { await f.close(); }
+    });
+  }
+});
+
+test('grant transaction rolls back all database changes and leaves an orphan receipt that fails closed', async (t) => {
+  const f = await exhaustedFixture();
+  try {
+    const variant = f.database.getVariant(f.variant.id);
+    const campaign = f.database.getCampaign(f.campaign.id);
+    const events = f.database.listEvents(f.campaign.id);
+    const update = t.mock.method(f.database, 'updateCampaign', () => { throw new Error('injected transaction failure'); });
+    await assert.rejects(f.orchestrator.extendInvestigatorTokens(f.campaign.id, f.variant.id, tokenExtension), /injected/);
+    update.mock.restore();
+    assert.deepEqual(f.database.getVariant(f.variant.id), variant);
+    assert.deepEqual(f.database.getCampaign(f.campaign.id), campaign);
+    assert.deepEqual(f.database.listEvents(f.campaign.id), events);
+    const receiptPath = path.join(f.artifacts, 'investigation/budget-grants/operator-4m.json');
+    const receipt = await readFile(receiptPath, 'utf8');
+    await assert.rejects(f.orchestrator.extendInvestigatorTokens(f.campaign.id, f.variant.id, tokenExtension), /orphan|exist/i);
+    assert.equal(await readFile(receiptPath, 'utf8'), receipt);
+  } finally { await f.close(); }
+});
+
+test('grant archival cannot overwrite a replacement lease or a concurrent operator stop', async (t) => {
+  for (const change of ['lease', 'stop'] as const) {
+    const f = await exhaustedFixture();
+    try {
+      const before = f.database.getVariant(f.variant.id);
+      const list = f.database.listVariants.bind(f.database);
+      t.mock.method(f.database, 'listVariants', (campaignId: string) => {
+        const variants = list(campaignId);
+        if (change === 'lease') f.database.database.prepare('UPDATE campaigns SET lease_owner = ?, lease_expires_at = ? WHERE id = ?')
+          .run('replacement', Date.now() + 60_000, campaignId);
+        else f.orchestrator.stop(campaignId);
+        return variants;
+      });
+      await assert.rejects(f.orchestrator.extendInvestigatorTokens(f.campaign.id, f.variant.id, tokenExtension), /lease or state changed/i);
+      assert.deepEqual(f.database.getVariant(f.variant.id), before);
+      if (change === 'lease') assert.equal(f.database.database.prepare('SELECT lease_owner FROM campaigns WHERE id = ?')
+        .get(f.campaign.id)?.lease_owner, 'replacement');
+      else assert.equal(f.database.getCampaign(f.campaign.id).status, 'stopped_by_user');
+      assert.equal(f.database.listEvents(f.campaign.id).some((event) => event.type === 'investigator.tokens_extended'), false);
+    } finally { await f.close(); }
+  }
+});
+
+test('missing or altered grant receipts block duplicate requests and investigator dispatch', async (t) => {
+  for (const invalid of ['missing', 'altered', 'snapshot', 'binding'] as const) {
+    const f = await exhaustedFixture();
+    try {
+      await f.orchestrator.extendInvestigatorTokens(f.campaign.id, f.variant.id, tokenExtension);
+      const receiptPath = path.join(f.artifacts, 'investigation/budget-grants/operator-4m.json');
+      if (invalid === 'missing') await rm(receiptPath);
+      else if (invalid === 'snapshot') await writeFile(path.join(f.artifacts, 'investigation/budget-grants/operator-4m/variant.patch'), 'changed');
+      else if (invalid === 'binding') f.database.database.prepare('DELETE FROM events WHERE type = ?').run('investigator.tokens_extended');
+      else {
+        const receipt = JSON.parse(await readFile(receiptPath, 'utf8'));
+        receipt.priorState.agentTokens = 0;
+        await writeFile(receiptPath, JSON.stringify(receipt));
+      }
+      const agent = t.mock.method(AgentRunner.prototype, 'investigate', async () => { throw new Error('must not dispatch'); });
+      await assert.rejects(f.orchestrator.extendInvestigatorTokens(f.campaign.id, f.variant.id, tokenExtension));
+      await assert.rejects(f.internal.runInvestigatorCandidate(f.campaign, f.database.getVariant(f.variant.id), f.worktree, f.artifacts, f.baseline));
+      assert.equal(agent.mock.callCount(), 0);
+      agent.mock.restore();
+    } finally { await f.close(); }
+  }
+});
+
+test('a second token grant uses the prior effective limit and never replays a request blocked by the first cap', async (t) => {
+  const f = await exhaustedFixture();
+  try {
+    const first = await f.orchestrator.extendInvestigatorTokens(f.campaign.id, f.variant.id, tokenExtension);
+    const agent = t.mock.method(AgentRunner.prototype, 'investigate', async () => ({
+      sessionId: f.state.sessionId!, usage: { tokens: 4_000_010, costUsd: 0.5 },
+      action: { action: 'test' as const, rationale: 'Request is blocked by token exhaustion', hypothesis },
+    }));
+    const exhausted = await f.internal.runInvestigatorCandidate(f.campaign, first.variant, f.worktree, f.artifacts, f.baseline);
+    assert.equal(agent.mock.callCount(), 1);
+    assert.equal(exhausted.investigation!.status, 'budget_exhausted');
+    assert.equal(exhausted.investigation!.agentTokens, 8_092_966);
+    assert.equal(exhausted.investigation!.turnCount, 3);
+    assert.deepEqual(exhausted.investigation!.actions, f.state.actions);
+    const second = await f.orchestrator.extendInvestigatorTokens(f.campaign.id, f.variant.id,
+      { ...tokenExtension, requestId: 'operator-second', additionalTokens: 25 });
+    assert.equal(second.grant.previousLimit, 8_092_956);
+    assert.equal(second.grant.effectiveLimit, 8_092_991);
+    assert.deepEqual(second.variant.investigation!.tokenGrants, [first.grant, second.grant]);
+    assert.equal(second.variant.investigation!.agentCostUsd, 12.84);
+    assert.equal(second.variant.investigation!.startedAt, f.state.startedAt);
+    assert.deepEqual(await f.orchestrator.extendInvestigatorTokens(f.campaign.id, f.variant.id, tokenExtension),
+      { variant: second.variant, grant: first.grant });
   } finally { await f.close(); }
 });
 

@@ -7,6 +7,7 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { z } from 'zod';
 import type { HarnessDatabase } from './db.js';
+import { InvestigatorTokenGrantInputSchema } from './investigatorBudget.js';
 import type { CampaignOrchestrator } from './orchestrator.js';
 import { DecisionSchema, TargetExcludedAnswerInputSchema } from './types.js';
 import { campaignReportDirectory, variantArtifactDirectory, variantWorktreePath } from './paths.js';
@@ -514,6 +515,14 @@ export function startDashboard(input: {
             clearInterval(timer);
             clearInterval(heartbeat);
           });
+          return;
+        }
+        if (request.method === 'POST' && segments[3] === 'variants' && segments[4] &&
+            segments[5] === 'extend-tokens' && segments.length === 6) {
+          requireSameOriginJson(request);
+          const grantInput = InvestigatorTokenGrantInputSchema.parse(await readJson(request));
+          const { variant, grant } = await input.orchestrator.extendInvestigatorTokens(campaignId, segments[4], grantInput);
+          sendJson(response, 200, { variantId: variant.id, status: variant.status, grant });
           return;
         }
         if (request.method === 'POST' && segments[3] === 'baseline') {
