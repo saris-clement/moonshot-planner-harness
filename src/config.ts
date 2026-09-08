@@ -45,6 +45,10 @@ export async function resolveCampaignConfig(input: unknown): Promise<{
   researchInputs: Awaited<ReturnType<typeof resolveResearchInputPins>>;
 }> {
   const config = CampaignConfigSchema.parse(input);
+  // Freeze the new-campaign default without reinterpreting archived configs that omitted it.
+  if (config.investigator?.enabled && config.investigator.primaryReplicates === undefined) {
+    config.investigator.primaryReplicates = 2;
+  }
   await Promise.all([
     assertDirectory(config.plannerRepo, 'plannerRepo'),
     assertDirectory(config.workflowsRepo, 'workflowsRepo'),

@@ -171,6 +171,24 @@ dd { margin: 2px 0 0; font-weight: 550; }
 .section-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
 .section-heading h2 { margin-bottom: 0; }
 .section-heading > p { max-width: 630px; margin: 0; color: var(--muted-foreground); font-size: 11px; text-align: right; }
+.section-heading-description { display: flex; align-items: center; gap: 8px; max-width: 630px; min-width: 0; }
+.section-heading-description > p { min-width: 0; margin: 0; color: var(--muted-foreground); font-size: 11px; text-align: right; }
+.experiment-help-trigger { display: inline-flex; flex: 0 0 32px; width: 32px; height: 32px; padding: 0; align-items: center; justify-content: center; border: 0; border-radius: 50%; color: var(--muted-foreground); background: transparent; cursor: pointer; }
+.experiment-help-icon { display: grid; place-items: center; width: 19px; height: 19px; border: 1px solid currentColor; border-radius: 50%; font-size: 12px; font-weight: 600; line-height: 1; }
+.experiment-help-trigger:hover { color: var(--foreground); background: var(--muted); }
+.experiment-help-dialog { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); margin: auto; padding: 24px; overflow: auto; border: 1px solid var(--border-contrast); border-radius: var(--radius); background: var(--background); color: var(--foreground); box-shadow: 0 16px 48px hsl(222 47% 11% / .16); font-size: 13px; line-height: 1.55; }
+.experiment-help-dialog::backdrop { background: hsl(222 47% 11% / .32); }
+.experiment-help-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 8px; }
+.experiment-help-header h2 { margin: 0; font-size: 19px; }
+.experiment-help-header button { flex-shrink: 0; }
+.experiment-help-dialog section { margin: 22px 0; }
+.experiment-help-dialog h3 { margin-bottom: 6px; font-size: 14px; }
+.experiment-help-dialog p { margin-bottom: 10px; }
+.experiment-help-dialog .experiment-help-example { margin: 10px 0 0; color: var(--muted-foreground); }
+.experiment-help-example span:first-child { display: block; margin-bottom: 2px; font-size: 11px; font-weight: 650; }
+.experiment-help-example span:last-child { color: var(--foreground); }
+.experiment-help-note { padding-top: 16px; border-top: 1px solid var(--border); }
+.experiment-help-dialog .experiment-help-scores { margin-bottom: 0; font-size: 12px; }
 .empty-row { padding: 18px 2px; border-bottom: 1px solid var(--border); color: var(--muted-foreground); }
 
 .active-variant { margin: 0 0 28px; border-top: 2px solid var(--primary); }
@@ -277,6 +295,42 @@ textarea { padding: 8px; resize: vertical; }
 .summary-grid .metric-summary div:nth-last-child(-n+2) { border-bottom: 0; }
 .definition-list { display: grid; grid-template-columns: repeat(3, 1fr); margin: 0; border-top: 1px solid var(--border-contrast); }
 .definition-list div { padding: 10px 3px; border-bottom: 1px solid var(--border); }
+.definition-list > div { min-width: 0; overflow-wrap: anywhere; }
+.ledger-investigation { display: block; margin-top: 5px; font-size: 10px; overflow-wrap: anywhere; }
+.score-basis { color: var(--muted-foreground); }
+.investigator-row { padding: 14px 0; border-bottom: 1px solid var(--border); }
+.investigator-row > a { overflow-wrap: anywhere; }
+.investigation-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin: 10px 0; }
+.investigation-heading p { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.investigation-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 0 0 10px; border-top: 1px solid var(--border); }
+.investigation-metrics > div { min-width: 0; padding: 8px 10px 8px 0; border-bottom: 1px solid var(--border); }
+.investigation-metrics dd { font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
+.investigation-panel, .investigation-status { min-width: 0; }
+.investigation-panel summary, .investigation-status summary, .investigator-budget-controls summary { min-height: 32px; padding: 7px 0; cursor: pointer; color: var(--link); font-weight: 600; }
+.investigation-prose { margin: 4px 0 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.investigation-note { margin: 20px 0 10px; }
+.investigation-table { table-layout: fixed; font-size: 12px; }
+.investigation-table th:nth-child(1) { width: 18%; }
+.investigation-table th:nth-child(2) { width: 28%; }
+.investigation-table th:nth-child(3) { width: 54%; }
+.investigation-table :is(td, th) { white-space: normal; overflow-wrap: anywhere; }
+.investigation-table tbody > tr > th { position: static; background: var(--background); color: var(--foreground); text-transform: none; letter-spacing: 0; font-size: 12px; }
+.investigation-table .identifier { display: block; color: var(--muted-foreground); }
+.investigation-action-title { display: -webkit-box; margin-bottom: 6px; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 3; font-weight: 600; }
+.investigation-score { font-family: var(--mono); font-size: 11px; }
+.investigation-action-detail { padding: 12px 0 0; border-top: 1px solid var(--border); }
+.investigation-action-detail > div { margin-bottom: 12px; }
+.investigation-action-detail .error-panel p { margin-bottom: 0; }
+.investigation-table td > p { margin: 6px 0; }
+.investigation-evaluation th { position: static; width: auto !important; }
+.investigation-evaluation tbody th { font-size: 10px; text-transform: none; letter-spacing: 0; }
+.investigation-artifacts a { display: block; margin: 6px 0; overflow-wrap: anywhere; }
+.investigation-raw { max-height: 320px; padding: 12px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--canvas); color: var(--foreground); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.investigator-help { margin: 0; color: var(--muted-foreground); font-size: 12px; }
+.investigator-budget-controls { min-width: 0; }
+.investigator-budget-controls fieldset { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 14px; min-width: 0; margin: 8px 0 0; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); }
+.investigator-budget-controls legend { padding: 0 4px; color: var(--muted-foreground); font-size: 11px; }
+.investigator-budget-controls label { display: grid; gap: 4px; min-width: 0; color: var(--muted-foreground); font-size: 11px; font-weight: 600; }
 .error-panel { padding: 13px; border: 1px solid hsl(0 60% 82%); border-radius: var(--radius); background: var(--red-soft); }
 .error-text { color: var(--destructive); }
 .markdown-panel .section-heading { margin-top: 0; }
@@ -340,12 +394,20 @@ textarea { padding: 8px; resize: vertical; }
 .lineage-card { position: relative; width: 244px; padding: 11px; border: 1px solid var(--border-contrast); border-radius: var(--radius); background: var(--background); }
 .lineage-card.current-path { border-color: hsl(246 38% 67%); box-shadow: 0 0 0 1px hsl(246 38% 67%); }
 .lineage-card.current-head { background: hsl(251 91% 97.5%); }
+.lineage-measurement { margin: 10px 0; padding-top: 9px; border-top: 1px solid var(--border); }
+.lineage-measurement p { margin: 4px 0; overflow-wrap: anywhere; }
+.lineage-comparison { font-size: 11px; font-variant-numeric: tabular-nums; }
+.lineage-outcome { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--border); }
+.lineage-outcome h3 { margin: 0 0 5px; font-size: 12px; }
+.lineage-outcome p { margin: 5px 0; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.lineage-investigation-link { display: inline-block; margin-top: 9px; font-size: 11px; }
 .lineage-card-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 7px; }
 .lineage-ordinal { color: var(--muted-foreground); font-family: var(--mono); font-size: 9px; }
 .lineage-card-title { display: block; color: var(--foreground); font-size: 12px; font-weight: 650; line-height: 1.3; }
 .lineage-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 0; margin: 10px 0 0; border-top: 1px solid var(--border); }
 .lineage-metrics div { min-width: 0; padding: 6px 4px 5px 0; border-bottom: 1px solid var(--border); }
 .lineage-metrics dd { overflow: hidden; text-overflow: ellipsis; font-family: var(--mono); font-size: 9px; white-space: nowrap; }
+.lineage-metrics dd.mean-score, .lineage-metrics dd.agreement-value { white-space: normal; overflow-wrap: anywhere; }
 .head-flag { margin: 9px -11px -11px; padding: 6px 10px; border-radius: 0 0 7px 7px; background: var(--primary); color: var(--primary-foreground); font-size: 9px; font-weight: 650; text-transform: uppercase; }
 .lineage-connectors { position: absolute; top: 0; left: 0; z-index: 0; overflow: visible; pointer-events: none; }
 .connector { fill: none; stroke: hsl(214 18% 66%); stroke-width: 1.5; }
@@ -503,6 +565,14 @@ tr.selected { background: var(--muted); }
 }
 
 @media (max-width: 780px) {
+  .investigation-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .investigation-panel summary, .investigation-status summary, .investigator-budget-controls summary { min-height: 44px; padding-block: 12px; }
+  .investigation-table > thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .investigation-table, .investigation-table > tbody { display: block; }
+  .investigation-table > tbody > tr { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); padding: 10px 0; border-bottom: 1px solid var(--border-contrast); }
+  .investigation-table > tbody > tr > :is(th, td) { width: auto; min-width: 0; border: 0; }
+  .investigation-table > tbody > tr > td:last-child { grid-column: 1 / -1; }
+  .investigation-table > tbody > tr:last-child { border-bottom: 0; }
   .button, button.button, .icon-button, input, select { min-height: 44px; height: 44px; }
   .app-shell, .sidebar-collapsed { grid-template-columns: minmax(0, 1fr); }
   .topbar { padding-inline: 10px; }
@@ -563,9 +633,15 @@ tr.selected { background: var(--muted); }
 }
 
 @media (max-width: 520px) {
+  .investigator-budget-controls fieldset { grid-template-columns: minmax(0, 1fr); }
   h1 { font-size: 20px; }
   .section-heading { display: block; }
   .section-heading > p { margin-top: 4px; text-align: left; }
+  .section-heading-description { margin-top: 4px; }
+  .section-heading-description > p { text-align: left; }
+  .experiment-help-trigger { flex-basis: 44px; width: 44px; height: 44px; }
+  .experiment-help-dialog { padding: 20px; }
+  .experiment-help-header h2 { font-size: 17px; }
   .campaign-form { grid-template-columns: 1fr; }
   .campaign-form .wide, .form-section { grid-column: auto; }
   .form-actions { display: grid; }

@@ -1,6 +1,8 @@
 import {
   element,
+  formatAgreement,
   formatDuration,
+  formatMeanScore,
   formatMoney,
   formatNumber,
   formatPercent,
@@ -104,9 +106,9 @@ export function frozenMetadata(campaign) {
     ['Mode', titleCase(campaign.config.mode)],
     ['Planner seed', shortSha(campaign.seedSha)],
     ['Workflows', shortSha(campaign.workflowsSha)],
-    ['Replicates', `${campaign.config.evaluation.replicates} / benchmark`],
+    [campaign.config.investigator?.enabled ? 'Baseline/final replicates' : 'Replicates', `${campaign.config.evaluation.replicates} / benchmark`],
     ['Search', `${campaign.config.limits.concurrency} wide · ${campaign.config.limits.maxVariants} max`],
-    ['Planner model', campaign.config.agent.model],
+    ['Harness agent', campaign.config.agent.model],
     ['Created', new Date(campaign.createdAt).toLocaleString()],
   ];
   const list = element('dl', { className: 'metadata-strip', attributes: { 'aria-label': 'Frozen campaign metadata' } });
@@ -246,7 +248,7 @@ export function replicateTable(campaign, variant, options = {}) {
     );
     for (const row of targetRows) appendRow(row, 'target-excluded');
   }
-  return element('div', { className: 'table-scroll replicate-table-wrap' }, [
+  return element('div', { className: 'table-scroll replicate-table-wrap', attributes: { 'data-live-key': `${variant.id}:replicates` } }, [
     element('table', { className: 'replicate-table' }, [
       element('caption', { text: `${variant.hypothesis.title} benchmark replicate matrix` }),
       element('thead', {}, [
@@ -292,11 +294,12 @@ export function usageSummary(campaign, variant) {
   );
 }
 
-export function scoreSummary(variant) {
+export function scoreSummary(variant, campaign) {
+  const basis = campaign?.config.investigator?.enabled || variant.score?.metricMode === 'replicate_mean' ? ' (replicate mean)' : '';
   const values = [
-    ['Verified', `${formatPercent(variant.score?.verified.accuracy)} · ${variant.score?.verified.labeled ?? 0} labeled`],
-    ['Provisional', `${formatPercent(variant.score?.provisional.accuracy)} · ${variant.score?.provisional.labeled ?? 0} suggested`],
-    ['Agreement', formatPercent(variant.facts?.decisionAgreement)],
+    [`Verified${basis}`, basis ? formatMeanScore(variant.score?.verified) : `${formatPercent(variant.score?.verified?.accuracy)} · ${variant.score?.verified?.labeled ?? 0} labeled`],
+    [`Provisional${basis}`, basis ? formatMeanScore(variant.score?.provisional) : `${formatPercent(variant.score?.provisional?.accuracy)} · ${variant.score?.provisional?.labeled ?? 0} suggested`],
+    [basis ? 'Consensus agreement' : 'Agreement', formatAgreement(variant.facts)],
     ['Cohort drift', variant.score ? (variant.score.cohortMismatches?.length ? variant.score.cohortMismatches.join(', ') : 'None observed') : 'Not evaluated'],
   ];
   return element('dl', { className: 'metric-summary metric-summary-scores', attributes: { 'aria-label': 'Truthful score dimensions' } },
@@ -334,10 +337,11 @@ export function externalTraceLink(variant, label = 'Open in Langfuse') {
     : null;
 }
 
-export function sectionHeading(kicker, title, description = '') {
+export function sectionHeading(kicker, title, description = '', help = null) {
   return element('div', { className: 'section-heading' }, [
     element('div', {}, [element('p', { className: 'overline', text: kicker }), element('h2', { text: title })]),
-    description ? element('p', { text: description }) : null,
+    help ? element('div', { className: 'section-heading-description' }, [element('p', { text: description }), help])
+      : description ? element('p', { text: description }) : null,
   ]);
 }
 

@@ -1,15 +1,18 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import { runCommand } from '../src/process.js';
 import {
   captureAndGateDiff,
   captureMutationDiff,
   prepareVariantWorktree,
+  runInvestigatorTests,
+  runVariantGates,
   stageMutationBaseline,
+  startVariantStack,
 } from '../src/stack.js';
 import { CampaignConfigSchema, type CampaignRecord, type VariantRecord } from '../src/types.js';
 import type { HarnessPaths } from '../src/paths.js';
@@ -560,4 +563,269 @@ test('compliance attempt inputs are immutable across later mutation captures', a
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+async function dockerFixture(t: TestContext) {
+  const value = await fixture();
+  t.after(async () => await rm(value.directory, { recursive: true, force: true }));
+  const bin = path.join(value.directory, 'bin');
+  const image = path.join(value.directory, 'image');
+  const callsPath = path.join(value.directory, 'docker-calls.jsonl');
+  await mkdir(bin);
+  await mkdir(path.join(image, 'server/test/nested'), { recursive: true });
+  await writeFile(path.join(image, 'server/test/policy.test.ts'), 'export {};\n');
+  await writeFile(path.join(image, 'server/test/nested/other.test.ts'), 'export {};\n');
+  await writeFile(path.join(bin, 'docker'), `#!${process.execPath} --
+const { appendFileSync } = require('node:fs');
+const { spawnSync } = require('node:child_process');
+const args = process.argv.slice(2);
+appendFileSync(process.env.DOCKER_CALLS, JSON.stringify(args) + '\\n');
+const entrypoint = args.indexOf('--entrypoint');
+const command = args[entrypoint + 1];
+const commandArgs = args.slice(entrypoint + 3);
+if (entrypoint !== -1 && command === 'node') {
+  const result = spawnSync(process.execPath, commandArgs, { cwd: process.env.TEST_IMAGE, stdio: 'inherit' });
+  process.exit(result.status ?? 1);
+}
+console.log('docker fixture output');
+if (process.env.FAIL_GATE && commandArgs.includes(process.env.FAIL_GATE)) {
+  console.error('fixture gate failed');
+  process.exit(7);
+}
+`);
+  await chmod(path.join(bin, 'docker'), 0o755);
+  const environment = {
+    PATH: `${bin}${path.delimiter}${process.env.PATH ?? ''}`,
+    DOCKER_CALLS: callsPath,
+    TEST_IMAGE: image,
+    PLANNER_KB_MODE: 'disabled',
+  };
+  return {
+    ...value,
+    image,
+    environment,
+    calls: async (): Promise<string[][]> => (await readFile(callsPath, 'utf8').catch(() => ''))
+      .split('\n').filter(Boolean).map((line) => JSON.parse(line) as string[]),
+  };
+}
+
+function assertGateSandbox(args: string[]): void {
+  assert.deepEqual(args.slice(0, args.indexOf('--entrypoint')), [
+    'run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
+    '--security-opt', 'no-new-privileges:true', '--pids-limit', '512',
+    '--memory', '4g', '--cpus', '4',
+    '--tmpfs', '/tmp:rw,exec,nosuid,size=1g',
+    '--tmpfs', '/root/.npm:rw,noexec,nosuid,size=128m',
+    '--tmpfs', '/app/.local:rw,noexec,nosuid,size=1g',
+    '--tmpfs', '/app/server/node_modules/.vite-temp:rw,noexec,nosuid,size=256m',
+    '--env', 'CI=1',
+  ]);
+}
+
+test('investigator selected tests validate image files, then run fixed typecheck and workspace Vitest', async (t) => {
+  const value = await dockerFixture(t);
+  value.campaign.config.gates.commands = [{ command: 'sh', args: ['-c', 'untrusted'], timeoutMs: 1_000 }];
+  const files = ['server/test/policy.test.ts', 'server/test/nested/other.test.ts'];
+  const result = await runInvestigatorTests(value.campaign, 'trusted:test', value.artifacts, value.environment, files);
+  assert.deepEqual(result, {
+    passed: true,
+    testFiles: files,
+    logPaths: ['test-files.log', 'typecheck.log', 'tests.log'].map((file) => path.join(value.artifacts, file)),
+  });
+  const calls = await value.calls();
+  assert.equal(calls.length, 3);
+  calls.forEach(assertGateSandbox);
+  const commands = calls.map((args) => args.slice(args.indexOf('--entrypoint') + 1));
+  assert.equal(commands[0]![0], 'node');
+  assert.deepEqual(commands[0]!.slice(-files.length), files);
+  assert.deepEqual(commands[1], ['npm', 'trusted:test', 'run', 'typecheck']);
+  assert.deepEqual(commands[2], [
+    'npm', 'trusted:test', 'exec', '--workspace', '@ainative-planner/server', '--',
+    'vitest', 'run', 'test/policy.test.ts', 'test/nested/other.test.ts',
+  ]);
+  for (const logPath of result.logPaths) await readFile(logPath);
+});
+
+test('omitted investigator test selection preserves configured full gates and legacy server test rewrite', async (t) => {
+  const value = await dockerFixture(t);
+  value.campaign.config.gates.commands = [
+    { command: 'npm', args: ['run', 'typecheck'], timeoutMs: 1_000 },
+    { command: 'npm', args: ['run', 'test', '--workspace', '@ainative-planner/server'], timeoutMs: 1_000 },
+  ];
+  await runVariantGates(value.campaign, 'trusted:test', value.artifacts, value.environment);
+  const original = await value.calls();
+  const result = await runInvestigatorTests(value.campaign, 'trusted:test', value.artifacts, value.environment);
+  assert.deepEqual((await value.calls()).slice(original.length), original);
+  original.forEach(assertGateSandbox);
+  assert.deepEqual(original[1]!.slice(original[1]!.indexOf('--entrypoint') + 1), [
+    'npm', 'trusted:test', 'exec', '--workspace', '@ainative-planner/server', '--',
+    'vitest', 'run', '--exclude', 'test/deployment.integration.test.ts',
+  ]);
+  assert.deepEqual(result, {
+    passed: true, testFiles: [],
+    logPaths: [path.join(value.artifacts, 'gate-1.log'), path.join(value.artifacts, 'gate-2.log')],
+  });
+});
+
+test('investigator rejects unsafe, empty, duplicate, and oversized test selections before Docker', async (t) => {
+  const value = await dockerFixture(t);
+  const invalid: unknown[] = [
+    [], null, 'server/test/policy.test.ts', [null], [1],
+    ['server/test/policy.test.ts', 'server/test/policy.test.ts'],
+    Array.from({ length: 31 }, (_, i) => `server/test/test-${i}.test.ts`),
+    ...[
+      '../server/test/policy.test.ts', '/server/test/policy.test.ts',
+      './server/test/policy.test.ts', 'server/test/../policy.test.ts',
+      'server/test/./policy.test.ts', 'server/test//policy.test.ts',
+      'server/test/*.test.ts', 'server/test/[a].test.ts', 'server/test/{a,b}.test.ts',
+      'server/test/?a.test.ts', '--config=server/test/policy.test.ts',
+      'server/test/-policy.test.ts', 'server/test/policy.test.ts;touch-x',
+      'server/test/$(touch-x).test.ts', 'server/test/a b.test.ts',
+      'server/test/a\nb.test.ts', 'server/test/a\0b.test.ts',
+      'server/test/policy.test.ts\n', 'server/test/policy.test.ts\r',
+      'server\\test\\policy.test.ts', 'C:/server/test/policy.test.ts',
+      'server/src/policy.test.ts', 'server/tests/policy.test.ts',
+      'server/test/policy.spec.ts', 'server/test/policy.test.ts/',
+      'server/test/.git/policy.test.ts', 'server/test/node_modules/policy.test.ts',
+      'server/test/nested/node_modules/policy.test.ts',
+    ].map((file) => [file]),
+  ];
+  for (const files of invalid) {
+    await assert.rejects(
+      runInvestigatorTests(value.campaign, 'trusted:test', value.artifacts, value.environment, files as string[]),
+      /testFiles|test file/i,
+      JSON.stringify(files),
+    );
+  }
+  assert.deepEqual(await value.calls(), []);
+});
+
+test('investigator accepts the maximum of 30 unique canonical files', async (t) => {
+  const value = await dockerFixture(t);
+  const files = Array.from({ length: 30 }, (_, i) => `server/test/test-${i}.test.ts`);
+  await Promise.all(files.map((file) => writeFile(path.join(value.image, file), 'export {};\n')));
+  const result = await runInvestigatorTests(value.campaign, 'trusted:test', value.artifacts, value.environment, files);
+  assert.deepEqual(result.testFiles, files);
+});
+
+test('investigator accepts safe test subdirectories even when named after infrastructure', async (t) => {
+  const value = await dockerFixture(t);
+  const files = ['server/test/scripts/docker.test.ts'];
+  await mkdir(path.join(value.image, 'server/test/scripts'));
+  await writeFile(path.join(value.image, files[0]!), 'export {};\n');
+  const result = await runInvestigatorTests(value.campaign, 'trusted:test', value.artifacts, value.environment, files);
+  assert.deepEqual(result.testFiles, files);
+});
+
+test('investigator full gate failures retain configured gate logs', async (t) => {
+  const value = await dockerFixture(t);
+  value.campaign.config.gates.commands = [{ command: 'npm', args: ['run', 'typecheck'], timeoutMs: 1_000 }];
+  await assert.rejects(
+    runInvestigatorTests(value.campaign, 'trusted:test', value.artifacts, { ...value.environment, FAIL_GATE: 'typecheck' }),
+    /command failed \(7\)/,
+  );
+  assert.match(await readFile(path.join(value.artifacts, 'gate-1.log'), 'utf8'), /fixture gate failed/);
+});
+
+for (const kind of ['missing', 'directory', 'symlink', 'symlink-parent', 'embedded-repo'] as const) {
+  test(`investigator rejects ${kind} selected image files with a validation log and no test execution`, async (t) => {
+    const value = await dockerFixture(t);
+    const file = kind === 'symlink-parent' || kind === 'embedded-repo'
+      ? 'server/test/link/policy.test.ts' : 'server/test/rejected.test.ts';
+    // A matching host file must not satisfy image validation.
+    await mkdir(path.dirname(path.join(value.directory, file)), { recursive: true });
+    await writeFile(path.join(value.directory, file), 'export {};\n');
+    if (kind === 'directory') await mkdir(path.join(value.image, file));
+    if (kind === 'symlink') await symlink('policy.test.ts', path.join(value.image, file));
+    if (kind === 'symlink-parent') await symlink('.', path.join(value.image, 'server/test/link'));
+    if (kind === 'embedded-repo') {
+      await mkdir(path.join(value.image, 'server/test/link/.git'), { recursive: true });
+      await writeFile(path.join(value.image, file), 'export {};\n');
+    }
+    await assert.rejects(
+      runInvestigatorTests(value.campaign, 'trusted:test', value.artifacts, value.environment, [file]),
+      /command failed/,
+    );
+    assert.equal((await value.calls()).length, 1);
+    assert.match(await readFile(path.join(value.artifacts, 'test-files.log'), 'utf8'), /ENOENT|regular file|symbolic link|embedded repository/i);
+  });
+}
+
+for (const gate of ['typecheck', 'vitest']) {
+  test(`investigator propagates ${gate} failure and retains its log`, async (t) => {
+    const value = await dockerFixture(t);
+    await assert.rejects(
+      runInvestigatorTests(value.campaign, 'trusted:test', value.artifacts, { ...value.environment, FAIL_GATE: gate }, ['server/test/policy.test.ts']),
+      /command failed \(7\)/,
+    );
+    assert.equal((await value.calls()).length, gate === 'typecheck' ? 2 : 3);
+    assert.match(await readFile(path.join(value.artifacts, gate === 'typecheck' ? 'typecheck.log' : 'tests.log'), 'utf8'), /fixture gate failed/);
+  });
+}
+
+test('diff gate rejects execution surfaces even with permissive allowed prefixes and includes ignored caches', async (t) => {
+  for (const file of [
+    'Dockerfile', 'package.json', 'server/package.json', 'server/package-lock.json',
+    'server/.npmrc', 'server/vitest.config.ts', 'server/test/tsconfig.json',
+    'scripts/build.ts', '.dockerignore', 'docker-compose.yml', '.gitattributes',
+    'server/node_modules/.vite/results.json', 'server/src/nested/node_modules/payload.ts',
+  ]) {
+    await t.test(file, async () => {
+      const value = await fixture();
+      try {
+        value.campaign.config.gates.allowedPathPrefixes = ['server/', 'scripts/', 'Dockerfile', 'package', '.docker', 'docker-', '.git'];
+        await writeFile(path.join(value.directory, '.git/info/exclude'), 'node_modules/\n');
+        await mkdir(path.dirname(path.join(value.directory, file)), { recursive: true });
+        await writeFile(path.join(value.directory, file), '// modified execution surface\n');
+        await assert.rejects(
+          captureAndGateDiff(value.campaign, value.variant, value.directory, value.artifacts),
+          /protected execution surface/,
+        );
+        assert.match(await readFile(path.join(value.artifacts, 'variant.patch'), 'utf8'), /modified execution surface/);
+      } finally {
+        await rm(value.directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test('diff gate checks whitespace after archiving the patch and logs failures', async (t) => {
+  for (const file of ['server/src/policy.ts', 'server/test/new.test.ts']) {
+    await t.test(file, async () => {
+      const value = await fixture();
+      try {
+        await writeFile(path.join(value.directory, file), 'export const policy = "generic";  \n');
+        await assert.rejects(
+          captureAndGateDiff(value.campaign, value.variant, value.directory, value.artifacts),
+          /command failed/,
+        );
+        assert.match(await readFile(path.join(value.artifacts, 'variant.patch'), 'utf8'), /generic/);
+        assert.match(await readFile(path.join(value.artifacts, 'diff-check.log'), 'utf8'), /trailing whitespace/);
+      } finally {
+        await rm(value.directory, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test('stack startup creates and retains the caller-supplied isolated artifact directory', async (t) => {
+  const value = await dockerFixture(t);
+  const paths: HarnessPaths = {
+    root: value.directory,
+    database: path.join(value.directory, 'harness.sqlite'),
+    campaigns: path.join(value.directory, 'campaigns'),
+    worktrees: path.join(value.directory, 'worktrees'),
+    artifacts: value.artifacts,
+    reports: path.join(value.directory, 'reports'),
+  };
+  const actionArtifacts = path.join(value.artifacts, 'trial-1/action-1');
+  const stack = await startVariantStack(
+    paths, value.campaign, value.variant, value.directory, actionArtifacts,
+    'trusted:runtime', value.environment, value.directory, 'trial-1',
+  );
+  assert.equal(stack.artifactDirectory, actionArtifacts);
+  assert.equal(stack.generatedEnvironmentFile, path.join(actionArtifacts, 'stack.env'));
+  assert.match(await readFile(stack.generatedEnvironmentFile, 'utf8'), /PLANNER_IMAGE=trusted:runtime/);
+  assert.match(await readFile(path.join(actionArtifacts, 'stack-up.log'), 'utf8'), /docker fixture output/);
+  assert.ok(stack.composeArgs.includes(stack.generatedEnvironmentFile));
 });

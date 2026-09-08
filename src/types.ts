@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { InvestigationState } from './investigator.js';
 
 const AbsolutePathSchema = z.string().min(1).refine((value) => value.startsWith('/'), {
   message: 'expected an absolute path',
@@ -84,6 +85,17 @@ export const CampaignConfigSchema = z
       .strict()
       .optional(),
     mode: z.enum(['supervised', 'automatic']).default('supervised'),
+    investigator: z
+      .object({
+        enabled: z.boolean(),
+        primaryReplicates: z.number().int().min(1).max(3).optional(),
+        maxTurns: z.number().int().positive().default(12),
+        maxPrimaryEvaluations: z.number().int().positive().default(3),
+        maxWallTimeMs: z.number().int().positive().max(2_147_483_647).default(14_400_000),
+        maxAgentTokens: z.number().int().positive().default(2_000_000),
+      })
+      .strict()
+      .optional(),
     evaluation: z
       .object({
         replicates: z.number().int().min(1).max(10).default(3),
@@ -1060,6 +1072,7 @@ export interface VariantRecord {
   round: number;
   ordinal: number;
   hypothesis: Hypothesis;
+  investigation?: InvestigationState | null;
   status: VariantStatus;
   worktreePath: string | null;
   imageTag: string | null;

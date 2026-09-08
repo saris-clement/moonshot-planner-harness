@@ -251,12 +251,10 @@ export function consensusRunFacts(runs: readonly RunFacts[]): RunFacts {
   };
 }
 
-export function computeScore(
-  facts: RunFacts,
+function scoreReference(
   labels: readonly LabelRecord[],
   judgment: JudgeOutput | null,
-): Score {
-  const units = new Map(facts.units.map((unit) => [unit.key, unit]));
+) {
   const verifiedLabels = labels.filter((label) => label.status === 'verified');
   const verifiedKeys = new Set(verifiedLabels.map((label) => label.unitKey));
   const suggestedByKey = new Map<string, { unitKey: string; expectedDecision: Decision }>(
@@ -269,6 +267,16 @@ export function computeScore(
       suggestedByKey.set(verdict.unitKey, verdict);
     }
   }
+  return { verified: verifiedLabels, provisional: [...suggestedByKey.values()] };
+}
+
+export function computeScore(
+  facts: RunFacts,
+  labels: readonly LabelRecord[],
+  judgment: JudgeOutput | null,
+): Score {
+  const units = new Map(facts.units.map((unit) => [unit.key, unit]));
+  const reference = scoreReference(labels, judgment);
   const decisionErrors = emptyDecisions();
 
   const evaluate = (expected: Array<{ unitKey: string; expectedDecision: Decision }>) => {
@@ -289,8 +297,42 @@ export function computeScore(
 
   return {
     cohortMismatches: [],
-    verified: evaluate(verifiedLabels),
-    provisional: evaluate([...suggestedByKey.values()]),
+    verified: evaluate(reference.verified),
+    provisional: evaluate(reference.provisional),
+    decisionErrors,
+  };
+}
+
+export function computeReplicateMeanScore(
+  runs: readonly RunFacts[],
+  labels: readonly LabelRecord[],
+  judgment: JudgeOutput | null,
+): Score {
+  if (runs.length === 0) throw new Error('cannot compute mean score without replicate facts');
+  const reference = scoreReference(labels, judgment);
+  const scores = runs.map((facts) => computeScore(facts, labels, judgment));
+  const average = (category: 'verified' | 'provisional'): Score['verified'] => {
+    // Keep the same denominator in every replicate; a missing labeled unit is an error.
+    const labeled = reference[category].length;
+    const correct = scores.reduce((sum, score) => sum + score[category].correct, 0) / runs.length;
+    const errors = scores.reduce((sum, score) => sum + (labeled - score[category].correct), 0) / runs.length;
+    return {
+      labeled,
+      correct,
+      errors,
+      accuracy: labeled === 0 ? null : correct / labeled,
+    };
+  };
+  const decisionErrors = emptyDecisions();
+  // Attribute errors only to decisions actually emitted, not to missing labeled units.
+  for (const decision of DecisionSchema.options) {
+    decisionErrors[decision] =
+      scores.reduce((sum, score) => sum + score.decisionErrors[decision], 0) / runs.length;
+  }
+  return {
+    cohortMismatches: [...new Set(runs.slice(1).flatMap((facts) => compareCohort(runs[0]!, facts)))],
+    verified: average('verified'),
+    provisional: average('provisional'),
     decisionErrors,
   };
 }

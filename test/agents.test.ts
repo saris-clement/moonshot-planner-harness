@@ -405,6 +405,8 @@ test('hypothesis compliance reviewer binds its unverified verdict to patch and m
     assert.match(calls[0]!.join(' '), /executable falsification/i);
     assert.match(calls[0]!.join(' '), /unverified model judgment/i);
     assert.match(calls[0]!.join(' '), /Do not modify files, the Git index, or HEAD/);
+    assert.match(calls[0]!.join(' '), /Do not run host tests/);
+    assert.match(calls[1]!.join(' '), /Do not run host tests/);
     assert.match(calls[0]!.join(' '), /deferred_to_evaluation/);
     const attachedPaths = calls[0]!
       .flatMap((value, index, values) => (value === '--file' ? [values[index + 1]!] : []));

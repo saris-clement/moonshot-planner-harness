@@ -14,6 +14,7 @@
     "start": "node dist/src/cli.js serve",
     "test": "node --import tsx --test test/**/*.test.ts",
     "test:e2e": "playwright test",
+    "test:live": "tsx scripts/live.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

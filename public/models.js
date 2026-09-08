@@ -67,22 +67,54 @@ export function langfuseUrlForVariant(variant) {
   return url.toString();
 }
 
+export function primaryScreening(campaign, variant) {
+  const investigation = variant.investigation;
+  const trial = investigation?.actions?.findLast((action) => action.kind === 'evaluate_primary');
+  const primary = campaign.config.benchmarks.find((benchmark) => benchmark.role === 'primary');
+  const start = Date.parse(trial?.startedAt ?? '');
+  const end = Date.parse(trial?.completedAt ?? '');
+  const executions = trial ? executionsFor(variant).filter((execution) => {
+    const time = Date.parse(execution.startedAt ?? execution.updatedAt);
+    return execution.benchmark === primary?.name &&
+      (!Number.isFinite(start) || time >= start) && (!Number.isFinite(end) || time <= end);
+  }) : [];
+  const latest = executions.reduce((previous, execution) =>
+    !previous || Date.parse(execution.updatedAt) >= Date.parse(previous.updatedAt) ? execution : previous, null);
+  const replicateFacts = trial?.status === 'completed' && Array.isArray(trial.result?.replicateFacts)
+    ? trial.result.replicateFacts : [];
+  const recorded = replicateFacts.length || (trial?.status === 'completed' ? trial.result?.facts?.sampleSize : 0);
+  const observed = latest?.replicateCount || Math.max(0, ...executions.map((execution) => execution.replicate));
+  return {
+    active: Boolean(investigation && variant.round > 0 && investigation.status !== 'finalized' && !variant.facts),
+    replicateCount: recorded || observed || campaign.config.investigator?.primaryReplicates || 1,
+    countSource: recorded ? 'recorded' : observed ? 'observed' : 'configured',
+    replicateFacts,
+    executions,
+  };
+}
+
 export function replicateMatrix(campaign, variant) {
   const rows = [];
+  const screening = primaryScreening(campaign, variant);
+  const finalStart = variant.investigation?.status === 'finalized'
+    ? Date.parse(variant.phase2StartedAt ?? variant.investigation.actions.findLast((action) => action.kind === 'finalize' && action.status === 'completed')?.completedAt ?? '')
+    : NaN;
   for (const benchmark of campaign.config.benchmarks) {
-    const finalFacts = replicateFactsForBenchmark(variant, benchmark);
-    const observedCount = Math.max(
-      finalFacts.length,
-      ...executionsFor(variant)
-        .filter((execution) => execution.benchmark === benchmark.name)
-        .map((execution) => execution.replicateCount ?? execution.replicate),
+    if (screening.active && benchmark.role !== 'primary') continue;
+    const finalFacts = screening.active ? screening.replicateFacts : replicateFactsForBenchmark(variant, benchmark);
+    // Trials and final cohorts share execution keys; old trial snapshots are not final results.
+    const executions = screening.active ? screening.executions : executionsFor(variant).filter((execution) =>
+      execution.benchmark === benchmark.name && (!Number.isFinite(finalStart) || Date.parse(execution.startedAt ?? execution.updatedAt) >= finalStart),
     );
-    const replicateCount = observedCount ||
-      (campaign.targetExcludedConfig && variant.round > 0
+    const replicateCount = screening.active ? screening.replicateCount : Math.max(
+      campaign.targetExcludedConfig && variant.round > 0
         ? campaign.targetExcludedConfig.replicates
-        : campaign.config.evaluation.replicates);
+        : campaign.config.evaluation.replicates,
+      finalFacts.length,
+      ...executions.map((execution) => execution.replicateCount ?? execution.replicate),
+    );
     for (let replicate = 1; replicate <= replicateCount; replicate += 1) {
-      const execution = executionsFor(variant).find(
+      const execution = executions.find(
         (candidate) =>
           candidate.benchmark === benchmark.name && candidate.replicate === replicate,
       ) ?? null;
@@ -97,7 +129,7 @@ export function replicateMatrix(campaign, variant) {
             : 'pending';
       rows.push({
         benchmark: benchmark.name,
-        role: benchmark.role,
+        role: screening.active ? 'primary screening' : benchmark.role,
         replicate,
         replicateCount,
         execution,
@@ -118,6 +150,7 @@ export function replicateMatrix(campaign, variant) {
 }
 
 export function targetExcludedReplicateMatrix(campaign, variant) {
+  if (primaryScreening(campaign, variant).active) return [];
   const config = campaign.targetExcludedConfig ?? (campaign.config.targetExcluded
     ? { ...campaign.config.targetExcluded, replicates: 2 }
     : null);

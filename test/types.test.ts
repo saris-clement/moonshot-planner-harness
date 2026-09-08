@@ -50,6 +50,24 @@ test('campaign defaults reserve twelve hours of aggregate Phase 2 model duration
 
   assert.equal(config.limits.phase2TimeoutMs, 43_200_000);
   assert.equal(config.limits.hypothesisComplianceRepairAttempts, 1);
+  assert.equal(config.investigator, undefined);
+  assert.deepEqual(CampaignConfigSchema.parse({ ...config, investigator: { enabled: true } }).investigator, {
+    enabled: true, maxTurns: 12, maxPrimaryEvaluations: 3,
+    maxWallTimeMs: 14_400_000, maxAgentTokens: 2_000_000,
+  });
+  assert.equal(CampaignConfigSchema.parse({ ...config, investigator: { enabled: false } }).investigator?.enabled, false);
+  assert.equal(CampaignConfigSchema.parse({ ...config, investigator: { enabled: true, primaryReplicates: 1 } }).investigator?.primaryReplicates, 1);
+  for (const primaryReplicates of [0, 4, 1.5]) {
+    assert.equal(CampaignConfigSchema.safeParse({ ...config, investigator: { enabled: true, primaryReplicates } }).success, false);
+  }
+  for (const field of ['maxTurns', 'maxPrimaryEvaluations', 'maxWallTimeMs', 'maxAgentTokens']) {
+    for (const value of [0, -1, 1.5, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.equal(CampaignConfigSchema.safeParse({ ...config, investigator: { enabled: true, [field]: value } }).success, false);
+    }
+  }
+  for (const investigator of [{}, { enabled: 'true' }, { enabled: true, unknown: 1 }, { enabled: true, maxWallTimeMs: 2_147_483_648 }]) {
+    assert.equal(CampaignConfigSchema.safeParse({ ...config, investigator }).success, false);
+  }
   assert.equal(
     CampaignConfigSchema.parse({
       ...config,

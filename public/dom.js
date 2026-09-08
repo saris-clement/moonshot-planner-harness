@@ -55,6 +55,12 @@ export const formatMoney = (value) =>
 export const formatPercent = (value) =>
   value === null || value === undefined ? '—' : `${(Number(value) * 100).toFixed(1)}%`;
 
+export const formatMeanScore = (score) =>
+  `${formatPercent(score?.accuracy)} · ${formatNumber(score?.correct)}/${formatNumber(score?.labeled)} mean correct`;
+
+export const formatAgreement = (facts, sampleSize = facts?.sampleSize) =>
+  sampleSize === 1 ? 'Not measured (n=1)' : formatPercent(facts?.decisionAgreement);
+
 export const shortSha = (value) => (value ? `${String(value).slice(0, 9)}…` : '—');
 
 export const titleCase = (value) =>

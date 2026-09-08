@@ -41,6 +41,79 @@ function usesStandardPrimaryControl(campaign: CampaignRecord): boolean {
   return campaign.config.targetExcluded?.protocol === 'standard-primary-v2';
 }
 
+function renderInvestigation(campaign: CampaignRecord, variant: VariantRecord): string {
+  const state = variant.investigation;
+  if (!state) return campaign.config.investigator?.enabled
+    ? 'Enabled; no investigator session recorded for this variant. Baseline evaluation is separate.'
+    : 'Not enabled; no investigator session recorded.';
+  const limits = campaign.config.investigator;
+  const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const number = (value: unknown): string => typeof value === 'number' && Number.isFinite(value) ? String(value) : 'unknown';
+  const accuracy = (value: unknown): string => typeof value === 'number' && Number.isFinite(value) ? percentage(value) : 'unknown';
+  const rows = state.actions.map((action) => {
+    const result = record(action.result);
+    let outcome = action.status === 'completed' ? 'Result unknown' : action.error ?? 'No completed result';
+    if (action.status === 'completed') {
+      if (action.kind === 'test') outcome = result.passed === true ? 'Tests passed (execution only)' : result.passed === false ? 'Tests failed' : 'Test result unknown';
+      if (action.kind === 'evaluate_primary') {
+        const score = record(result.score);
+        const baseline = record(result.baselineScore);
+        outcome = score.verified || score.provisional
+          ? `Trial verified: ${accuracy(record(score.verified).accuracy)}; provisional: ${accuracy(record(score.provisional).accuracy)}. Baseline verified: ${accuracy(record(baseline.verified).accuracy)}; provisional: ${accuracy(record(baseline.provisional).accuracy)}. Label set: ${typeof result.labelSetHash === 'string' ? result.labelSetHash : 'unknown'}`
+          : 'Primary result unknown';
+      }
+      if (action.kind === 'finalize') {
+        const tests = record(result.tests);
+        const compliance = record(result.compliance);
+        outcome = `Finalization ${result.passed === true ? 'passed' : 'result unknown'}; full tests ${tests.passed === true ? 'passed' : 'unknown'}; compliance ${typeof compliance.status === 'string' ? compliance.status : 'unknown'} (unverified)`;
+      }
+      if (action.kind === 'abandon') outcome = 'Abandoned; no improvement asserted';
+    }
+    const archive = action.artifactDirectory ?? (/^action-\d+$/.test(action.id) ? `investigation/${action.id} (expected path; inspect archive)` : 'not recorded');
+    return `| ${[action.id, action.kind, action.status, action.hypothesis?.title ?? 'not recorded', action.patchHash ?? 'not recorded', outcome, archive].map(markdown).join(' | ')} |`;
+  });
+  const elapsed = Date.parse(state.updatedAt) - Date.parse(state.startedAt);
+  const pins = Object.entries(state.harnessPins ?? {})
+    .filter(([name, value]) => ['revision', 'dirtyPatchHash', 'runtimeSourceHash', 'contextHash', 'labelSetHash', 'mutationBaselineTree'].includes(name) && typeof value === 'string')
+    .map(([name, value]) => `| ${markdown(name)} | ${markdown(String(value))} |`);
+  return `Session state is operational telemetry. Hypotheses, rationales, and reasons are unverified interpretations; test success is not planner correctness.
+
+### Session
+
+| Field | Value |
+| --- | --- |
+| Session | ${markdown(state.sessionId ?? 'not assigned')} |
+| Session status | ${state.status} |
+| Started | ${markdown(state.startedAt)} |
+| Updated | ${markdown(state.updatedAt)} |
+| Agent cost USD | ${state.agentCostUsd === null ? 'unknown' : state.agentCostUsd.toFixed(4)} |
+${pins.join('\n')}
+
+Recorded reason (unverified interpretation):
+${state.reason ? quote(state.reason) : 'None recorded.'}
+
+### Budgets
+
+These are per-investigator budgets, separate from planner usage. Primary evaluation attempts include failed actions. Wall time is the elapsed session span at the last persisted update, not model duration.
+
+| Budget | Used | Limit |
+| --- | ---: | ---: |
+| Turns | ${number(state.turnCount)} | ${number(limits?.maxTurns)} |
+| Primary evaluation attempts | ${state.actions.filter(({ kind }) => kind === 'evaluate_primary').length} | ${number(limits?.maxPrimaryEvaluations)} |
+| Wall elapsed at last update ms | ${number(Number.isFinite(elapsed) ? Math.max(0, elapsed) : null)} | ${number(limits?.maxWallTimeMs)} |
+| Agent tokens | ${number(state.agentTokens)} | ${number(limits?.maxAgentTokens)} |
+
+### Action Timeline
+
+| Action | Kind | Status | Hypothesis (unverified) | Patch | Recorded outcome | Artifact directory |
+| --- | --- | --- | --- | --- | --- | --- |
+${rows.join('\n') || '| - | - | - | No actions recorded | - | No results | - |'}
+
+Targeted trusted tests precede primary development trials. Finalization requires full configured tests and semantic review before final primary, holdout, and configured excluded cohorts. A finalized session is not a completed experiment or a promotion decision. Trial facts remain separate from final facts below.
+
+Action directories are relative to this variant's ignored artifact root. Requests, pins, patches, receipts or failure records, logs, runtime question audits, transitions, and raw results remain there; they are not copied into this summary.`;
+}
+
 function renderAssumptions(variant: VariantRecord, parent?: VariantRecord | null): string {
   if (variant.hypothesis.assumptions.length === 0) {
     return 'No explicit assumptions were captured for this legacy hypothesis.';
@@ -124,11 +197,9 @@ function renderArms(
   const rows: Array<[string, string, VariantRecord['facts']]> = [
     [
       standardPrimaryControl ? 'Standard primary (comparison control)' : 'Standard',
-      standardPrimaryControl
-        ? 'reference (standard measurement)'
-        : variant.facts
-          ? 'measured'
-          : 'pending',
+      variant.facts
+        ? standardPrimaryControl ? 'reference (standard measurement)' : 'measured'
+        : `${variant.status} (no final facts)`,
       variant.facts,
     ],
   ];
@@ -166,7 +237,8 @@ function renderConclusion(
   standardPrimaryControl = false,
 ): string {
   if (!variant.facts) {
-    return `Status: \`pending\`\n\nNo measured conclusion is available while the experiment is ${variant.status}.`;
+    const status = variant.status === 'failed' || variant.investigation?.status === 'failed' ? 'failed' : 'incomplete';
+    return `Status: \`${status}\`\n\nNo final measured facts are available. Experiment lifecycle: \`${variant.status}\`.${variant.investigation ? ` Investigator session: \`${variant.investigation.status}\`. Development trials and passing tests do not establish a final outcome.` : ''}`;
   }
   const statements = [
     'This section is generated from persisted measurements. It does not treat model diagnosis or blind-judge suggestions as verified truth.',
@@ -196,7 +268,7 @@ function renderConclusion(
   if (targetExcluded) {
     statements.push(
       targetExcluded.status === 'completed'
-        ? `The target-excluded promotion guard is ${targetExcluded.gate?.status ?? 'pending'}.`
+        ? `The target-excluded promotion guard is ${targetExcluded.gate?.status ?? 'not evaluated'}.`
         : standardPrimaryControl
           ? `The standard-primary reference and target-excluded comparison is ${targetExcluded.status}; the conclusion is incomplete until it finishes.`
           : `The target-safe control and target-excluded comparison is ${targetExcluded.status}; the conclusion is incomplete until it finishes.`,
@@ -276,6 +348,10 @@ function renderEvidenceLedger(
     ['Frozen campaign inputs', 'observed_durable', path.join(paths.campaigns, campaign.id, 'campaign.json'), 'hash-pinned'],
     ['Current measured facts', 'observed_durable', `${root}/${primary}/facts.json`, variant.facts ? (variant.artifactCollectionComplete ? 'archived' : 'pending archive') : 'unavailable'],
   ];
+  if (variant.investigation) {
+    rows.push(['Investigator session and actions', 'observed_durable', paths.database, variant.investigation.status]);
+    rows.push(['Investigator trial archive', 'mixed_authority', `${root}/investigation/`, 'see per-action status; not final cohort evidence']);
+  }
   if (parent) {
     rows.push([
       'Parent measured facts',
@@ -414,7 +490,7 @@ Excluded decisions: ${decisions(targetExcluded.excludedFacts)}`;
       .join('\n') || 'No target-arm runtime question was recorded.';
   return `Status: \`${targetExcluded.status}\`
 
-Gate: \`${targetExcluded.gate?.status ?? 'pending'}\`
+Gate: \`${targetExcluded.gate?.status ?? (targetExcluded.status === 'failed' ? 'not evaluated' : 'pending')}\`
 
 Baseline mean build rate: ${percentage(targetExcluded.gate?.baselineMeanBuildRate ?? null)}
 
@@ -422,7 +498,7 @@ Candidate mean build rate: ${percentage(targetExcluded.gate?.candidateMeanBuildR
 
 Build-rate drop: ${percentage(targetExcluded.gate?.buildDropRatio ?? null)}
 
-Pair validity: ${targetExcluded.comparisons?.length && targetExcluded.comparisons.every((comparison) => comparison.valid) ? 'valid' : 'invalid or pending'}
+Pair validity: ${targetExcluded.comparisons?.length ? targetExcluded.comparisons.every((comparison) => comparison.valid) ? 'valid' : 'invalid' : targetExcluded.status === 'failed' ? 'unavailable' : 'pending'}
 
 Leakage paths: ${targetExcluded.comparisons?.reduce((total, comparison) => total + comparison.leakagePaths.length, 0) ?? 0}
 
@@ -602,7 +678,7 @@ ${renderObservedIssues(variant, parent)}
 
 ## Planned Change
 
-${parent ? 'The plan below is model-generated and remains unverified.' : 'The baseline plan below is harness-authored.'} It is recorded before execution so the result can be evaluated against the original intervention.
+${variant.investigation ? 'The plan below is the latest investigator preregistration, not an immutable original hypothesis. It remains unverified; per-action revisions are preserved in the investigation archive.' : `${parent ? 'The plan below is model-generated and remains unverified.' : 'The baseline plan below is harness-authored.'} It is recorded before execution so the result can be evaluated against the original intervention.`}
 
 ${quote(variant.hypothesis.rationale)}
 
@@ -613,7 +689,7 @@ Expected impact: ${markdown(variant.hypothesis.expectedImpact)}
 
 Risk: ${markdown(variant.hypothesis.risk)}
 
-## Hypothesis Compliance Preflight
+${campaign.config.investigator?.enabled || variant.investigation ? `## Investigation\n\n${renderInvestigation(campaign, variant)}\n\n` : ''}## Hypothesis Compliance Preflight
 
 ${renderHypothesisCompliance(variant)}
 
@@ -641,7 +717,7 @@ ${renderBaselineMetrics(variant, parent)}
 
 ## Actual Facts
 
-| Decision | Count |
+${campaign.config.investigator?.enabled ? 'Consensus decision counts and agreement describe the final cohort only, not trial scores. Raw-replicate mean accuracy is reported separately.\n\n' : ''}| Decision | Count |
 | --- | ---: |
 ${decisionRows}
 
@@ -659,18 +735,24 @@ ${decisionRows}
 | Cost USD | ${facts?.usage.costUsd.toFixed(4) ?? 'unavailable'} |
 | Model duration ms | ${facts?.usage.durationMs ?? 'unavailable'} |
 
+## Score Basis
+
+${campaign.config.investigator?.enabled
+  ? 'Accuracy and errors use the raw-replicate mean against a shared label reference, not majority-consensus accuracy. Missing labeled units count as errors; a missing accuracy is unknown, not zero. Consensus decisions and agreement remain descriptive observations. Normal scoring uses persisted baseline provisional labels; excluded scoring uses its separate baseline judgment and labels. Human-verified labels retain precedence. Fresh candidate judgments are interpretations, not a replacement baseline reference. Trial label snapshots are hash-bound in investigator context; final score-basis artifacts record the labels used at scoring time.\n\nRuntime answers are not globally frozen. Question audits, decision-set hashes, and cohort-comparison artifacts diagnose context differences; matching input pins alone do not establish strict replay.\n\nPer-benchmark score-basis.json and cohort-comparison.json files remain in the ignored artifact archive; target-excluded scoring keeps its own reference.'
+  : 'Accuracy uses deterministic per-unit consensus with human-verified labels taking precedence over provisional suggestions. Consensus is not independent evidence of correctness.'}
+
 ## Evaluation
 
 | Metric | Value |
 | --- | ---: |
-| Human-verified labels | ${score?.verified.labeled ?? 0} |
-| Verified errors | ${score?.verified.errors ?? 0} |
+| Human-verified labels | ${score?.verified.labeled ?? 'unavailable'} |
+| Verified errors | ${score?.verified.errors ?? 'unavailable'} |
 | Verified accuracy | ${percentage(score?.verified.accuracy ?? null)} |
-| Provisional labels | ${score?.provisional.labeled ?? 0} |
-| Provisional errors | ${score?.provisional.errors ?? 0} |
+| Provisional labels | ${score?.provisional.labeled ?? 'unavailable'} |
+| Provisional errors | ${score?.provisional.errors ?? 'unavailable'} |
 | Provisional accuracy | ${percentage(score?.provisional.accuracy ?? null)} |
 | Persisted labels | ${labels.length} |
-| Cohort pin mismatches | ${score?.cohortMismatches.join(', ') || 'none'} |
+| Cohort pin mismatches | ${score ? score.cohortMismatches.join(', ') || 'none' : 'unavailable'} |
 
 ## Experiment Arms
 
@@ -849,14 +931,27 @@ ${campaign.config.goal.trim()}
 | Compliance-exhausted hypotheses | ${exhausted} |
 | Executed generated variants | ${executed} |
 
-## Target-Excluded Evaluations
+${campaign.config.investigator?.enabled || variants.some(({ investigation }) => investigation) ? `## Investigator Sessions
+
+Investigator budgets and primary development attempts are separate from final planner cohorts. Session finalization is not promotion; reasons and hypotheses remain unverified.
+
+| Variant | Session | Status | Turns | Primary attempts | Agent tokens |
+| --- | --- | --- | ---: | ---: | ---: |
+${variants.filter(({ investigation }) => investigation).map((variant) => {
+  const session = variant.investigation!;
+  return `| ${markdown(variant.id)} | ${markdown(session.sessionId ?? 'not assigned')} | ${session.status} | ${session.turnCount} | ${session.actions.filter(({ kind }) => kind === 'evaluate_primary').length} | ${session.agentTokens ?? 'unknown'} |`;
+}).join('\n') || '| - | - | No sessions recorded | - | - | - |'}
+
+Score basis: raw-replicate mean; consensus decisions remain separate. Runtime answers are not globally frozen. See each experiment report for budgets, action outcomes, and artifact locators.
+
+` : ''}## Target-Excluded Evaluations
 
 ${
   targetEvaluations.length
     ? targetEvaluations
         .map(
           (evaluation) =>
-            `- ${evaluation.variantId}: ${evaluation.status}; gate=${evaluation.gate?.status ?? 'pending'}; build drop=${percentage(evaluation.gate?.buildDropRatio ?? null)}`,
+            `- ${evaluation.variantId}: ${evaluation.status}; gate=${evaluation.gate?.status ?? (evaluation.status === 'failed' ? 'not evaluated' : 'pending')}; build drop=${percentage(evaluation.gate?.buildDropRatio ?? null)}`,
         )
         .join('\n')
     : 'No target-excluded evaluation has run.'
