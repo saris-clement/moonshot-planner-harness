@@ -50,6 +50,9 @@ const MESSAGES: Record<string, string> = {
   cancelled: 'The planner run was cancelled.',
   superseded: 'The planner run was superseded.',
   InvalidRequest: 'The planner rejected an invalid HTTP request.',
+  source_answer_no_output: 'The PM/source-answer agent returned no final JSON answer.',
+  source_answer_invalid_output: 'The PM/source-answer agent returned invalid final JSON output.',
+  source_answer_execution_failed: 'The PM/source-answer agent could not complete its scoped source inspection.',
 };
 const UNAVAILABLE = 'Execution failed; diagnostic details are unavailable.';
 const TERMINAL_FAILURE = new Set(['failed', 'cancelled', 'superseded']);

@@ -115,6 +115,9 @@ export interface PlannerQuestionRecord {
   ownerRole?: string;
   priority?: string;
   coverageIds?: string[];
+  requirementRefs?: Array<{ entity: string; anchor: string }>;
+  /** Harness-only product scope; never replaces the planner's expected-context pins. */
+  sourceContext?: { workflow?: string };
   answer?: Record<string, unknown>;
   createdAt?: string;
   updatedAt?: string;

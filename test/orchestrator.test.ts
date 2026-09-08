@@ -19,6 +19,7 @@ import {
 } from '../src/orchestrator.js';
 import { variantArtifactDirectory, type HarnessPaths } from '../src/paths.js';
 import { resolveCampaignConfig } from '../src/config.js';
+import { runtimeQuestionCacheKey } from '../src/runtimeAnswerLedger.js';
 import { runCommand } from '../src/process.js';
 import { PlannerClient, type PlannerQuestionRecord } from '../src/plannerClient.js';
 import { canonicalHash, computeTargetExcludedGate } from '../src/metrics.js';
@@ -3978,18 +3979,7 @@ test('paired semantic runtime questions share one scoped human fallback answer',
         { id: 'excluded-write', label: 'Shared boundary', description: 'Reviewed write boundary' },
       ],
     };
-    const cacheKey = JSON.stringify({
-      responseKind: normalQuestion.responseKind,
-      prompt: normalQuestion.prompt,
-      type: normalQuestion.type,
-      ownerRole: normalQuestion.ownerRole,
-      coverageIds: normalQuestion.coverageIds,
-      options: normalQuestion.options?.map(({ label, description, consequences }) => ({
-        label,
-        description: description ?? null,
-        consequences: consequences ?? null,
-      })),
-    });
+    const cacheKey = runtimeQuestionCacheKey(normalQuestion);
     const legacyCacheKey = JSON.stringify({
       responseKind: normalQuestion.responseKind,
       prompt: normalQuestion.prompt,

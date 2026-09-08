@@ -71,6 +71,7 @@ export async function runInvestigatorLoop(
       response = await dependencies.turn(previous, feedback, (id) => { state.sessionId = id; save(); });
       dependencies.assertActive?.();
       state.sessionId = response.sessionId;
+      state.latestHypothesis = response.action.hypothesis;
       state.agentTokens = state.agentTokens !== null && response.usage.tokens !== null ? state.agentTokens + response.usage.tokens : null;
       state.agentCostUsd = state.agentCostUsd !== null && response.usage.costUsd !== null ? state.agentCostUsd + response.usage.costUsd : null;
     } catch (error) {

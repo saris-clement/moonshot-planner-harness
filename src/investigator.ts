@@ -46,6 +46,7 @@ export interface InvestigationState {
   agentCostUsd: number | null;
   reason: string | null;
   actions: InvestigationActionRecord[];
+  latestHypothesis?: Hypothesis;
   harnessPins?: Record<string, unknown>;
 }
 

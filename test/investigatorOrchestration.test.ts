@@ -125,6 +125,30 @@ if (args[0] === 'image' && args[1] === 'inspect') console.log('sha256:' + 'a'.re
     .map((line) => JSON.parse(line) as string[]);
 }
 
+test('post-turn budget stops archive the latest unexecuted mutation and hypothesis', async (t) => {
+  const f = await fixture();
+  try {
+    f.campaign.config.investigator!.maxAgentTokens = 5;
+    const revised = { ...hypothesis, title: 'Revised but not tested' };
+    t.mock.method(AgentRunner.prototype, 'investigate', async () => {
+      await writeFile(path.join(f.worktree, 'server/src/evidence.ts'), "export const evidence = 'revised';\n");
+      return { sessionId: f.state.sessionId!, usage: { tokens: 6, costUsd: 0 },
+        action: { action: 'test' as const, rationale: 'Test revised code', hypothesis: revised } };
+    });
+    const result = await f.internal.runInvestigatorCandidate(f.campaign, f.database.getVariant(f.variant.id), f.worktree, f.artifacts, f.baseline);
+    assert.equal(result.investigation?.status, 'budget_exhausted');
+    assert.equal(result.investigation?.actions.length, 0);
+    assert.equal(result.hypothesis.title, revised.title);
+    assert.notEqual(result.patchHash, f.patchHash);
+    assert.match(await readFile(result.patchPath!, 'utf8'), /'revised'/);
+    const receipt = JSON.parse(await readFile(path.join(path.dirname(result.patchPath!), 'receipt.json'), 'utf8'));
+    assert.equal(receipt.kind, 'investigator_terminal_snapshot');
+    assert.equal(receipt.patchHash, result.patchHash);
+    assert.equal(result.facts, null);
+    assert.equal(result.artifactCollectionComplete, false);
+  } finally { await f.close(); }
+});
+
 test('primary retries use action-specific stacks even when collection preserves the previous volumes', async (t) => {
   const f = await fixture();
   try {

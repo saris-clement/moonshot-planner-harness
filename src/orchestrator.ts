@@ -141,6 +141,16 @@ export function matchQuestionConsultations(
   });
 }
 
+export function withRuntimeSourceContext(question: PlannerQuestionRecord, consultations: readonly unknown[]): PlannerQuestionRecord {
+  const workflows = new Set(matchQuestionConsultations(consultations, question).flatMap((consultation) => {
+    const intent = isRecord(consultation.intent) ? consultation.intent : {};
+    const request = isRecord(intent.request) ? intent.request : {};
+    return typeof request.workflow === 'string' && request.workflow.length > 0 && request.workflow.length <= 512
+      ? [request.workflow] : [];
+  }));
+  return { ...question, sourceContext: workflows.size === 1 ? { workflow: [...workflows][0]! } : {} };
+}
+
 export function selectedOptionIdForAnswer(
   question: PlannerQuestionRecord,
   answer: string,
@@ -2696,11 +2706,44 @@ export class CampaignOrchestrator {
         }
       },
     });
+    if (completed.status !== 'finalized') {
+      assertActive();
+      try {
+        const current = this.database.getVariant(initialVariant.id);
+        const hypothesis = completed.latestHypothesis ?? current.hypothesis;
+        const snapshot = await this.archiveInvestigatorTerminal(campaign, { ...current, hypothesis }, worktree, artifactDirectory, mutationBaselineTree, completed);
+        this.database.updateVariant(initialVariant.id, { ...snapshot, hypothesis });
+      } catch (error) {
+        completed.status = 'failed';
+        completed.reason = `${completed.reason ?? 'Investigation stopped.'} Terminal patch archival failed: ${errorMessage(error)}`;
+      }
+    }
     return this.database.updateVariant(initialVariant.id, {
       investigation: completed,
-      status: completed.status === 'finalized' ? 'gating' : completed.status === 'stopped' ? 'mutating' : 'rejected',
+      status: completed.status === 'finalized' ? 'gating' : completed.status === 'stopped' ? 'mutating' : completed.status === 'failed' ? 'failed' : 'rejected',
       error: completed.reason,
     });
+  }
+
+  private async archiveInvestigatorTerminal(
+    campaign: CampaignRecord, variant: VariantRecord, worktree: string, artifactDirectory: string,
+    mutationBaselineTree: string, state: InvestigationState,
+  ): Promise<{ patchPath: string; patchHash: string }> {
+    const directory = path.join(artifactDirectory, 'investigation', `terminal-${state.turnCount}-${randomUUID()}`);
+    await mkdir(directory, { recursive: true });
+    const mutation = await captureMutationDiff(campaign, variant, worktree, directory, mutationBaselineTree);
+    const candidate = await captureAndGateDiff(campaign, variant, worktree, directory);
+    const patchHash = await sha256File(candidate.patchPath);
+    await writeFile(path.join(directory, 'receipt.json'), `${JSON.stringify({
+      kind: 'investigator_terminal_snapshot', capturedAt: new Date().toISOString(),
+      variantId: variant.id, sessionId: state.sessionId, turnCount: state.turnCount, status: state.status,
+      hypothesis: variant.hypothesis, patchHash, mutationHash: await sha256File(mutation.patchPath),
+      interpretation: 'Terminal preservation only. This snapshot does not establish test or evaluation results; consult hash-bound action receipts.',
+    }, null, 2)}\n`, { flag: 'wx' });
+    this.database.addEvent(campaign.id, variant.id, 'investigator.terminal_archived', {
+      patchHash, artifactDirectory: path.relative(artifactDirectory, directory), status: state.status,
+    });
+    return { patchPath: candidate.patchPath, patchHash };
   }
 
   private async runVariant(
@@ -4106,17 +4149,18 @@ export class CampaignOrchestrator {
         `${variant.id}-${benchmark.name}${options.scope ? `-${options.scope}` : ''}-r${replicate}`,
         campaign.config.limits.phase2TimeoutMs,
         benchmark.sha256,
-        async ({ question, consultations }) =>
-          await answerWithRuntimeLedger({
+        async ({ question, consultations }) => {
+          const sourceQuestion = withRuntimeSourceContext(question, consultations);
+          return await answerWithRuntimeLedger({
             campaign, benchmark, database: this.database,
             campaignDirectory: campaignDirectory(this.paths, campaign.id),
             artifactDirectory: directory, variantId: variant.id, executionBenchmark, replicate,
-            question, requirementsAgentRequests: matchQuestionConsultations(consultations, question).length,
+            question: sourceQuestion, requirementsAgentRequests: matchQuestionConsultations(consultations, question).length,
             targetWorkflow: options.answerSourceTargetWorkflow,
             selectOption: selectedOptionIdForAnswer,
             resolve: () => this.answerRuntimeQuestion(
               campaign,
-              question,
+              sourceQuestion,
               consultations,
               workflowsSource,
               path.join(directory, 'questions'),
@@ -4131,7 +4175,8 @@ export class CampaignOrchestrator {
                   }
                 : undefined,
             ),
-          }),
+          });
+        },
         async (snapshot) => {
           const updatedAtMs = Date.now();
           latestSnapshot = {
@@ -4468,6 +4513,12 @@ export class CampaignOrchestrator {
       {
         id: question.id,
         question: question.prompt,
+        rationale: question.rationale,
+        coverageIds: question.coverageIds,
+        requirementRefs: question.requirementRefs,
+        entity: question.requirementRefs?.[0]?.entity,
+        anchor: question.requirementRefs?.[0]?.anchor,
+        context: question.sourceContext ?? {},
         type: question.responseKind,
         options: (question.options ?? []).map((option) => ({
           id: option.id,
