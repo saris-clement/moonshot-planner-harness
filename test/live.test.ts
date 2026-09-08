@@ -109,8 +109,8 @@ test('live runner sequences one coordinator, preserves inputs, and reports incom
       }
       assert.deepEqual(config, {
         ...source, id: 'new-campaign', mode: 'automatic',
-        investigator: { enabled: true, maxTurns: 12, maxPrimaryEvaluations: 3, maxWallTimeMs: 7_200_000, maxAgentTokens: 2_000_000 },
-        evaluation: { ...source.evaluation, replicateConcurrency: 1 },
+        investigator: { enabled: true, primaryReplicates: 2, maxTurns: 12, maxPrimaryEvaluations: 3, maxWallTimeMs: 14_400_000, maxAgentTokens: 2_000_000 },
+        evaluation: { ...source.evaluation, replicateConcurrency: 2 },
         limits: { ...source.limits, concurrency: 1, maxVariants: 1 },
       });
       const phases = (await readFile(path.join(root, 'live-phases.jsonl'), 'utf8')).trim().split('\n').map((line) => JSON.parse(line));

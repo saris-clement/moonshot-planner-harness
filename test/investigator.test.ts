@@ -169,7 +169,7 @@ test('investigator runner resumes the explicit session, attaches feedback, and s
       assert.match(prompt, /"maxPrimaryEvaluations": 3/);
       assert.match(prompt, /Unknown usage is not zero/);
       assert.doesNotMatch(prompt, /holdout.*secret|cannot see.*holdout/i);
-      assert.ok((options?.timeoutMs ?? Infinity) <= 7_200_000);
+      assert.ok((options?.timeoutMs ?? Infinity) <= campaign.config.investigator!.maxWallTimeMs);
       const stdout = `${text(action)}\n${finish()}`;
       if (calls.length === 1) {
         options?.onStdout?.(Buffer.from(`${event('tool_use', { text: 'x'.repeat(5 * 1024 * 1024) })}\n`));

@@ -704,7 +704,7 @@ async function seedInvestigatorCampaign(): Promise<void> {
       { name: 'primary-pack', role: 'primary', zipPath: primaryZip },
       { name: 'holdout-pack', role: 'holdout', zipPath: holdoutZip },
     ],
-    investigator: { enabled: true },
+    investigator: { enabled: true, primaryReplicates: 1 },
     evaluation: { replicates: 2, replicateConcurrency: 2 },
   });
   const hypothesis = {
@@ -1250,9 +1250,11 @@ test('isolates duplicate question IDs by benchmark and replicate and serves arti
   await expect(conclusionLink).toHaveAttribute('aria-current', 'location');
   await expect(page.getByRole('link', { name: 'Open raw Markdown' })).toBeVisible();
   await markdownViewer.focus();
-  await markdownViewer.evaluate((element) => {
+  await markdownViewer.evaluate((element) => new Promise<void>((resolve) => {
+    if (element.scrollTop === 120) return resolve();
+    element.addEventListener('scroll', () => resolve(), { once: true });
     element.scrollTo({ top: 120, behavior: 'instant' });
-  });
+  }));
   const humanNotesDirectory = path.join(paths.reports, campaignId, 'human');
   await mkdir(humanNotesDirectory, { recursive: true });
   await writeFile(
@@ -1294,8 +1296,14 @@ test('isolates duplicate question IDs by benchmark and replicate and serves arti
   expect(report.headers()['content-type']).toBe('text/markdown; charset=utf-8');
   expect(await report.text()).toContain('## Actual Facts');
 
-  await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${reviewId}`);
-  await expect(page.getByRole('button', { name: 'Promote experiment' })).toHaveCount(0);
+  const review = database.getVariant(reviewId);
+  database.updateVariant(reviewId, { artifactCollectionComplete: false });
+  try {
+    await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${reviewId}`);
+    await expect(page.getByRole('button', { name: 'Promote experiment' })).toHaveCount(0);
+  } finally {
+    database.updateVariant(reviewId, { artifactCollectionComplete: review.artifactCollectionComplete });
+  }
 });
 
 test('retains a central dirty review draft across SSE and guards navigation before save', async ({ page }) => {
@@ -1863,8 +1871,8 @@ test('provides a mobile drawer, defaults lineage to list, and preserves campaign
   const creationRequest = await creationRequestPromise;
   expect(creationRequest.postDataJSON()).toMatchObject({
     mode: 'supervised',
-    investigator: { enabled: true, primaryReplicates: 1, maxTurns: 12, maxPrimaryEvaluations: 3, maxWallTimeMs: 7_200_000, maxAgentTokens: 2_000_000 },
-    evaluation: { replicates: 2 },
+    investigator: { enabled: true, primaryReplicates: 2, maxTurns: 12, maxPrimaryEvaluations: 3, maxWallTimeMs: 14_400_000, maxAgentTokens: 2_000_000 },
+    evaluation: { replicates: 2, replicateConcurrency: 2 },
     targetExcluded: {
       protocol: 'standard-primary-v2',
       targetImplementationWorkflow: 'trumark/deceased-accounts',
@@ -1907,7 +1915,8 @@ for (const enabled of [true, false]) {
     await page.getByLabel('Holdout requirements ZIP').setInputFiles(holdoutZip);
     await page.getByText('Advanced investigator budgets', { exact: true }).click();
     const screening = page.getByLabel('Primary screening replicates');
-    await expect(screening).toHaveValue('1');
+    await expect(screening).toHaveValue('2');
+    await expect(page.getByLabel('Investigator wall time (minutes)')).toHaveValue('240');
     await expect(screening).toHaveAttribute('min', '1');
     await expect(screening).toHaveAttribute('max', '3');
     await screening.fill('2');

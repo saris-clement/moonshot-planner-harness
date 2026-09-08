@@ -9,10 +9,11 @@ Ordinary `npm test` / `npm run check` only run the mocked runner tests, not live
 The runner reads the source JSON internally, requires its V2 target declaration,
 two replicates, and `agent.autoApprove: false`, and preserves the source pins,
 environment, packs, research, model, and other limits. It enables automatic
-investigation with 12 turns, 3 primary evaluations, 7,200,000 ms (2 hours), and
-2,000,000 reported agent tokens. It limits candidates and candidate concurrency
-to 1 and standard replicate concurrency to 1. V2's internal target-arm concurrency
-remains controlled by the existing protocol, not by this script.
+investigation with 12 turns, 3 primary evaluations of 2 parallel replicas,
+14,400,000 ms (4 hours), and 2,000,000 reported agent tokens. It limits candidates
+and candidate concurrency to 1 and sets standard replicate concurrency to 2.
+V2 baseline/final validation retains six concurrent cases per candidate:
+two primary, two holdout, and two target-excluded cases.
 
 The time/token limits apply to investigation, not the entire E2E or all model
 calls. Baseline, final evaluation, judging, and V2 calibration add time and cost;

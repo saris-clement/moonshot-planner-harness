@@ -28,10 +28,10 @@
   "mode": "supervised",
   "investigator": {
     "enabled": true,
-    "primaryReplicates": 1,
+    "primaryReplicates": 2,
     "maxTurns": 12,
     "maxPrimaryEvaluations": 3,
-    "maxWallTimeMs": 7200000,
+    "maxWallTimeMs": 14400000,
     "maxAgentTokens": 2000000
   },
   "evaluation": {

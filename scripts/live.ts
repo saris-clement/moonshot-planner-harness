@@ -60,10 +60,10 @@ export async function runLive(args: string[], cwd = process.cwd()): Promise<numb
     const config = CampaignConfigSchema.parse({
       ...source, id: id.data, mode: 'automatic',
       investigator: {
-        enabled: true, maxTurns: 12, maxPrimaryEvaluations: 3,
-        maxWallTimeMs: 7_200_000, maxAgentTokens: 2_000_000,
+        enabled: true, primaryReplicates: 2, maxTurns: 12, maxPrimaryEvaluations: 3,
+        maxWallTimeMs: 14_400_000, maxAgentTokens: 2_000_000,
       },
-      evaluation: { ...source.evaluation, replicates: 2, replicateConcurrency: 1 },
+      evaluation: { ...source.evaluation, replicates: 2, replicateConcurrency: 2 },
       limits: { ...source.limits, concurrency: 1, maxVariants: 1 },
     });
     const configPath = path.join(root, 'live-config.json');

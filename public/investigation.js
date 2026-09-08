@@ -5,10 +5,10 @@ import { routeLink, sectionHeading } from './ui.js';
 import { experimentHelpButton } from './experimentHelp.js';
 
 export const investigatorDefaults = {
-  primaryReplicates: 1,
+  primaryReplicates: 2,
   maxTurns: 12,
   maxPrimaryEvaluations: 3,
-  maxWallTimeMs: 7_200_000,
+  maxWallTimeMs: 14_400_000,
   maxAgentTokens: 2_000_000,
 };
 

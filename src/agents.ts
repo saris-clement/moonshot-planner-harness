@@ -385,7 +385,7 @@ Return JSON only:
     onSession?: (sessionId: string) => void,
   ): Promise<InvestigatorTurnResult> {
     const remainingMs =
-      (this.campaign.config.investigator?.maxWallTimeMs ?? 7_200_000) -
+      (this.campaign.config.investigator?.maxWallTimeMs ?? 14_400_000) -
       Math.max(0, Date.now() - Date.parse(state.startedAt));
     if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
       throw new Error('investigator wall-time budget exhausted or invalid start time');

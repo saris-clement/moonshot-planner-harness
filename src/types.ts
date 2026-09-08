@@ -91,7 +91,7 @@ export const CampaignConfigSchema = z
         primaryReplicates: z.number().int().min(1).max(3).optional(),
         maxTurns: z.number().int().positive().default(12),
         maxPrimaryEvaluations: z.number().int().positive().default(3),
-        maxWallTimeMs: z.number().int().positive().max(2_147_483_647).default(7_200_000),
+        maxWallTimeMs: z.number().int().positive().max(2_147_483_647).default(14_400_000),
         maxAgentTokens: z.number().int().positive().default(2_000_000),
       })
       .strict()

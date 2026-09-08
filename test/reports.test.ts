@@ -62,7 +62,7 @@ test('investigator reports distinguish session states, trial evidence, budgets, 
     const config = CampaignConfigSchema.parse({
       id: 'report-investigator', goal: 'Separate agent development trials from final measured outcomes.',
       plannerRepo: root, workflowsRepo: root, environmentFile: path.join(root, 'environment.env'),
-      seedRevision: 'seed', workflowsRevision: 'workflows', investigator: { enabled: true },
+      seedRevision: 'seed', workflowsRevision: 'workflows', investigator: { enabled: true, maxWallTimeMs: 7_200_000 },
       benchmarks: [
         { name: 'primary', role: 'primary', zipPath: path.join(root, 'primary.zip') },
         { name: 'holdout', role: 'holdout', zipPath: path.join(root, 'holdout.zip') },

@@ -762,6 +762,20 @@ test('campaign initialization freezes environment and pack bytes', async () => {
     const campaign = await new CampaignOrchestrator(paths, database).initialize(configPath);
     assert.match(campaign.environmentSha, /^sha256:[a-f0-9]{64}$/);
     assert.equal(campaign.workflowsRemoteUrl, 'https://github.com/Saris-AI/workflows.git');
+    const defaults = await resolveCampaignConfig({ ...campaign.config, investigator: { enabled: true } });
+    assert.equal(defaults.config.investigator?.primaryReplicates, 2);
+    assert.equal(defaults.config.investigator?.maxWallTimeMs, 14_400_000);
+    assert.equal(defaults.config.evaluation.replicateConcurrency, 2);
+    const custom = await resolveCampaignConfig({ ...campaign.config, investigator: {
+      enabled: true, primaryReplicates: 1, maxWallTimeMs: 3_600_000,
+    } });
+    assert.equal(custom.config.investigator?.primaryReplicates, 1);
+    assert.equal(custom.config.investigator?.maxWallTimeMs, 3_600_000);
+    const historical = database.createCampaign({ ...defaults.config, id: 'historical-limits', investigator: {
+      ...defaults.config.investigator!, primaryReplicates: undefined, maxWallTimeMs: 7_200_000,
+    } }, seedSha, workflowsSha, campaign.environmentSha, campaign.workflowsRemoteUrl);
+    assert.equal(database.getCampaign(historical.id).config.investigator?.primaryReplicates, undefined);
+    assert.equal(database.getCampaign(historical.id).config.investigator?.maxWallTimeMs, 7_200_000);
     assert.equal(campaign.config.environmentFile, path.join(data, 'campaigns/freeze-test/environment.env'));
     assert.match(
       await readFile(campaign.config.environmentFile, 'utf8'),

@@ -45,7 +45,7 @@ Patch crossover is intentionally excluded: combining independent source-policy c
 
 An investigator owns revisable hypotheses, not the harness's execution policy. The coordinator records each request before execution, enforces exact-patch test prerequisites for primary trials, and archives action-specific requests, pins, patches, receipts/failures, logs, and planner artifacts under `investigation/action-NNN/`. Finalization requires an unchanged evaluated patch and matching preregistration, full configured tests, and semantic review before the final primary/holdout/configured excluded cohorts. Test success and session finalization are not correctness or promotion decisions.
 
-Screening evaluates the entire primary pack with `investigator.primaryReplicates` (integer 1..3, default 1 for future trials). Baseline and final cohorts retain `evaluation.replicates` (2 in V2); screening is not a substitute for those final cohorts. Provisional reference labels are sufficient to screen and finalize. Human-reviewed labels are not an admission prerequisite, and the semantic review is a model judgment, not a human gate. One screening replicate provides no agreement/stability measurement.
+Screening evaluates the entire primary pack with `investigator.primaryReplicates` (integer 1..3, default 2 for new campaigns). New-campaign initialization freezes that value; archived configurations that omitted it retain their historical fallback. Baseline and final cohorts retain `evaluation.replicates` (2 in V2); screening is not a substitute for those final cohorts. Provisional reference labels are sufficient to screen and finalize. Human-reviewed labels are not an admission prerequisite, and the semantic review is a model judgment, not a human gate. An explicit one-replicate override provides no agreement/stability measurement.
 
 Per-session budgets bound turns, primary evaluation attempts, wall time, and agent tokens independently of planner telemetry. SQLite stores session identity, action status, unknown usage, reasons, and harness/context pins. Stop/resume retains this history; interrupted actions are identified rather than replayed.
 
@@ -134,7 +134,7 @@ Variant creation writes the initial report before mutation or evaluation starts.
 
 The Overview investigator section and Investigation detail tab keep agent budgets separate from planner usage. The timeline renders known result fields compactly, leaves unknown results uninterpreted, and loads artifact paths/raw details only on expansion. `investigator.updated` and running-session polling refresh the view while preserving scoped disclosure, scroll, and focus state. Session chat is not a dashboard surface.
 
-Screening matrices use the latest primary action's completed replicate facts first, then its current execution snapshot count, then screening configuration. Action timestamps separate successive trials and prevent stale screening snapshots from appearing as completed final runs. Final matrices keep the complete baseline/final configured slots. The new one-replicate default does not rewrite archived measurements: legacy trials with two recorded runs remain two-run trials even without the new config field.
+Screening matrices use the latest primary action's completed replicate facts first, then its current execution snapshot count, then screening configuration. Action timestamps separate successive trials and prevent stale screening snapshots from appearing as completed final runs. Final matrices keep the complete baseline/final configured slots. Changed defaults do not rewrite archived measurements: legacy trials retain their recorded repetition counts even without the screening config field.
 
 Replicate matrices are configured-slot projections, not lists of observed runs. For each benchmark and replicate number, the view left-joins execution state and final `replicateFacts`/`holdoutReplicateFacts`. Final facts take precedence for planner usage, live execution usage fills the current slot, and aggregate consensus usage is never added again. This keeps primary and holdout planner totals once-per-execution and excludes all harness-agent usage.
 
@@ -160,6 +160,10 @@ retry reruns only excluded work. Diagnosis and strategist history include the bi
 not as an independent observation.
 
 ## Change History
+
+### 2026-09-08 - Four-Hour Investigation With Parallel Screening
+
+New campaigns now freeze two screening replicas and a four-hour investigation budget. The live runner executes screening replicas in parallel; baseline and final V2 validation retain six parallel cases per candidate. The budget permits multiple sequential revision cycles, not four hours of overhead on a single planner run. Explicit overrides and archived campaign limits remain unchanged.
 
 ### 2026-09-08 - Lightweight Full-Primary Screening
 

@@ -53,7 +53,7 @@ test('campaign defaults reserve twelve hours of aggregate Phase 2 model duration
   assert.equal(config.investigator, undefined);
   assert.deepEqual(CampaignConfigSchema.parse({ ...config, investigator: { enabled: true } }).investigator, {
     enabled: true, maxTurns: 12, maxPrimaryEvaluations: 3,
-    maxWallTimeMs: 7_200_000, maxAgentTokens: 2_000_000,
+    maxWallTimeMs: 14_400_000, maxAgentTokens: 2_000_000,
   });
   assert.equal(CampaignConfigSchema.parse({ ...config, investigator: { enabled: false } }).investigator?.enabled, false);
   assert.equal(CampaignConfigSchema.parse({ ...config, investigator: { enabled: true, primaryReplicates: 1 } }).investigator?.primaryReplicates, 1);
