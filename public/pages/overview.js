@@ -1,5 +1,5 @@
 import { element } from '../dom.js';
-import { ACTIVE_STATUSES, primaryScreening } from '../models.js';
+import { ACTIVE_STATUSES, executionHealth, primaryScreening } from '../models.js';
 import { investigationStatus } from '../investigation.js';
 import {
   campaignActions,
@@ -14,7 +14,7 @@ import {
 export function overviewPage(context) {
   const campaign = context.state.campaign;
   const variants = campaign.variants ?? [];
-  const active = variants.filter((variant) => ACTIVE_STATUSES.has(variant.status));
+  const active = variants.filter((variant) => ACTIVE_STATUSES.has(variant.status) || executionHealth(campaign, variant).status === 'blocked');
   const investigations = variants.filter((variant) => variant.investigation);
   const investigator = element('section', { className: 'section investigator-overview' }, [
     sectionHeading('Agent research', 'Autonomous investigator', 'Session budgets cover investigator work, not planner usage. Test passes are not correctness judgments.'),

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -119,14 +119,14 @@ test('event parser uses reported token totals and preserves unknown or partial u
 
 test('investigator runner resumes the explicit session, attaches feedback, and streams beyond capture', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'planner-investigator-'));
-  const worktree = path.join(root, 'worktree');
-  const artifacts = path.join(root, '.data');
-  await mkdir(worktree);
-  await mkdir(artifacts);
-  const workflowsSource = path.join(root, 'frozen-workflows');
+  const worktree = path.join(root, '.data', 'worktrees', 'investigation', 'investigation-v001');
+  const artifacts = path.join(root, '.data', 'artifacts', 'investigation', 'investigation-v001');
+  await mkdir(worktree, { recursive: true });
+  await mkdir(artifacts, { recursive: true });
+  const workflowsSource = path.join(path.dirname(worktree), 'frozen-workflows');
   await mkdir(workflowsSource);
-  const contextPath = path.join(artifacts, 'context.json');
-  await writeFile(contextPath, JSON.stringify({ primaryRawArtifactIndex: ['primary/raw/analysis.json'],
+  const contextPath = path.join(artifacts, 'investigator-context.json');
+  await writeFile(contextPath, JSON.stringify({ goal: 'Investigate failures without promising improvements.', primaryRawArtifactIndex: ['primary/raw/analysis.json'],
     artifacts: { current: artifacts, workflowsSource, priorExperiments: [] } }));
   const database = new HarnessDatabase(':memory:');
   try {
@@ -151,8 +151,20 @@ test('investigator runner resumes the explicit session, attaches feedback, and s
       calls.push([...args]);
       const attachments = args.flatMap((arg, index) => arg === '--file' ? [args[index + 1]!] : []);
       const contents = await Promise.all(attachments.map((file) => readFile(file, 'utf8')));
-      assert.ok(contents.some((content) => content.includes('primary/raw/analysis.json')));
-      assert.ok(contents.some((content) => content.includes('Boundary regression failed.')));
+      assert.equal(attachments.length, 1, 'only the compact briefing is attached');
+      const briefing = JSON.parse(contents[0]!);
+      assert.match(briefing.referenceHandles.context, /^evidence_[a-f0-9]{64}$/);
+      assert.equal(briefing.referenceHandles.currentHypothesis, briefing.referenceHandles.context);
+      assert.deepEqual(briefing.currentHypothesis, hypothesis);
+      assert.equal(briefing.failureSummary, 'Boundary regression failed.');
+      assert.equal(briefing.byteLength, Buffer.byteLength(contents[0]!));
+      assert.ok(briefing.byteLength <= (calls.length === 1 ? 16_384 : 8_192));
+      assert.doesNotMatch(contents[0]!, /primary\/raw\/analysis\.json|replicateFacts/);
+      assert.equal(briefing.state, undefined);
+      assert.equal(briefing.feedback, undefined);
+      const mcp = JSON.parse(options!.env!.OPENCODE_CONFIG_CONTENT!).mcp.harness_evidence;
+      const manifest = JSON.parse(await readFile(mcp.command[mcp.command.indexOf('--manifest') + 1], 'utf8'));
+      assert.equal(manifest.scope.parentArtifactDirectory, await realpath(artifacts), 'a parentless variant uses its own scoped archive');
       const prompt = args.find((arg) => arg.includes('Campaign goal:'))!;
       assert.match(prompt, /challenge.*diagnosis/i);
       assert.match(prompt, /revise.*hypothesis/i);
@@ -191,6 +203,7 @@ test('investigator runner resumes the explicit session, attaches feedback, and s
     assert.equal(calls[1]![calls[1]!.indexOf('--session') + 1], first.sessionId);
     assert.equal(calls[1]!.includes('--continue'), false);
     assert.deepEqual(await readdir(worktree), []);
+    assert.match(await readFile(contextPath, 'utf8'), /primary\/raw\/analysis\.json/, 'full original context remains archived, not attached');
     assert.equal(current.turnCount, 1, 'the coordinator owns state transitions');
     assert.deepEqual(JSON.parse(await readFile(path.join(artifacts, 'investigator-turn-001-result.json'), 'utf8')), first);
     await assert.rejects(runner.investigate(variant, worktree, artifacts, contextPath,

@@ -5,6 +5,8 @@ import { primaryScreening } from './models.js';
 import { routeLink, sectionHeading } from './ui.js';
 import { experimentHelpButton } from './experimentHelp.js';
 import { helpButton } from './help.js';
+import { evidenceExplorer } from './evidence.js';
+import { sanitizeDiagnosticValue } from './diagnostics.js';
 
 export const investigatorDefaults = {
   primaryReplicates: 2,
@@ -102,7 +104,7 @@ function evaluationResult(result, campaign) {
   ];
   return element('div', { className: 'investigation-evaluation' }, [
     element('p', { text: mean ? 'Score basis: replicate mean. Consensus decisions are separate.' : 'Score basis: consensus decisions.' }),
-    element('p', { className: 'muted', text: 'Recorded scores, not a promotion decision. Unknown values are not zero.' }),
+    element('p', { className: 'muted', text: 'Recorded scores against the frozen comparison reference, not a promotion decision. Unknown values are not zero.' }),
     element('div', { className: 'table-scroll' }, [
       element('table', {}, [
         element('caption', { text: 'Primary trial score comparison' }),
@@ -134,6 +136,20 @@ export function investigationPanel(campaign, variant) {
     investigationStatus(campaign, variant),
   ]);
   if (!investigation) return panel;
+  const latestTrial = investigation.actions?.findLast((action) => action.kind === 'evaluate_primary' && action.status === 'completed');
+  panel.append(element('section', { className: 'investigation-comparison' }, [
+    element('h3', { text: 'Latest recorded primary comparison' }),
+    latestTrial ? element('p', { className: 'identifier', text: `${latestTrial.id} / ${latestTrial.hypothesis?.title ?? 'Recorded hypothesis'}` }) : null,
+    latestTrial ? element('div', {}, [
+      element('p', { className: 'muted', text: 'Recorded action summary, not the latest unevaluated revision or a promotion decision. Open its timeline entry for score basis and comparison notes.' }),
+      element('dl', { className: 'investigation-metrics' }, [
+        ['Verified accuracy', 'verified'], ['Provisional accuracy (LLM suggestion)', 'provisional'],
+      ].map(([label, dimension]) => element('div', {}, [
+        element('dt', { text: label }), element('dd', { text: `Trial ${knownNumber(latestTrial.result?.score?.[dimension]?.accuracy, formatPercent)} / Frozen reference ${knownNumber(latestTrial.result?.baselineScore?.[dimension]?.accuracy, formatPercent)}` }),
+      ]))),
+    ]) : element('p', { className: 'muted', text: 'No completed primary trial is recorded. Tests and proposed revisions are not measured improvements.' }),
+    evidenceExplorer(campaign, variant), evidenceExplorer(campaign, variant, true),
+  ]));
   const root = `/api/campaigns/${encodeURIComponent(campaign.id)}/variants/${encodeURIComponent(variant.id)}/artifacts`;
   const body = element('tbody');
   for (const [index, action] of (investigation.actions ?? []).entries()) {
@@ -157,7 +173,7 @@ export function investigationPanel(campaign, variant) {
         ])),
         element('p', { className: 'identifier', text: `Started: ${action.startedAt ?? 'Unknown'} / Completed: ${action.completedAt ?? 'Not recorded'}` }),
         element('p', { className: 'identifier', text: `Patch: ${action.patchHash ?? 'Not recorded'}` }),
-        action.error ? element('div', { className: 'error-panel' }, [element('h3', { text: 'Recorded action error' }), element('p', { className: 'investigation-prose', text: action.error })]) : null,
+        action.error ? element('div', { className: 'error-panel' }, [element('h3', { text: 'Recorded action error' }), element('p', { className: 'investigation-prose', text: sanitizeDiagnosticValue(action.error) })]) : null,
         action.kind === 'evaluate_primary' ? evaluationResult(action.result, campaign) : null,
         action.kind === 'test' ? element('p', { text: `${actionOutcome(action)}. Passing tests do not establish planner correctness.` }) : null,
         action.kind === 'finalize' ? element('div', {}, [

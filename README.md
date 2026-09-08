@@ -62,6 +62,8 @@ The overview separates live execution from durable experiment results. Each acti
 
 Polling and server events update mounted views in place, preserving scroll, focus, disclosures, and unsaved inputs. Structural changes around an open native select wait until it closes; other data continues refreshing. Markdown and artifacts retain their last-good content while updates load. To verify native menu behavior in a real browser window (macOS headless Chrome dismisses native menus itself), run `npm run test:e2e -- --grep 'live target questions' --headed`.
 
+Failure status is separate from standard-result review: an excluded failure can block the evaluation while completed primary/holdout results remain reviewable. Expand **Failure diagnostics** for normalized evidence, provenance, trace links, and sanitized JSON copying. Legacy diagnostics can recover captured codes and checkpoint data from matching archives without rewriting records; missing code or details stay unknown. A validator rejection is observed execution evidence, not a verified semantic cause. Evidence and diagnostic disclosures preserve the PR7 live UI behaviors above.
+
 The experiment ledger supports URL-synchronized lifecycle, round, lineage, result, search, and sort controls. The lineage view uses the same lexicographic score ordering as promotion and keeps verified accuracy, provisional accuracy, agreement, holdout state, cohort drift, latency, and planner tokens separate rather than manufacturing a composite score.
 
 Campaign and experiment descriptions are collapsed by default and have copy actions for reuse. Each observed replicate links to the shared staging Langfuse project with its own `case:<caseId>` filter; experiment-level links include every persisted case.
@@ -105,6 +107,16 @@ Runs shows primary-only screening slots before finalization and the full configu
 
 Overview shows session state and budgets; the Investigation tab shows hypothesis revisions, action outcomes, trial scores, and lazy artifact/log links. Markdown records the same operational evidence without copying session chat or raw trial output. Agent interpretations, passing tests, provisional labels, and human-reviewed truth remain distinct. The runtime answer ledger freezes repeated semantic answers within a pinned context, not every decision context or complete decision set; matching pack/source pins alone do not establish strict replay.
 
+### Evidence On Demand
+
+Each turn attaches one compact JSON briefing: at most 16 KiB initially and 8 KiB for resumed-session deltas. It carries the objective, hypothesis, bounded measurements, latest feedback, action headers, budgets, and omission/reference metadata, not repeated full trial results. Durable trial receipts, facts, patches, and label references remain unchanged and available on demand. Compaction is deterministic, not an LLM judgment.
+
+The `harness_evidence` MCP server exposes eight tools in the investigator's session: `list_observations`, `compare_trial`, `inspect_unit`, `read_evidence`, `search_source`, `research_shell`, `research_http`, and `research_output`. The optional read-only subagent is not required to fetch evidence. **Explore evidence** and **Evidence access** expose bounded queries and access receipts in the UI, not session chat.
+
+Research scope includes all available, coordinator-registered primary, regression (holdout), and target-excluded observations, including registered prior experiments and legacy control arms. This is not an unseen-holdout protocol. Benchmark, arm, replica, label basis, and frozen-source provenance stay explicit; excluded research uses its filtered source, never a silent fallback to normal source. Use returned opaque references and pagination; agents cannot supply host paths or expand scope, and only the coordinator selects evaluation cohorts.
+
+`research_shell` permits arbitrary commands and pipelines inside isolated Docker, not a command whitelist or host shell. `/candidate`, scoped `/sources`, and sanitized `/artifacts/data.json` are read-only; `/scratch` is temporary writable space for scripts. No host credentials or Docker socket enter the worker. `curl` GET/HEAD and `research_http` use a broker restricted to approved public HTTPS documentation hosts. Local coordinator APIs are not proxied: local run data is exposed through typed evidence tools and the sanitized bundle instead. Build the trusted `Dockerfile.research` image explicitly before using shell or HTTP research; there is no automatic build/pull or host fallback. See the commands below and the [sandbox contract](src/researchSandbox.md).
+
 ## Scoring Semantics
 
 Decision counts are observations, not fitness.
@@ -142,6 +154,8 @@ Planner runtime questions remain separate. For investigator campaigns, `runtimeA
     mutation.patch               current treatment relative to the inherited parent
     investigator-context.json    hash-bound advisory context and score-reference locator
     investigator-reference.json  hash-bound parent facts/replicates and trial labels
+    investigator-turn-*-feedback.json  compact briefing; the turn's only attachment
+    evidence-access/             scoped invocation manifests, access receipts, bundles, and research output
     investigation/action-NNN/    trial requests, pins, patches, receipts/failures, logs, and collected run artifacts
     hypothesis-compliance/       immutable prompts, logs, and patch-bound verdict
     diagnosis/                   immutable bounded inputs, manifests, optional telemetry, prompts, logs, and results
@@ -161,6 +175,17 @@ npm run build
 
 The test suite covers persistence, scoring precedence, cohort drift, command argument safety, and the complete planner HTTP sequence through Phase 2 without touching Phase 3.
 
+### Research Sandbox Check
+
+Before research use, the operator builds the trusted image and runs the opt-in real Docker smoke test from the harness root:
+
+```bash
+docker build -f Dockerfile.research -t ainative-planner-research:local .
+RESEARCH_DOCKER_SMOKE=1 node --import tsx --test test/researchSandbox*.test.ts
+```
+
+Without `RESEARCH_DOCKER_SMOKE=1`, ordinary tests skip the real-container check. It exercises scripts, brokered public GET/HEAD, isolation, output bounds, and cleanup without starting a planner campaign or dashboard. See [script verification notes](scripts/README.md).
+
 ### Opt-In Live Check
 
 Ordinary `npm run check` uses isolated fixtures and mocked live-runner tests; it does not start a live evaluation. For a **new, explicitly authorized** live run on an unused port:
@@ -173,7 +198,9 @@ npm run test:live -- --live --source-config /absolute/path/to/campaign.json --id
 
 ## Current Operational Limits
 
-The [PR47 live investigation summary](docs/experiments/pr47-autonomous-1/investigation-summary.md) records an approximately 82-minute, sequential two-replicate primary trial with provisional accuracy falling from 35.2% to 33.2%. The revised patch passed 103 targeted tests but was not evaluated; the agent abandoned at turn 7 with about 25 minutes left. No improvement or final candidate outcome was established. The initial follow-up used single-replica screening; current new-campaign defaults instead provide two parallel replicas and a four-hour investigation budget. The archived campaign's configuration and measurements remain unchanged.
+The [PR47 live investigation summary](docs/experiments/pr47-autonomous-1/investigation-summary.md) records an approximately 82-minute, sequential two-replicate primary trial with provisional accuracy falling from 35.2% to 33.2%. The revised patch passed targeted tests but was not evaluated; the agent abandoned at turn 7 with about 25 minutes left. No improvement or final candidate outcome was established. The initial follow-up used single-replica screening; current new-campaign defaults instead provide two parallel replicas and a four-hour investigation budget. The archived campaign's configuration and measurements remain unchanged. No full new campaign has been run to establish improvement from compact briefing, evidence access, or failure diagnostics.
+
+Planner-side structured `run.failed` event details are a separate future planner commit/PR, not part of PR47. The harness accepts the optional versioned details into `failure.details` without echoing raw model output; unknown candidate selections use fingerprints rather than raw text. Exact selections absent from old archives are unrecoverable; a code alone does not establish a semantic cause.
 
 - A stop request prevents the next iteration and automatic promotion, but does not terminate a model call already in flight.
 - New full-primary investigator screening defaults to two parallel replicas. Baseline/final repetitions remain separately configured; V2 requires two. An explicit single-replica override cannot measure agreement.
@@ -182,4 +209,4 @@ The [PR47 live investigation summary](docs/experiments/pr47-autonomous-1/investi
 - Campaign execution is single-coordinator. Do not run dashboard and mutating CLI commands against the same campaign simultaneously.
 - Hypothesis compliance is a conservative same-model semantic review. It reduces obviously unfaithful experiments but may reject a valid mutation and is not independent correctness evidence.
 - Node currently labels built-in SQLite as experimental; all state is also represented by raw artifacts and generated Markdown.
-- Live execution projections must be persisted in SQLite. The server does not hydrate missing execution state from archived artifacts.
+- Live execution projections must be persisted in SQLite. Read-only diagnostic recovery may supplement existing failed slots from matching archives, but never hydrates missing execution state or rewrites historical records.

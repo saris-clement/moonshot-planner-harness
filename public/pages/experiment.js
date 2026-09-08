@@ -1,6 +1,7 @@
 import { api, apiText } from '../api.js';
 import { element, formatNumber, formatPercent, statusLabel } from '../dom.js';
-import { holdoutState, isPromotionEligible, primaryScreening, scopedQuestions } from '../models.js';
+import { executionHealth, holdoutState, isPromotionEligible, primaryScreening, scopedQuestions } from '../models.js';
+import { sanitizeDiagnosticValue } from '../diagnostics.js';
 import {
   experimentHeading,
   externalTraceLink,
@@ -284,6 +285,7 @@ function tabNavigation(campaign, variant, current, questionCount) {
 function summaryPanel(campaign, variant) {
   const relationship = element('dl', { className: 'definition-list' }, [
     element('div', {}, [element('dt', { text: 'Lifecycle' }), element('dd', {}, [statusLabel(variant.status)])]),
+    element('div', {}, [element('dt', { text: 'Execution health' }), element('dd', { text: executionHealth(campaign, variant).label ?? executionHealth(campaign, variant).status })]),
     element('div', {}, [element('dt', { text: 'Parent' }), element('dd', {}, [
       variant.parentVariantId
         ? routeLink(variant.parentVariantId, `/campaigns/${encodeURIComponent(campaign.id)}/experiments/${encodeURIComponent(variant.parentVariantId)}`)
@@ -302,7 +304,7 @@ function summaryPanel(campaign, variant) {
     element('section', {}, [sectionHeading('Telemetry', 'End-to-end and planner-only'), usageSummary(campaign, variant)]),
     element('section', { className: 'summary-wide' }, [sectionHeading('Provenance', 'Experiment position'), relationship]),
     variant.error
-      ? element('section', { className: 'error-panel summary-wide' }, [element('h2', { text: 'Recorded failure' }), element('p', { text: variant.error })])
+      ? element('section', { className: 'error-panel summary-wide' }, [element('h2', { text: 'Recorded failure' }), element('p', { text: sanitizeDiagnosticValue(variant.error) })])
       : null,
   ]);
 }
@@ -421,7 +423,7 @@ export function experimentPage(context, route) {
             : 'Planner totals count standard primary and holdout executions only; target-excluded guard runs are excluded from totals.',
         ),
         usageSummary(campaign, variant),
-        replicateTable(campaign, variant),
+        replicateTable(campaign, variant, { includeTargetExcluded: true }),
       ])
     : selectedTab === 'investigation'
       ? investigationPanel(campaign, variant)

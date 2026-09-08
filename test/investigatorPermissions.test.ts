@@ -3,7 +3,18 @@ import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { AgentRunner } from '../src/agents.js';
+import { AgentRunner, inheritedEvidencePermission } from '../src/agents.js';
+
+test('evidence tools preserve inherited wildcard denials and confirmation rules', () => {
+  const name = 'harness_evidence_research_shell';
+  assert.equal(inheritedEvidencePermission(undefined, name), 'allow');
+  assert.equal(inheritedEvidencePermission('ask', name), 'ask');
+  assert.equal(inheritedEvidencePermission({ '*': 'ask', 'harness_evidence_research_*': 'deny' }, name), 'deny');
+  assert.equal(inheritedEvidencePermission({ 'harness_evidence_*': 'deny', [name]: 'ask' }, name), 'ask');
+  assert.equal(inheritedEvidencePermission({ 'harness_evidence_research_?????': 'deny' }, name), 'deny');
+  assert.deepEqual(inheritedEvidencePermission({ [name]: { '*': 'deny' } }, name), { '*': 'deny' });
+  assert.equal(inheritedEvidencePermission({ 'harness_evidence_research_*': 'deny' }, 'harness_evidence_read_evidence'), 'allow');
+});
 import { HarnessDatabase } from '../src/db.js';
 import { runCommand } from '../src/process.js';
 import { CampaignConfigSchema, HypothesisSchema } from '../src/types.js';

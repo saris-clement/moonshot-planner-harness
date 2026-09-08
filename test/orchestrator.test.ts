@@ -20,7 +20,7 @@ import {
 import { variantArtifactDirectory, type HarnessPaths } from '../src/paths.js';
 import { resolveCampaignConfig } from '../src/config.js';
 import { runCommand } from '../src/process.js';
-import type { PlannerQuestionRecord } from '../src/plannerClient.js';
+import { PlannerClient, type PlannerQuestionRecord } from '../src/plannerClient.js';
 import { canonicalHash, computeTargetExcludedGate } from '../src/metrics.js';
 import { summarizeTargetExcludedComparisonReport } from '../src/targetExcludedComparison.js';
 import { hypothesisComplianceResultPath } from '../src/hypothesisCompliance.js';
@@ -2149,10 +2149,12 @@ test('replicate wall-clock timing is initialized before health and finalized on 
         root,
         new Map(),
       ),
-      /GET \/readyz failed \(503\)/,
+      /planner HTTP request failed; diagnostic details are unavailable/,
     );
     const execution = database.getVariant(variant.id).executionState?.executions[0];
     assert.equal(execution?.status, 'failed');
+    assert.equal(execution?.failure?.origin, 'http');
+    assert.equal(execution?.failure?.httpStatus, 503);
     assert.ok(execution?.startedAt);
     assert.ok(execution?.completedAt);
     assert.equal(
@@ -2166,6 +2168,55 @@ test('replicate wall-clock timing is initialized before health and finalized on 
     );
     database.close();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('replicate preserves wrapped HTTP failure before case creation', async (t) => {
+  const fixture = await v2LifecycleFixture('wrapped-http-before-case');
+  try {
+    const { campaign, variant, paths, database, root } = fixture;
+    const message = 'The planner HTTP request failed; diagnostic details are unavailable.';
+    const original = Object.assign(new Error(message, { cause: new Error('SECRET source response body') }), {
+      failure: { origin: 'http' as const, code: null, message, httpStatus: 503 },
+    });
+    assert.equal('status' in original, false);
+    const health = t.mock.method(PlannerClient.prototype, 'health', async () => ({ status: 'ready' }));
+    const runPhase2 = t.mock.method(PlannerClient.prototype, 'runPhase2', async () => {
+      const execution = database.getVariant(variant.id).executionState?.executions[0];
+      assert.equal(execution?.status, 'starting');
+      assert.equal(execution?.caseId, null);
+      assert.equal(execution?.runId, null);
+      throw original;
+    });
+    const internal = new CampaignOrchestrator(paths, database) as unknown as {
+      runBenchmark(
+        campaign: CampaignRecord, variant: VariantRecord,
+        stack: { artifactDirectory: string; baseUrl: string }, benchmark: Benchmark,
+        token: string | undefined, replicate: number, workflowsSource: string, answerCache: Map<string, unknown>,
+      ): Promise<unknown>;
+    };
+    await assert.rejects(internal.runBenchmark(
+      campaign, variant, { artifactDirectory: variantArtifactDirectory(paths, campaign.id, variant.id), baseUrl: 'http://planner.invalid' },
+      campaign.config.benchmarks[0]!, undefined, 1, root, new Map(),
+    ), (error) => {
+      assert.equal(error, original);
+      assert.equal(original.message, message);
+      return true;
+    });
+    assert.equal(health.mock.callCount(), 1);
+    assert.equal(runPhase2.mock.callCount(), 1);
+    const execution = database.getVariant(variant.id).executionState?.executions[0];
+    assert.equal(execution?.status, 'failed');
+    assert.equal(execution?.caseId, null);
+    assert.equal(execution?.runId, null);
+    assert.equal(execution?.failure?.origin, 'http');
+    assert.equal(execution?.failure?.httpStatus, 503);
+    assert.equal(execution?.failure?.code, null);
+    assert.equal(execution?.failure?.message, message);
+    assert.equal(JSON.stringify(execution).includes('SECRET'), false);
+  } finally {
+    fixture.database.close();
+    await rm(fixture.root, { recursive: true, force: true });
   }
 });
 

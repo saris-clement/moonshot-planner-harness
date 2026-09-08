@@ -7,6 +7,7 @@ import {
   type VariantExecutionState,
 } from './types.js';
 import { extractPlannerUsage } from './metrics.js';
+import { normalizeExecutionFailure } from './failures.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -177,6 +178,10 @@ export function executionSnapshotFromRun(
     completedAt: context.completedAt ?? null,
     elapsedMs: context.elapsedMs ?? null,
     usage: extractPlannerUsage(response),
+    failure: normalizeExecutionFailure(response, {
+      ...(context.caseId ? { caseId: context.caseId } : {}),
+      ...(context.runId ? { runId: context.runId } : {}),
+    }),
     updatedAt:
       nestedString(response, ['checkpointMetadata', 'createdAt']) ??
       nestedString(response, ['runtime', 'updatedAt']) ??
@@ -220,12 +225,27 @@ export function mergeExecutionSnapshot(
           decisions: previous.decisions,
         }
       : input.snapshot;
+  const previousFailure = checkpointSnapshot.caseId && checkpointSnapshot.runId &&
+    previous?.caseId === checkpointSnapshot.caseId &&
+    previous?.runId === checkpointSnapshot.runId ? previous?.failure : null;
+  const incomingFailure = checkpointSnapshot.failure;
   const snapshot = {
     ...checkpointSnapshot,
     startedAt: checkpointSnapshot.startedAt ?? previous?.startedAt ?? null,
     completedAt: checkpointSnapshot.completedAt ?? previous?.completedAt ?? null,
     elapsedMs: checkpointSnapshot.elapsedMs ?? previous?.elapsedMs ?? null,
     usage: checkpointSnapshot.usage ?? previous?.usage ?? null,
+    failure: checkpointSnapshot.status === 'completed' ? null : incomingFailure && previousFailure
+      ? {
+          ...previousFailure, ...incomingFailure,
+          code: incomingFailure.code ?? previousFailure.code,
+          message: incomingFailure.code ? incomingFailure.message : previousFailure.message,
+          details: incomingFailure.details ?? previousFailure.details ?? null,
+          providerRetryBudgetAvailable: incomingFailure.providerRetryBudgetAvailable ?? previousFailure.providerRetryBudgetAvailable ?? null,
+          ...(previousFailure.provenance && !incomingFailure.code && !incomingFailure.details
+            ? { provenance: previousFailure.provenance } : {}),
+        }
+      : incomingFailure ?? previousFailure ?? null,
   };
   const execution = {
     benchmark: input.benchmark,

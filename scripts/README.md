@@ -1,4 +1,21 @@
-# Opt-In Live E2E
+# Research And Live Checks
+
+## Research Sandbox
+
+Before using `research_shell` or `research_http`, the operator must explicitly build the trusted image from the harness root, then run the real Docker smoke check:
+
+```bash
+docker build -f Dockerfile.research -t ainative-planner-research:local .
+RESEARCH_DOCKER_SMOKE=1 node --import tsx --test test/researchSandbox*.test.ts
+```
+
+Without the opt-in environment variable, ordinary tests skip the real-container check. The smoke exercises arbitrary scripts/pipelines, brokered public GET/HEAD, read-only inputs, absent host credentials/Docker socket, output limits, cancellation, and cleanup. It starts disposable research containers and reads public test pages, not a planner campaign or dashboard. An operator-selected prebuilt image may use `HARNESS_RESEARCH_IMAGE`; invocations pin its immutable ID and never automatically build or pull it.
+
+`scripts/research-curl.mjs` is the sandbox's broker client, not a host API proxy. It supports public-documentation GET/HEAD only. Local coordinator APIs are unavailable; use the typed evidence tools or sanitized `/artifacts/data.json` for local run data. Candidate/source/evidence mounts are read-only, and arbitrary research scripts can write to fresh `/scratch` tmpfs. See [the sandbox contract](../src/researchSandbox.md) for boundaries and limits.
+
+These checks do not establish semantic correctness or full-campaign improvement. No full new campaign has been run for the compact briefing/evidence changes; four-hour investigation and two-parallel-replica settings below are unchanged.
+
+## Opt-In Live E2E
 
 `npm run test:live -- --live --source-config <absolute-campaign.json> --id <new-id> --port 4174`
 

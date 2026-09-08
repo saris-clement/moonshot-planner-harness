@@ -1,5 +1,5 @@
 const ACTIVE_STATUSES = new Set(['queued', 'mutating', 'gating', 'building', 'starting', 'running', 'judging']);
-const STABLE_PROGRESS_STAGES = new Set(['adjudicating', 'waiting_for_input', 'completed']);
+const STABLE_PROGRESS_STAGES = new Set(['adjudicating', 'waiting_for_input', 'completed', 'failed']);
 const LANGFUSE_TRACES_URL =
   'https://langfuse.staging.saris.ai/project/cmt941f0r005ank07hhyq0s50/traces';
 
@@ -141,7 +141,7 @@ export function replicateMatrix(campaign, variant) {
         traceUrl: langfuseUrlForCase(execution?.caseId),
         stableProgress: Boolean(
           execution?.progress &&
-            (execution.status === 'completed' || STABLE_PROGRESS_STAGES.has(execution.stage)),
+            (['completed', 'failed'].includes(execution.status) || STABLE_PROGRESS_STAGES.has(execution.stage)),
         ),
       });
     }
@@ -155,23 +155,28 @@ export function targetExcludedReplicateMatrix(campaign, variant) {
     ? { ...campaign.config.targetExcluded, replicates: 2 }
     : null);
   const primary = campaign.config.benchmarks.find((benchmark) => benchmark.role === 'primary');
-  if (!config || !primary || (variant.round === 0 && config.protocol !== 'standard-primary-v2')) {
+  if (!config || !primary) {
     return [];
   }
   const evaluation = (campaign.targetExcludedEvaluations ?? []).find(
     (candidate) => candidate.variantId === variant.id,
   );
+  if (variant.round === 0 && config.protocol !== 'standard-primary-v2' && !evaluation) return [];
   const executions = evaluation?.executionState?.executions ?? [];
   const rows = [];
-  const arms = config.protocol === 'standard-primary-v2' ? ['excluded'] : ['control', 'excluded'];
-  for (const arm of arms) {
-    const benchmark = `${primary.name}:${arm}`;
+  const arms = config.protocol === 'standard-primary-v2' ? [] : campaign.config.benchmarks
+    .filter((benchmark) => benchmark.role === 'primary' || executions.some((item) =>
+      item.benchmark === `${benchmark.name}:control` || item.benchmark === `${benchmark.name}:target-excluded/control`))
+    .map((benchmark) => ({ benchmark, arm: 'control' }));
+  arms.push({ benchmark: primary, arm: 'excluded' });
+  for (const { benchmark: definition, arm } of arms) {
+    const benchmark = `${definition.name}:${arm}`;
     const finalFacts = arm === 'control'
-      ? evaluation?.controlReplicateFacts ?? []
+      ? definition.role === 'primary' ? evaluation?.controlReplicateFacts ?? [] : evaluation?.holdoutReplicateFacts?.[definition.name] ?? []
       : evaluation?.excludedReplicateFacts ?? [];
     for (let replicate = 1; replicate <= config.replicates; replicate += 1) {
       const execution = executions.find(
-        (candidate) => candidate.benchmark === benchmark && candidate.replicate === replicate,
+        (candidate) => (candidate.benchmark === benchmark || candidate.benchmark === `${definition.name}:target-excluded/${arm}`) && candidate.replicate === replicate,
       ) ?? null;
       const facts = finalFacts[replicate - 1] ?? null;
       const failed = execution?.status === 'failed';
@@ -184,6 +189,8 @@ export function targetExcludedReplicateMatrix(campaign, variant) {
             : 'pending';
       rows.push({
         benchmark,
+        benchmarkName: definition.name,
+        scope: arm,
         role: arm === 'control' ? 'target control' : 'target excluded',
         replicate,
         replicateCount: config.replicates,
@@ -196,12 +203,53 @@ export function targetExcludedReplicateMatrix(campaign, variant) {
         traceUrl: langfuseUrlForCase(execution?.caseId),
         stableProgress: Boolean(
           execution?.progress &&
-            (execution.status === 'completed' || STABLE_PROGRESS_STAGES.has(execution.stage)),
+            (['completed', 'failed'].includes(execution.status) || STABLE_PROGRESS_STAGES.has(execution.stage)),
         ),
       });
     }
   }
   return rows;
+}
+
+export function executionHealth(campaign, variant) {
+  const standard = replicateMatrix(campaign, variant);
+  const excluded = targetExcludedReplicateMatrix(campaign, variant);
+  const rows = [...standard, ...excluded];
+  const target = campaign.targetExcludedEvaluations?.find((item) => item.variantId === variant.id);
+  const baselineBlocked = variant.round === 0 && campaign.status === 'baseline_target_failed';
+  const guardFailed = target?.status === 'failed' || excluded.some((row) => row.state === 'failed');
+  const blocked = baselineBlocked || guardFailed || variant.status === 'failed' || standard.some((row) => row.state === 'failed');
+  return {
+    status: blocked ? 'blocked' : rows.length && rows.every((row) => row.state === 'completed') ? 'complete'
+      : rows.some((row) => row.state === 'current') ? 'running' : 'unknown',
+    label: blocked ? `${variant.round === 0 ? 'Baseline' : 'Evaluation'} blocked${guardFailed ? ' / Guard failed' : ''}` : null,
+    counts: {
+      completed: rows.filter((row) => row.state === 'completed').length,
+      failed: rows.filter((row) => row.state === 'failed').length,
+      pending: rows.filter((row) => row.state === 'pending' || row.state === 'current').length,
+      total: rows.length,
+    },
+    standardAvailable: standard.length > 0 && standard.every((row) => row.state === 'completed'),
+    failures: rows.filter((row) => row.state === 'failed').map((row) => ({
+      scope: row.scope ?? 'standard', benchmark: row.benchmarkName ?? row.benchmark, replicate: row.replicate,
+      caseId: row.execution?.caseId ?? null, runId: row.execution?.runId ?? null,
+      progress: row.execution?.progress ?? null, failure: row.execution?.failure ?? null,
+    })),
+  };
+}
+
+export function canRetryExcludedBaseline(campaign, variant) {
+  const frozen = campaign.config.targetExcluded;
+  const config = campaign.targetExcludedConfig;
+  const target = campaign.targetExcludedEvaluations?.find((item) => item.variantId === variant.id);
+  return Boolean(campaign.status === 'baseline_target_failed' && variant.round === 0 &&
+    ['review', 'completed'].includes(variant.status) && variant.artifactCollectionComplete &&
+    (!campaign.currentParentVariantId || campaign.currentParentVariantId === variant.id) &&
+    frozen?.protocol === 'standard-primary-v2' && config?.protocol === frozen.protocol &&
+    config.baselineVariantId === variant.id && config.replicates === 2 &&
+    config.targetImplementationWorkflow === frozen.targetImplementationWorkflow &&
+    target?.status === 'failed' && !target.executionState?.executions?.some((item) => !['failed', 'completed'].includes(item.status)) &&
+    executionHealth(campaign, variant).standardAvailable);
 }
 
 export function plannerTotals(campaign, variant) {

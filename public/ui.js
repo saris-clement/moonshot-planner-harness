@@ -14,6 +14,7 @@ import {
 } from './dom.js';
 import {
   effectiveElapsed,
+  executionHealth,
   experimentDescription,
   langfuseUrlForVariant,
   plannerTotals,
@@ -21,6 +22,7 @@ import {
   targetExcludedReplicateMatrix,
 } from './models.js';
 import { helpButton } from './help.js';
+import { sanitizeDiagnosticValue } from './diagnostics.js';
 
 export function routeLink(label, href, className = '') {
   return element('a', {
@@ -87,7 +89,7 @@ export function campaignActions(campaign, context) {
     },
     on: { click: () => context.stopCampaign() },
   });
-  return [run, stop];
+  return campaign.status === 'baseline_target_failed' ? [stop] : [run, stop];
 }
 
 export function campaignHeading(campaign, context, actions = []) {
@@ -153,6 +155,7 @@ function progressContent(row) {
       },
     }),
     element('span', { className: 'progress-value', text: `${progress.completedUnits} / ${progress.totalUnits}` }),
+    row.state === 'failed' ? element('small', { className: 'muted', text: 'Last accepted' }) : null,
   ];
 }
 
@@ -189,7 +192,9 @@ export function replicateTable(campaign, variant, options = {}) {
       }, [
         element('td', {}, [element('b', { text: row.benchmark }), element('small', { text: row.role })]),
         tableCell(`${row.replicate} / ${row.replicateCount}`, 'mono'),
-        element('td', {}, [statusLabel(rowState(row))]),
+        element('td', {}, [statusLabel(rowState(row)),
+          row.state === 'failed' && row.execution?.failure?.code ? element('small', { className: 'replicate-failure-code', text: sanitizeDiagnosticValue(row.execution.failure.code) }) : null,
+        ]),
         element('td', { className: 'progress-cell' }, progressContent(row)),
         element('td', { className: 'mono decision-cell' }, decisionsContent(row)),
         tableCell(
@@ -198,7 +203,7 @@ export function replicateTable(campaign, variant, options = {}) {
             : formatDuration(effectiveElapsed(
                 row.execution?.elapsedMs,
                 row.execution?.startedAt,
-                row.execution?.completedAt,
+                row.execution?.completedAt ?? (row.state === 'failed' ? row.execution?.failure?.occurredAt ?? row.execution?.updatedAt : null),
               )),
           'mono',
         ),
@@ -320,6 +325,7 @@ export function experimentHeading(campaign, variant, context, actions = []) {
       element('p', { className: 'overline', text: `Experiment ${String(variant.ordinal).padStart(3, '0')} · Round ${variant.round}` }),
       element('h1', { text: variant.hypothesis.title }),
       element('p', { className: 'identifier', text: variant.id }),
+      executionHealth(campaign, variant).label ? element('p', { className: 'failure-status', text: executionHealth(campaign, variant).label }) : null,
       descriptionControl(
         'Experiment description',
         experimentDescription(variant),

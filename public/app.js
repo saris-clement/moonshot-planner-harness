@@ -1,6 +1,7 @@
 import { api } from './api.js';
 import { element } from './dom.js';
-import { ACTIVE_STATUSES } from './models.js';
+import { ACTIVE_STATUSES, canRetryExcludedBaseline, executionHealth } from './models.js';
+import { failureBanner } from './diagnostics.js';
 import { navigate, parseRoute, startRouter } from './router.js';
 import { renderShell } from './shell.js';
 import { clearReviewDraft, hasDirtyDraft, state } from './state.js';
@@ -166,6 +167,7 @@ async function runAction(action, message) {
 
 function runCampaign() {
   const campaign = state.campaign;
+  if (campaign.status === 'baseline_target_failed') return;
   const stopped = campaign.status.startsWith('stopped');
   const baseline = campaign.variants.some(
     (variant) => variant.round === 0 && variant.status === 'completed',
@@ -176,6 +178,14 @@ function runCampaign() {
     () => api(`/api/campaigns/${encodeURIComponent(campaign.id)}/${operation}`, { method: 'POST', body: '{}' }),
     message,
   );
+}
+
+function retryExcludedBaseline(variantId) {
+  const campaign = state.campaign;
+  const variant = campaign.variants.find((item) => item.id === variantId);
+  if (!variant || !canRetryExcludedBaseline(campaign, variant) || state.pendingAction) return;
+  if (!window.confirm('Rerun the two excluded runs for this baseline? This replaces both excluded runs and preserves completed standard primary and holdout results. Nothing starts until you confirm.')) return;
+  return runAction(() => api(`/api/campaigns/${encodeURIComponent(campaign.id)}/baseline`, { method: 'POST', body: '{}' }), 'Excluded baseline retry admitted');
 }
 
 function stopCampaign() {
@@ -248,6 +258,7 @@ const context = {
   refreshCurrent,
   render: () => renderCurrent(),
   runCampaign,
+  retryExcludedBaseline,
   stopCampaign,
   promoteVariant,
   configureTargetExcluded,
@@ -294,6 +305,11 @@ async function renderCurrent() {
       element('h1', { text: 'Page not found' }),
       element('p', { text: 'This path is not part of the local evaluation console.' }),
     ]);
+    if (route.params.campaignId && state.campaign) {
+      const failed = state.campaign.variants.filter((variant) =>
+        (variant.round === 0 || variant.id === route.params.variantId) && executionHealth(state.campaign, variant).status === 'blocked');
+      if (failed.length) content.insertBefore(element('div', { className: 'failure-banners' }, failed.map((variant) => failureBanner(state.campaign, variant, context))), content.children[1] ?? null);
+    }
     renderShell({ state, route, content, navigate });
   } catch (error) {
     if (token !== renderToken) return;

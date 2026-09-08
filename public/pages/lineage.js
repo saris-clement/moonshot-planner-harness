@@ -11,12 +11,14 @@ import {
 import {
   currentPathIds,
   effectiveElapsed,
+  executionHealth,
   holdoutState,
   plannerTotals,
   siblingScoreRanks,
 } from '../models.js';
 import { campaignHeading, routeLink, sectionHeading } from '../ui.js';
 import { liveRegion, updateLiveView } from '../live.js';
+import { sanitizeDiagnosticValue } from '../diagnostics.js';
 
 const graphPanels = new WeakMap();
 
@@ -25,7 +27,7 @@ function lineageCard(campaign, variants, variant, rank, onPath) {
   // Screening is a preview of a specific immutable trial, never a replacement promotion score.
   const finalEvaluation = variant.score && variant.facts;
   const trial = finalEvaluation ? null : variant.investigation?.actions?.findLast((action) =>
-    action.kind === 'evaluate_primary' && action.status === 'completed' && action.result?.score && action.result?.facts,
+    action.kind === 'evaluate_primary' && action.status === 'completed' && action.result?.score,
   );
   const score = finalEvaluation ? variant.score : trial?.result.score;
   const facts = finalEvaluation ? variant.facts : trial?.result.facts;
@@ -54,6 +56,7 @@ function lineageCard(campaign, variants, variant, rank, onPath) {
       'lineage-card-title',
     ),
     element('p', { className: 'identifier', text: variant.id }),
+    executionHealth(campaign, variant).label ? element('p', { className: 'failure-status', text: executionHealth(campaign, variant).label }) : null,
     element('div', { className: 'lineage-measurement' }, [
       element('p', { className: 'overline', text: trial ? `Latest screening: ${trial.id}` : finalEvaluation ? variant.round === 0 ? 'Baseline evaluation' : 'Final evaluation' : 'No evaluation recorded' }),
       trial ? element('p', { text: trial.hypothesis?.title ?? 'Recorded screening hypothesis' }) : null,
@@ -75,7 +78,7 @@ function lineageCard(campaign, variants, variant, rank, onPath) {
     reason ? element('section', { className: 'lineage-outcome' }, [
       element('h3', { text: abandoned && !finalEvaluation ? 'Abandoned before final evaluation' : 'Recorded outcome' }),
       element('p', { className: 'muted', text: variant.investigation?.reason ? 'Agent explanation, not verified causality' : 'Coordinator record' }),
-      element('p', { text: reason }),
+      element('p', { text: sanitizeDiagnosticValue(reason) }),
     ]) : null,
     variant.investigation ? routeLink('View investigation', investigationUrl, 'lineage-investigation-link') : null,
     variant.id === campaign.currentParentVariantId

@@ -1,0 +1,6 @@
+**
+!Dockerfile.research
+!src/
+!src/researchSandboxBroker.ts
+!scripts/
+!scripts/research-curl.mjs

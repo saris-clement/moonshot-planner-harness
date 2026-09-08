@@ -211,6 +211,63 @@ th .timing-help-trigger { margin-block: -5px; margin-left: 2px; }
 .help-steps li p { margin: 0; color: var(--muted-foreground); font-size: 12px; }
 .empty-row { padding: 18px 2px; border-bottom: 1px solid var(--border); color: var(--muted-foreground); }
 
+.failure-banner { margin-bottom: 20px; padding: 14px 16px; border: 1px solid var(--border-contrast); border-radius: var(--radius); background: var(--background); overflow-wrap: anywhere; }
+.failure-banner-heading { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 20px; }
+.failure-banner-heading h2, .failure-status { color: var(--destructive); }
+.failure-banner-heading .mono { font-size: 11px; }
+.failure-banner p { margin: 8px 0; }
+.failure-status { margin: 5px 0; font-weight: 650; font-size: 12px; }
+.failure-diagnostics { margin-top: 12px; border-top: 1px solid var(--border); }
+.failure-diagnostics summary { padding-block: 10px; cursor: pointer; font-weight: 600; }
+.diagnostic-failure { padding: 12px 0; border-bottom: 1px solid var(--border); }
+.diagnostic-code { font-family: var(--mono); font-size: 12px; }
+.diagnostic-content pre { max-height: 300px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; background: var(--canvas); font-size: 11px; }
+.diagnostic-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.diagnostic-actions .button, .diagnostic-retry .button, .evidence-body .button { border-color: var(--border-contrast); background: var(--background); }
+.diagnostic-retry .button { background: var(--secondary); }
+.failure-banner, .diagnostic-failure details, .evidence-explorer { scroll-margin-top: calc(var(--topbar-height) + 12px); }
+.diagnostic-retry { margin-top: 12px; }
+.diagnostic-retry p { color: var(--muted-foreground); font-size: 12px; }
+.target-run-trace { display: block; margin-top: 5px; }
+.replicate-failure-code { display: block; max-width: 190px; white-space: normal; overflow-wrap: anywhere; color: var(--destructive); font-family: var(--mono); }
+.investigation-comparison { margin: 20px 0; padding-block: 12px; border-block: 1px solid var(--border); }
+.evidence-explorer, .evidence-access { margin-top: 12px; border-top: 1px solid var(--border); min-width: 0; }
+.evidence-explorer > summary, .evidence-access > summary { padding-block: 12px; cursor: pointer; font-weight: 650; }
+.evidence-body { padding-bottom: 12px; min-width: 0; overflow-wrap: anywhere; }
+.evidence-controls { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; margin-block: 12px; }
+.evidence-controls label { display: grid; gap: 4px; min-width: 0; max-width: 100%; flex: 1 1 220px; }
+.evidence-controls label[hidden] { display: none; }
+.evidence-controls select, .evidence-controls input { width: 100%; min-width: 0; }
+.evidence-controls label > span { color: var(--muted-foreground); font-size: 11px; font-weight: 600; }
+.evidence-results { min-width: 0; }
+.evidence-item { padding: 12px 0; border-bottom: 1px solid var(--border); }
+.evidence-item dl { margin-bottom: 10px; }
+.evidence-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 24px; }
+.evidence-item dl > div { min-width: 0; }
+.evidence-item dt { text-transform: none; letter-spacing: 0; font-size: 11px; }
+.evidence-metrics dd { font-size: 12px; font-weight: 550; }
+.evidence-item-heading { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 8px; }
+.evidence-metadata { margin-top: 10px; }
+.evidence-metadata > summary { padding-block: 6px; color: var(--muted-foreground); font-size: 11px; cursor: pointer; }
+.evidence-source-list { margin-block: 12px; }
+.evidence-source-list h4, .evidence-envelope h4 { margin-block: 8px; font-size: 12px; }
+.evidence-source-list > div { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 6px; }
+.evidence-results pre { margin: 0; max-width: 100%; max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--mono); font-size: 11px; font-weight: 400; }
+.evidence-envelope { padding: 10px 12px; background: var(--canvas); border: 1px solid var(--border); border-radius: var(--radius); }
+.evidence-omissions { margin-top: 10px; }
+.evidence-item-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.evidence-pagination { margin-top: 12px; }
+@media (max-width: 700px) {
+  .failure-banner { padding: 12px; }
+  .failure-banner .button { height: auto; min-height: 44px; padding-block: 9px; white-space: normal; line-height: 1.3; }
+  .failure-diagnostics summary { min-height: 44px; }
+  .evidence-body .button { min-height: 44px; height: auto; white-space: normal; line-height: 1.3; padding-block: 9px; }
+  .evidence-explorer > summary, .evidence-access > summary { min-height: 44px; }
+  .evidence-controls input, .evidence-controls select { min-height: 44px; }
+  .evidence-metrics { gap: 10px 12px; }
+  .evidence-metadata > summary { min-height: 44px; padding-block: 14px; }
+}
+
 .active-variant { margin: 0 0 28px; border-top: 2px solid var(--primary); }
 .active-variant-heading { display: grid; grid-template-columns: minmax(220px, .42fr) minmax(700px, 1fr); align-items: center; gap: 20px; padding: 11px 0; }
 .active-variant-title { color: var(--foreground); font-size: 14px; font-weight: 650; }

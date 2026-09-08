@@ -9,9 +9,12 @@ import { z } from 'zod';
 import type { HarnessDatabase } from './db.js';
 import type { CampaignOrchestrator } from './orchestrator.js';
 import { DecisionSchema, TargetExcludedAnswerInputSchema } from './types.js';
-import { campaignReportDirectory, variantArtifactDirectory } from './paths.js';
+import { campaignReportDirectory, variantArtifactDirectory, variantWorktreePath } from './paths.js';
 import { renderMarkdown } from './renderMarkdown.js';
 import { parseSourceLineRanges, readFrozenSourceFile, renderSourceViewer } from './sourceViewer.js';
+import { evidenceReadSchemas, evidenceScopeFromContext, loadEvidenceInvocation, prepareEvidenceInvocation,
+  readEvidenceLedger, type EvidenceAccess } from './evidenceAccess.js';
+import { readVariantDiagnostics } from './failures.js';
 
 const LabelInputSchema = z.object({
   benchmark: z.string().min(1),
@@ -255,6 +258,8 @@ export function startDashboard(input: {
   database: HarnessDatabase;
   orchestrator: CampaignOrchestrator;
 }) {
+  // Retain lazy source-reference lookups between API calls, without an unbounded per-campaign cache.
+  const evidence = new Map<string, Promise<EvidenceAccess>>();
   const server = createServer(async (request, response) => {
     try {
       response.setHeader(
@@ -382,6 +387,66 @@ export function startDashboard(input: {
             campaignId,
             variant.id,
           );
+          if (segments.length === 6 && segments[5] === 'diagnostics') {
+            if (url.searchParams.size) throw new Error('Diagnostics does not accept scope or path overrides');
+            sendJson(response, 200, await readVariantDiagnostics(input.orchestrator.paths,
+              input.database.getCampaign(campaignId), variant, input.database.getTargetExcludedEvaluation(variant.id)));
+            return;
+          }
+          if (segments.length === 6 && ['evidence', 'evidence-reads'].includes(segments[5]!)) {
+            const ledger = segments[5] === 'evidence-reads';
+            const parameters = ledger ? ['cursor', 'limit'] : ['tool', 'query'];
+            for (const key of url.searchParams.keys()) {
+              if (!parameters.includes(key) || url.searchParams.getAll(key).length !== 1) throw new Error('Unexpected evidence query parameter');
+            }
+            const campaign = input.database.getCampaign(campaignId);
+            const parent = variant.parentVariantId ? input.database.getVariant(variant.parentVariantId) : variant;
+            if (parent.campaignId !== campaignId) throw new Error('Parent variant belongs to another campaign');
+            const scope = evidenceScopeFromContext(campaign, variant,
+              variantWorktreePath(input.orchestrator.paths, campaignId, variant.id), artifactRoot, { artifacts: {
+                current: artifactRoot, parent: variantArtifactDirectory(input.orchestrator.paths, campaignId, parent.id),
+                workflowsSource: path.join(input.orchestrator.paths.worktrees, campaignId, 'frozen-workflows'),
+                priorExperiments: input.database.listVariants(campaignId).map((prior) => ({ id: prior.id,
+                  directory: variantArtifactDirectory(input.orchestrator.paths, campaignId, prior.id) })),
+              } });
+            if (ledger) {
+              sendJson(response, 200, await readEvidenceLedger(scope, {
+                ...(url.searchParams.has('cursor') ? { cursor: url.searchParams.get('cursor')! } : {}),
+                ...(url.searchParams.has('limit') ? { limit: Number(url.searchParams.get('limit')) } : {}),
+              }));
+              return;
+            }
+            const tool = url.searchParams.get('tool') ?? 'list_observations';
+            if (!Object.hasOwn(evidenceReadSchemas, tool)) throw new Error('Only the five read-only evidence tools are available');
+            const rawQuery = url.searchParams.get('query') ?? '{}';
+            if (Buffer.byteLength(rawQuery) > 65_536) throw new Error('Evidence query exceeds 64 KiB');
+            const query: unknown = JSON.parse(rawQuery);
+            const key = JSON.stringify(scope);
+            let access = evidence.get(key);
+            if (access && (await access).manifest.referenceSha256 === null &&
+                (await lstat(scope.referencePath).catch(() => null))?.isFile()) {
+              // An early dashboard read may precede initialization. Never repin an existing reference.
+              if (evidence.get(key) === access) evidence.delete(key);
+              access = evidence.get(key);
+            }
+            if (!access) {
+              access = (async () => {
+                // Turn zero identifies dashboard reads, not a model turn. Each session is immutable.
+                const prepared = await prepareEvidenceInvocation(scope, 0);
+                return loadEvidenceInvocation(prepared.manifestPath, createHash('sha256').update(await readFile(prepared.manifestPath)).digest('hex'));
+              })();
+              evidence.set(key, access);
+              void access.catch(() => { if (evidence.get(key) === access) evidence.delete(key); });
+              if (evidence.size > 8) evidence.delete(evidence.keys().next().value!);
+            }
+            const controller = new AbortController();
+            response.once('close', () => { if (!response.writableEnded) controller.abort(); });
+            const result = await (await access).callTool(tool, query, controller.signal);
+            const content = result.content[0];
+            if (content?.type !== 'text') throw new Error('Invalid evidence response');
+            sendJson(response, result.isError ? 400 : 200, JSON.parse(content.text));
+            return;
+          }
           if (segments[5] === 'artifacts' && !url.searchParams.has('path')) {
             sendJson(response, 200, {
               files: await listFiles(artifactRoot),

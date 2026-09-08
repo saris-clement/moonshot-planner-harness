@@ -6,16 +6,19 @@ import {
   plannerQuestionsFromResponse,
 } from './executionState.js';
 import type { Phase2RunSnapshot, RunFacts } from './types.js';
+import { normalizeExecutionFailure, safeExecutionError, type ExecutionFailure } from './failures.js';
 
 type JsonRecord = Record<string, unknown>;
 
 class PlannerHttpError extends Error {
+  readonly failure: ExecutionFailure;
   constructor(
     readonly status: number,
     readonly code: string | null,
-    message: string,
   ) {
-    super(message);
+    const failure = normalizeExecutionFailure({ code }, { origin: 'http', httpStatus: status })!;
+    super(failure.message);
+    this.failure = failure;
     this.name = 'PlannerHttpError';
   }
 }
@@ -96,6 +99,7 @@ export interface Phase2Result {
   status: string;
   facts: RunFacts | null;
   questions: Phase2QuestionAudit[];
+  failure?: ExecutionFailure | null;
 }
 
 export interface PlannerQuestionRecord {
@@ -163,7 +167,14 @@ export class PlannerClient {
       signal: init.signal ?? AbortSignal.timeout(120_000),
     });
     const text = await response.text();
-    const value = text ? (JSON.parse(text) as unknown) : null;
+    let value: unknown = null;
+    try {
+      value = text ? JSON.parse(text) as unknown : null;
+    } catch {
+      // Parsing errors can contain fragments of the response body.
+      if (!response.ok) throw new PlannerHttpError(response.status, null);
+      throw new Error('The planner returned an invalid JSON response.');
+    }
     await writeFile(
       path.join(this.artifactDirectory, `${artifactName}.json`),
       `${JSON.stringify(value, null, 2)}\n`,
@@ -171,8 +182,7 @@ export class PlannerClient {
     if (!response.ok) {
       throw new PlannerHttpError(
         response.status,
-        isRecord(value) && typeof value.error === 'string' ? value.error : null,
-        `${init.method ?? 'GET'} ${requestPath} failed (${response.status}): ${text.slice(0, 2_000)}`,
+        normalizeExecutionFailure(value, { origin: 'http', httpStatus: response.status })?.code ?? null,
       );
     }
     return value;
@@ -186,12 +196,18 @@ export class PlannerClient {
         : { Accept: 'application/json' },
       signal: AbortSignal.timeout(120_000),
     });
-    const value = (await response.json()) as unknown;
+    let value: unknown;
+    try {
+      value = await response.json();
+    } catch {
+      if (!response.ok) throw new PlannerHttpError(response.status, null);
+      throw new Error('The planner returned an invalid JSON response.');
+    }
     await writeFile(
       path.join(this.artifactDirectory, 'readyz.json'),
       `${JSON.stringify(value, null, 2)}\n`,
     );
-    if (!response.ok) throw new Error(`GET /readyz failed (${response.status})`);
+    if (!response.ok) throw new PlannerHttpError(response.status, null);
     return value;
   }
 
@@ -202,7 +218,7 @@ export class PlannerClient {
     );
     const status = runStatus(run);
     if (status !== 'completed') {
-      throw new Error(`Phase 2 run is not complete: ${caseId}/${runId} status=${status}`);
+      throw new Error('The Phase 2 run is not complete.');
     }
     const finalResponses = await Promise.all([
       this.request('case-final', `/api/planning-cases/${caseId}`),
@@ -249,6 +265,31 @@ export class PlannerClient {
       question: PlannerQuestionRecord;
       consultations: unknown[];
     }) => Promise<Phase2QuestionAnswer>,
+    onSnapshot?: (snapshot: Phase2RunSnapshot) => void | Promise<void>,
+    caseOptions?: Phase2CaseOptions,
+  ): Promise<Phase2Result> {
+    let latestSnapshot: Phase2RunSnapshot | null = null;
+    try {
+      return await this.executePhase2(zipPath, idempotencyPrefix, timeoutMs, expectedArtifactSha,
+        answerQuestion, async (snapshot) => {
+          latestSnapshot = snapshot;
+          await onSnapshot?.(snapshot);
+        }, caseOptions);
+    } catch (error) {
+      const previous = latestSnapshot as Phase2RunSnapshot | null;
+      const failure = previous?.failure ?? normalizeExecutionFailure({ status: 'failed',
+        failure: isRecord(error) ? error.failure : undefined }, { origin: error instanceof PlannerHttpError ? 'http' : 'harness' });
+      if (previous) await onSnapshot?.({ ...previous, status: 'failed', failure });
+      throw Object.assign(new Error(safeExecutionError({ failure })), { failure });
+    }
+  }
+
+  private async executePhase2(
+    zipPath: string,
+    idempotencyPrefix: string,
+    timeoutMs: number,
+    expectedArtifactSha?: string,
+    answerQuestion?: (input: { question: PlannerQuestionRecord; consultations: unknown[] }) => Promise<Phase2QuestionAnswer>,
     onSnapshot?: (snapshot: Phase2RunSnapshot) => void | Promise<void>,
     caseOptions?: Phase2CaseOptions,
   ): Promise<Phase2Result> {
@@ -485,7 +526,10 @@ export class PlannerClient {
       await emitSnapshot(run, runId);
     }
 
-    const finalResponses = await Promise.all([
+    let failure = normalizeExecutionFailure(run, { caseId, runId });
+    // Publish terminal evidence before optional final collection can fail.
+    if (failure) await emitSnapshot(run, runId);
+    const finalRequests = [
       this.request('case-final', `/api/planning-cases/${caseId}`),
       this.request('events', `/api/planning-cases/${caseId}/events`),
       this.request('analysis-runs', `/api/planning-cases/${caseId}/runs`),
@@ -495,7 +539,14 @@ export class PlannerClient {
         'requirements-consultations-final',
         `/api/planning-cases/${caseId}/requirements-consultations`,
       ),
-    ]);
+    ];
+    const finalResponses = failure
+      ? (await Promise.allSettled(finalRequests)).map((result) => result.status === 'fulfilled' ? result.value : null)
+      : await Promise.all(finalRequests);
+    if (failure) {
+      run = { ...(isRecord(run) ? run : {}), events: nestedValue(finalResponses[1], ['events']) };
+      failure = normalizeExecutionFailure(run, { caseId, runId });
+    }
     const finalQuestions = finalResponses[4];
     if (isRecord(finalQuestions) && Array.isArray(finalQuestions.questions)) {
       for (const candidate of finalQuestions.questions.filter(isRecord)) {
@@ -510,7 +561,7 @@ export class PlannerClient {
       path.join(this.artifactDirectory, 'question-audit.json'),
       `${JSON.stringify(questionAudits, null, 2)}\n`,
     );
-    if (status !== 'completed') return { caseId, runId, status, facts: null, questions: questionAudits };
+    if (status !== 'completed') return { caseId, runId, status, facts: null, questions: questionAudits, failure };
     const analysis = await this.request('analysis', `/api/planning-cases/${caseId}/analysis`);
     const facts = extractRunFacts(analysis, run);
     await writeFile(

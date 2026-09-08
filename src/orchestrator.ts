@@ -12,6 +12,7 @@ import {
 } from './config.js';
 import { HarnessDatabase } from './db.js';
 import { AgentRunner, type SourceQuestionAnswer } from './agents.js';
+import { normalizeExecutionFailure } from './failures.js';
 import { runInvestigatorLoop } from './investigatorLoop.js';
 import type { InvestigationState } from './investigator.js';
 import {
@@ -4148,7 +4149,11 @@ export class CampaignOrchestrator {
       await writeFile(path.join(directory, 'result.json'), `${JSON.stringify(result, null, 2)}\n`);
       return result;
     } catch (error) {
-      latestSnapshot = { ...latestSnapshot, status: 'failed' };
+      latestSnapshot = { ...latestSnapshot, status: 'failed', failure: latestSnapshot.failure ?? normalizeExecutionFailure(error, {
+        status: 'failed',
+        ...(isRecord(error) && isRecord(error.failure) ? {} : { origin: isRecord(error) && typeof error.status === 'number' ? 'http' as const : 'harness' as const }),
+        ...(isRecord(error) && typeof error.status === 'number' ? { httpStatus: error.status } : {}),
+      }) };
       throw error;
     } finally {
       const completedAtMs = Date.now();

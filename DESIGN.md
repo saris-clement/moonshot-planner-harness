@@ -51,6 +51,12 @@ Per-session budgets bound turns, primary evaluation attempts, wall time, and age
 
 `runtimeAnswerLedger.ts` freezes repeated semantic answers in investigator campaigns. Its key binds the semantic question (including coverage and option meanings) to campaign/benchmark, resolved pack, workflows, environment, model/variant, versioned answer policy, and target-source context. Transient variant, replicate, run, and question IDs are provenance, not distinct answer scopes. An exclusive immutable file is bound to a SQLite commit event; later reuse checks its file, input, and answer hashes, remaps selected option IDs, and records a per-run receipt. Unbound, missing, or altered entries fail closed. New questions/contexts can still resolve new answers, and complete decision sets are not fixed. Ledger receipts, question audits, decision-set hashes, and cohort comparisons diagnose those limits; this is neither strict global replay nor verified product truth.
 
+### Compact Evidence Access
+
+The investigator receives a single deterministically compacted briefing attachment, bounded to 16 KiB initially and 8 KiB on session continuation. Full result bodies remain in unchanged durable trial receipts, not repeated context/history attachments. Omitted fields carry reference availability; missing capture stays unknown. The same session can use eight `harness_evidence` MCP tools: `list_observations`, `compare_trial`, `inspect_unit`, `read_evidence`, `search_source`, `research_shell`, `research_http`, and `research_output`. A second model is optional, not a retrieval prerequisite.
+
+The coordinator's hash-bound invocation manifest registers all available primary, regression/holdout, and target-excluded evidence, including registered prior experiments and legacy controls. Access does not make regression data unseen validation. Opaque references bind observations to their benchmark, arm, replica, label basis, and source policy; excluded source is separately filtered. No tool argument can expand scope or select execution cohorts. Bounded paginated responses expose omissions and provenance, and per-call request/response receipts remain under ignored `.data/`.
+
 ## Sources Of Truth
 
 | Data | Authority |
@@ -72,6 +78,8 @@ Each variant has a distinct planner worktree, image tag, Compose project, host p
 Docker builds use the Dockerfile from a clean frozen seed checkout, and stacks use that checkout's Compose definition. Candidate changes are limited to configured `server/src/` and `server/test/` prefixes, so generated patches cannot alter build secrets, Compose mounts, package lifecycle scripts, or teardown targets.
 
 Candidate tests execute from a trusted extension of the Docker builder image with Linux Git, no network, a read-only root filesystem, bounded memory/CPU/PIDs, no Linux capabilities, and only disposable tmpfs writes. `/tmp` permits execution because planner script tests create executable fixtures there; it is destroyed with the container. Generated tests never execute directly on the host checkout.
+
+Research uses a separate operator-built `Dockerfile.research` image, resolved to an immutable image ID per invocation, with no automatic build/pull. Arbitrary shell commands run as non-root with a read-only root, no network, bounded resources, read-only candidate/source/sanitized evidence snapshots, and fresh writable `/scratch` tmpfs. Native edits keep their existing worktree path. Neither worker nor broker receives host credentials or the Docker socket. Brokered `curl`/`research_http` allow only approved public HTTPS GET/HEAD, rechecking DNS and redirects; local APIs are deliberately not proxied. The same local run data is available through typed tools and the sanitized bundle. See [the sandbox contract](src/researchSandbox.md) and [build/smoke commands](scripts/README.md).
 
 The deployment integration test is excluded because the planner's production `.dockerignore` intentionally omits `.github/`, and candidate paths cannot modify deployment, Docker, or workflow files. Type checking and the other server tests remain mandatory.
 
@@ -96,7 +104,7 @@ Final evaluation runs the configured repetitions of the primary pack and every h
 
 ## Security
 
-- Child commands use argument arrays rather than shell interpolation.
+- Coordinator child commands use argument arrays rather than host shell interpolation; arbitrary research command strings execute only inside the isolated worker.
 - Campaign ZIP hashes are verified before case creation.
 - S3 object keys are contained beneath the variant artifact directory.
 - Environment files and secrets are not copied into reports.
@@ -112,6 +120,10 @@ Every state transition emits a durable event. Failed variants retain logs, patch
 
 Diagnosis failure has its own persisted status and error and never clears measured facts, scores, or artifact-completeness state. Human label edits mark existing diagnoses stale. A stale, missing, or hash-invalid current-parent diagnosis blocks the next round unless the frozen campaign configuration contains the explicit missing-parent opt-out.
 
+Execution failure diagnostics are separate from model-generated diagnosis and standard-result review. A blocked excluded cohort leaves completed standard results reviewable, without implying promotion eligibility. Normalized failures retain allowlisted codes, checkpoint data, and provenance, not raw exception/model messages. For existing failed slots, matching case/run archives may supply legacy codes or data without mutating SQLite or artifacts; absent or unsafe evidence stays unknown. An observed validator rejection is not a verified semantic explanation.
+
+The harness can consume optional versioned candidate-boundary details from a `run.failed` event into `failure.details`. Planner-side emission belongs to a separate future planner commit/PR outside PR47. Only validated IDs/counts and fingerprints of unknown selections are accepted, never raw model output. Exact details absent from old archives are unrecoverable, not inferred from error codes.
+
 An in-flight external process is currently cooperative rather than cancellable. A stop request is observed between experiments and before promotion.
 
 ## Live Dashboard Projection
@@ -122,7 +134,7 @@ Live counts are deliberately scoped to one benchmark replicate and labeled as pa
 
 Planner questions are separate from imported requirements-pack blockers. The experiment question view shows only questions sent directly to the harness and preserves their answers, resolution source, and evidence. Question identity is `(benchmark, replicate, id)`, so a provider-reused ID cannot collapse observations from different executions. Langfuse links use recorded planner case IDs, which already map to trace sessions and `case:<caseId>` tags, without adding planner instrumentation.
 
-There is no archive hydration path. Campaign APIs expose the execution projection persisted on each variant, and the frontend treats absent execution slots as pending.
+There is no live execution archive hydration path. Campaign APIs expose the execution projection persisted on each variant, and the frontend treats absent execution slots as pending. Read-only failure diagnostics may supplement an existing failed slot from matching archived runtime/events; this does not create executions or rewrite historical state.
 
 ## Web Console
 
@@ -133,6 +145,8 @@ The shell uses a compact collapsible desktop sidebar and an accessible mobile dr
 Variant creation writes the initial report before mutation or evaluation starts. Default search keeps an immutable hypothesis; investigator mode exposes the latest preregistration and retains per-action revisions in its archive. Later refreshes add parent comparisons, protocol-aware normal/excluded measurements, human-label coverage, diagnosis status, and a deterministic conclusion. Investigator reports also record session/action/budget state and distinguish raw-replicate score basis from consensus observations. Missing final facts yield an explicit failed or incomplete conclusion, not a pending or inferred successful result. A lower build count or provisional score is never phrased as verified improvement. Optional human notes are read from a separate sidecar and embedded verbatim without becoming scoring truth.
 
 The Overview investigator section and Investigation detail tab keep agent budgets separate from planner usage. The timeline renders known result fields compactly, leaves unknown results uninterpreted, and loads artifact paths/raw details only on expansion. `investigator.updated` and running-session polling refresh the view while preserving scoped disclosure, scroll, and focus state. Session chat is not a dashboard surface.
+
+Failure diagnostics, **Explore evidence**, and **Evidence access** are lazy disclosures, separate from human label review. They preserve PR7 live behavior: stable mounted controls, scroll/focus/disclosures, unsaved drafts, deferred structural updates around open native selects, and last-good content during refresh. Diagnostic copying includes only normalized sanitized fields; missing historical access records are not invented.
 
 Screening matrices use the latest primary action's completed replicate facts first, then its current execution snapshot count, then screening configuration. Action timestamps separate successive trials and prevent stale screening snapshots from appearing as completed final runs. Final matrices keep the complete baseline/final configured slots. Changed defaults do not rewrite archived measurements: legacy trials retain their recorded repetition counts even without the screening config field.
 
@@ -161,13 +175,17 @@ not as an independent observation.
 
 ## Change History
 
+### 2026-09-08 - Bounded Research And Failure Evidence
+
+Added a compact single briefing, scoped on-demand evidence, isolated research commands, and separate failure diagnostics to reduce repeated context while preserving durable evidence and review authority. Four-hour investigation and two-parallel-replica screening settings are unchanged. No full new campaign was run to establish an improvement; planner event-detail emission remains a separate future change outside PR47.
+
 ### 2026-09-08 - Four-Hour Investigation With Parallel Screening
 
 New campaigns now freeze two screening replicas and a four-hour investigation budget. The live runner executes screening replicas in parallel; baseline and final V2 validation retain six parallel cases per candidate. The budget permits multiple sequential revision cycles, not four hours of overhead on a single planner run. Explicit overrides and archived campaign limits remain unchanged.
 
 ### 2026-09-08 - Lightweight Full-Primary Screening
 
-The PR47 autonomous run completed one two-replicate screening in approximately 82 minutes. Its provisional accuracy fell from 35.2% to 33.2%; a revised patch passed 103 targeted tests but was not evaluated. The session abandoned at turn 7 with approximately 25 minutes remaining, without finalization or an improvement claim. Future screening therefore defaults to one full-primary replicate while preserving repeated baseline/final cohorts. See the [aggregate investigation summary](docs/experiments/pr47-autonomous-1/investigation-summary.md); generated records and the archived live configuration remain unchanged.
+The PR47 autonomous run completed one two-replicate screening in approximately 82 minutes. Its provisional accuracy fell from 35.2% to 33.2%; a revised patch passed targeted tests but was not evaluated. The session abandoned at turn 7 with approximately 25 minutes remaining, without finalization or an improvement claim. The initial follow-up used one full-primary screening replicate, superseded by the two-parallel-replica/four-hour defaults above; baseline/final cohorts stayed repeated. See the [aggregate investigation summary](docs/experiments/pr47-autonomous-1/investigation-summary.md); generated records and the archived live configuration remain unchanged.
 
 ### 2026-09-05 - Initial UI-first harness
 
