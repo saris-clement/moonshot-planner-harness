@@ -65,9 +65,12 @@ function filterControls(context, filters, rounds, prefix = '') {
     },
   });
   let timer;
+  const pathname = location.pathname;
   search.addEventListener('input', () => {
     clearTimeout(timer);
-    timer = setTimeout(() => updateFilter(context, 'q', search.value.trim()), 120);
+    timer = setTimeout(() => {
+      if (search.isConnected && location.pathname === pathname) updateFilter(context, 'q', search.value.trim());
+    }, 120);
   });
   return [
     element('label', { attributes: { for: searchId } }, [element('span', { text: `${prefix ? 'Mobile ' : ''}Search experiments` }), search]),

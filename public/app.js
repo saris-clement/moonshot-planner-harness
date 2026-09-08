@@ -45,9 +45,13 @@ async function reloadCampaigns() {
   state.campaigns = await api('/api/campaigns');
 }
 
-async function loadCampaign(campaignId) {
-  if (state.campaign?.id === campaignId) return;
+async function loadCampaign(campaignId, token) {
+  if (state.campaign?.id === campaignId) {
+    if (!state.events) connectEvents();
+    return;
+  }
   const details = await api(`/api/campaigns/${encodeURIComponent(campaignId)}`);
+  if (token !== renderToken || parseRoute().params.campaignId !== campaignId) return;
   state.campaign = {
     ...details.campaign,
     variants: details.variants,
@@ -64,16 +68,17 @@ async function loadCampaign(campaignId) {
 }
 
 async function refreshCurrent() {
-  if (!state.campaign) return;
+  if (!state.campaign || parseRoute().params.campaignId !== state.campaign.id) return;
   if (state.refreshRunning) {
     state.refreshQueued = true;
     return;
   }
   state.refreshRunning = true;
+  const campaignId = state.campaign.id;
+  const source = state.events;
   try {
-    const campaignId = state.campaign.id;
     const details = await api(`/api/campaigns/${encodeURIComponent(campaignId)}`);
-    if (state.campaign?.id !== campaignId) return;
+    if (state.events !== source || state.campaign?.id !== campaignId || parseRoute().params.campaignId !== campaignId) return;
     state.campaign = {
       ...details.campaign,
       variants: details.variants,
@@ -86,9 +91,9 @@ async function refreshCurrent() {
     state.campaigns = state.campaigns.map((campaign) =>
       campaign.id === campaignId ? { ...state.campaign } : campaign,
     );
-    if (!hasDirtyDraft() && parseRoute().params.campaignId === campaignId) await renderCurrent(true);
+    if (parseRoute().params.campaignId === campaignId) await renderCurrent();
   } catch (error) {
-    notify(error.message);
+    if (state.events === source && parseRoute().params.campaignId === campaignId) notify(error.message);
   } finally {
     state.refreshRunning = false;
     if (state.refreshQueued) {
@@ -106,15 +111,18 @@ function connectEvents() {
   );
   state.events = source;
   source.onopen = () => {
+    if (state.events !== source) return;
     state.connection = 'Live ledger';
     const value = document.querySelector('.connection-state span:last-child');
     if (value && !hasDirtyDraft()) value.textContent = state.connection;
   };
   source.onerror = () => {
+    if (state.events !== source) return;
     state.connection = 'Reconnecting';
     const value = document.querySelector('.connection-state span:last-child');
     if (value && !hasDirtyDraft()) value.textContent = state.connection;
   };
+  const refresh = () => { if (state.events === source) void refreshCurrent(); };
   for (const eventName of [
     'campaign.updated',
     'campaign.resumed',
@@ -132,8 +140,9 @@ function connectEvents() {
     'target_excluded.updated',
     'target_excluded.question_waiting',
     'target_excluded.label_updated',
-  ]) source.addEventListener(eventName, refreshCurrent);
+  ]) source.addEventListener(eventName, refresh);
   source.addEventListener('reports.refreshed', () => {
+    if (state.events !== source) return;
     if (state.campaign) invalidateExperimentMarkdown(state.campaign.id);
     void refreshCurrent();
   });
@@ -259,22 +268,20 @@ function routeTitle(route) {
   return `${titles[route.name] ?? 'Not found'} · Planner Eval`;
 }
 
-async function renderCurrent(preserveLiveView = false) {
+async function renderCurrent() {
   const token = ++renderToken;
   const route = parseRoute();
   document.title = routeTitle(route);
+  if (state.campaign?.id !== route.params.campaignId) {
+    state.events?.close();
+    state.events = null;
+    state.connection = 'Local archive';
+    if (!route.params.campaignId) state.campaign = null;
+  }
   try {
     if (state.campaigns.length === 0) await reloadCampaigns();
-    if (route.params.campaignId) await loadCampaign(route.params.campaignId);
+    if (route.params.campaignId) await loadCampaign(route.params.campaignId, token);
     if (token !== renderToken) return;
-    const preserve = preserveLiveView && (route.name === 'overview' || (route.name === 'experiment' && route.query.get('tab') === 'investigation'));
-    const scroll = preserve ? { x: window.scrollX, y: window.scrollY } : null;
-    const positions = preserve ? [...document.querySelectorAll('[data-live-key]')].map((node) => ({
-      key: node.dataset.liveKey, top: node.scrollTop, left: node.scrollLeft,
-    })) : [];
-    const focused = preserve ? document.activeElement : null;
-    const focusKey = focused?.closest('[data-live-key]')?.dataset.liveKey;
-    const focusHref = focused?.getAttribute('href');
     let content;
     if (route.name === 'campaigns') content = campaignsPage(context);
     else if (route.name === 'new-campaign') content = newCampaignPage(context);
@@ -288,19 +295,6 @@ async function renderCurrent(preserveLiveView = false) {
       element('p', { text: 'This path is not part of the local evaluation console.' }),
     ]);
     renderShell({ state, route, content, navigate });
-    if (preserve) {
-      for (const position of positions) {
-        const node = document.querySelector(`[data-live-key="${CSS.escape(position.key)}"]`);
-        if (node) { node.scrollTop = position.top; node.scrollLeft = position.left; }
-      }
-      const container = focusKey ? document.querySelector(`[data-live-key="${CSS.escape(focusKey)}"]`) : document;
-      const target = focusHref ? [...(container?.querySelectorAll('a') ?? [])].find((link) => link.getAttribute('href') === focusHref)
-        : focused?.tagName === 'SUMMARY' ? container?.querySelector('summary')
-        : focused?.matches('[data-live-key]') ? container
-        : focused?.id ? document.getElementById(focused.id) : null;
-      target?.focus({ preventScroll: true });
-      window.scrollTo(scroll.x, scroll.y);
-    }
   } catch (error) {
     if (token !== renderToken) return;
     renderShell({

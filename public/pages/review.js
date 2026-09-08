@@ -188,12 +188,14 @@ function reviewDetail(context, campaign, variant, benchmark, unit, suggestion, l
       element('p', { text: 'Inspect measured output and the blind-judge suggestion before recording human truth.' }),
     ]);
   }
-  const draftKey = `${campaign.id}\u0000${variant.id}\u0000${benchmark}\u0000${unit.key}`;
+  const draftKey = `${campaign.id}\u0000${variant.id}\u0000${scope}\u0000${benchmark}\u0000${unit.key}`;
   const draft = state.reviewDraft?.key === draftKey ? state.reviewDraft : null;
   const expectedDecision = draft?.expectedDecision ?? label?.expectedDecision ?? suggestion?.expectedDecision ?? 'build';
   const classification = draft?.classification ?? label?.classification ?? suggestion?.classification ?? 'uncertain';
   const rationale = draft?.rationale ?? (label?.status === 'verified' ? label.rationale : '');
-  const form = element('form', { className: 'label-form' });
+  const form = element('form', { className: 'label-form', attributes: {
+    'data-live-key': JSON.stringify([scope, benchmark, unit.key]), 'data-live-pristine': !draft?.dirty,
+  } });
   const decisionField = selectWithOptions(
     'expectedDecision',
     'Expected disposition',
@@ -211,6 +213,7 @@ function reviewDetail(context, campaign, variant, benchmark, unit, suggestion, l
     attributes: { id: 'review-rationale', name: 'rationale', required: true, placeholder: 'Record why the source proves this disposition' },
   });
   const updateDraft = () => {
+    form.removeAttribute('data-live-pristine');
     const values = new FormData(form);
     setReviewDraft({
       key: draftKey,
@@ -231,6 +234,7 @@ function reviewDetail(context, campaign, variant, benchmark, unit, suggestion, l
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     const values = new FormData(form);
+    const submittedDraft = state.reviewDraft;
     try {
       await api(
         scope === 'target-excluded'
@@ -245,7 +249,7 @@ function reviewDetail(context, campaign, variant, benchmark, unit, suggestion, l
           rationale: values.get('rationale'),
         }),
       });
-      clearReviewDraft();
+      if (state.reviewDraft === submittedDraft) clearReviewDraft();
       context.notify('Verified label saved');
       await context.refreshCurrent();
     } catch (error) {
@@ -334,13 +338,13 @@ export function reviewPage(context, route) {
       unit: '',
       scope: target ? 'target-excluded' : '',
     }));
-    if (!moved) context.render();
+    if (!moved) event.target.value = scope === 'target-excluded' ? scope : benchmark;
   });
   const filterSelect = element('select', { attributes: { 'aria-label': 'Filter requirement units' } });
   for (const [value, label] of filters) filterSelect.append(option(value, label, value === filter));
   filterSelect.addEventListener('change', (event) => {
     const moved = context.navigate(reviewUrl(campaign, variant, { benchmark, filter: event.target.value, unit: '', scope }));
-    if (!moved) context.render();
+    if (!moved) event.target.value = filter;
   });
   toolbar.append(benchmarkSelect, filterSelect);
 
@@ -356,7 +360,7 @@ export function reviewPage(context, route) {
         click: () => context.navigate(reviewUrl(campaign, variant, { benchmark, filter, unit: unit.key, scope })),
       },
     }, [element('b', { text: `${unit.kind} · ${unit.ref.anchor}` }), element('span', { text: unit.semantics })]);
-    body.append(element('tr', { className: unit.key === selectedUnit ? 'selected' : '' }, [
+    body.append(element('tr', { className: unit.key === selectedUnit ? 'selected' : '', attributes: { 'data-live-key': unit.key } }, [
       element('td', { className: 'review-unit-cell' }, [button]),
       tableCell(unit.decision, `decision-${unit.decision}`),
       tableCell(expectedFor(unit, label, suggestion) ?? '—'),

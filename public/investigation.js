@@ -1,8 +1,10 @@
 import { api } from './api.js';
+import { liveRegion, mountLiveRegions, updateLiveView } from './live.js';
 import { element, formatAgreement, formatDuration, formatMoney, formatNumber, formatPercent, statusLabel, titleCase } from './dom.js';
 import { primaryScreening } from './models.js';
 import { routeLink, sectionHeading } from './ui.js';
 import { experimentHelpButton } from './experimentHelp.js';
+import { helpButton } from './help.js';
 
 export const investigatorDefaults = {
   primaryReplicates: 2,
@@ -35,20 +37,22 @@ export function investigationSummary(investigation) {
   return `${trials} primary trial${trials === 1 ? '' : 's'} / ${tests} test${tests === 1 ? '' : 's'}; latest: ${actionOutcome(actions.at(-1))}`;
 }
 
-function disclosure(key, label, render) {
+const disclosureVersions = new WeakMap();
+const archiveVersions = new WeakMap();
+
+function disclosure(key, label, render, version) {
   const details = element('details', { attributes: { 'data-live-key': key } }, [element('summary', { text: label })]);
-  let loaded = false;
-  if (document.querySelector(`details[data-live-key="${CSS.escape(key)}"]`)?.open) {
-    details.open = true;
-    loaded = true;
-    details.append(render());
-  }
-  details.addEventListener('toggle', () => {
-    if (!details.open || loaded) return;
-    loaded = true;
-    details.append(render());
+  return liveRegion(details, (mounted) => {
+    const show = () => {
+      if (!mounted.open || (mounted.children.length > 1 && version !== undefined && disclosureVersions.get(mounted) === version)) return;
+      const content = render();
+      if (mounted.children.length > 1) updateLiveView(mounted.children[1], content);
+      else { mounted.append(content); mountLiveRegions(content); }
+      disclosureVersions.set(mounted, version);
+    };
+    mounted.ontoggle = show;
+    show();
   });
-  return details;
 }
 
 export function investigationStatus(campaign, variant) {
@@ -78,10 +82,11 @@ export function investigationStatus(campaign, variant) {
       element('p', { text: investigationSummary(investigation) }),
     ]),
     element('dl', { className: 'investigation-metrics', attributes: { 'aria-label': 'Investigator session and budgets' } }, values.map(([label, value]) =>
-      element('div', {}, [element('dt', { text: label }), element('dd', { text: value })]),
+      element('div', {}, [element('dt', { text: label }, label === 'Wall time' ? [helpButton(label)] : []), element('dd', { text: value })]),
     )),
     investigation.reason ? disclosure(`${variant.id}:reason`, 'Recorded reason (unverified interpretation)', () =>
       element('p', { className: 'investigation-prose', text: investigation.reason }),
+      investigation.reason,
     ) : null,
   ]);
 }
@@ -168,27 +173,44 @@ export function investigationPanel(campaign, variant) {
           ...logPaths.map((log) => element('p', { className: 'identifier', text: log })),
           routeLink('Browse experiment artifacts', `/campaigns/${encodeURIComponent(campaign.id)}/experiments/${encodeURIComponent(variant.id)}?tab=artifacts`),
         ]);
-        // Resolve links from the archive listing, never from agent-supplied URLs.
-        api(root).then(({ files }) => {
-          const directory = String(action.artifactDirectory ?? (/^action-\d+$/.test(action.id) ? `investigation/${action.id}` : '')).replace(/\/$/, '');
-          const relativeDirectory = directory.includes(`/${variant.id}/`) ? directory.split(`/${variant.id}/`).at(-1) : directory;
-          const matches = files.filter(({ path }) =>
-            logPaths.some((log) => typeof log === 'string' && (log === path || log.endsWith(`/${path}`))) ||
-            (relativeDirectory && path.startsWith(`${relativeDirectory}/`)),
-          );
-          archive.append(...matches.map((file) => element('a', {
-            text: file.path,
-            attributes: { href: `${root}?path=${encodeURIComponent(file.path)}`, target: '_blank', rel: 'noreferrer' },
-          })));
-          if (!matches.length) archive.append(element('p', { className: 'muted', text: 'No matching archived files yet. Browse the experiment archive for other evidence.' }));
-        }).catch((error) => archive.append(element('p', { className: 'error-text', text: `Archive unavailable: ${error.message}` })));
-        return archive;
-      }));
+        return liveRegion(archive, function refreshArchive(mounted) {
+          const version = JSON.stringify([action.artifactDirectory, logPaths, action.status]);
+          if (archiveVersions.get(mounted) === version) return;
+          archiveVersions.set(mounted, version);
+          mounted.querySelector('.archive-error')?.remove();
+          // Resolve links from the archive listing, never from agent-supplied URLs.
+          api(root).then(({ files }) => {
+            if (!mounted.isConnected || archiveVersions.get(mounted) !== version) return;
+            const directory = String(action.artifactDirectory ?? (/^action-\d+$/.test(action.id) ? `investigation/${action.id}` : '')).replace(/\/$/, '');
+            const relativeDirectory = directory.includes(`/${variant.id}/`) ? directory.split(`/${variant.id}/`).at(-1) : directory;
+            const matches = files.filter(({ path }) =>
+              logPaths.some((log) => typeof log === 'string' && (log === path || log.endsWith(`/${path}`))) ||
+              (relativeDirectory && path.startsWith(`${relativeDirectory}/`)),
+            );
+            const listing = archive.cloneNode(true);
+            listing.append(...matches.map((file) => element('a', {
+              text: file.path,
+              attributes: { href: `${root}?path=${encodeURIComponent(file.path)}`, target: '_blank', rel: 'noreferrer' },
+            })));
+            if (!matches.length) listing.append(element('p', { className: 'muted', text: 'No matching archived files yet. Browse the experiment archive for other evidence.' }));
+            updateLiveView(mounted, listing);
+          }).catch((error) => {
+            if (!mounted.isConnected || archiveVersions.get(mounted) !== version) return;
+            mounted.append(element('div', { className: 'archive-error' }, [
+              element('p', { className: 'error-text', text: `Archive unavailable: ${error.message}` }),
+              element('button', {
+                className: 'button button-outline', text: 'Retry archive', attributes: { type: 'button' },
+                on: { click: () => { archiveVersions.delete(mounted); refreshArchive(mounted); } },
+              }),
+            ]));
+          });
+        });
+      }, JSON.stringify([action.artifactDirectory, logPaths, action.status])));
       if (action.result !== null && action.result !== undefined) content.append(disclosure(`${key}:raw`, 'Raw result (unverified; may include model output)', () =>
         element('pre', { className: 'investigation-raw', text: JSON.stringify(action.result, null, 2), attributes: { tabindex: '0', 'data-live-key': `${key}:raw-scroll` } }),
       ));
       return content;
-    });
+    }, JSON.stringify(action));
     body.append(element('tr', { attributes: { 'data-testid': `investigation-action-${action.id}` } }, [
       element('th', { attributes: { scope: 'row' } }, [
         element('b', { text: `${index + 1}. ${actionNames[action.kind] ?? action.kind}` }),

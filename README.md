@@ -41,6 +41,8 @@ npm run cli -- serve --port 4173
 
 Open `http://127.0.0.1:4173` and select **New campaign**. The UI collects and validates the research goal, exact seed revisions, repository paths, environment file, primary ZIP, holdout ZIP, repeat count, search width, and automatic-mode limit. An optional target-excluded workflow freezes protocol V2 at campaign creation and requires exactly two repetitions.
 
+**Help** in the top bar explains the workflow, investigation loop, finalization, and review. Question-mark buttons beside timing labels explain each clock and its scope.
+
 The console uses real History API routes and can be refreshed at any valid deep link:
 
 - `/` and `/campaigns/new`
@@ -57,6 +59,8 @@ Optional diagnosis-time Langfuse reads use `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC
 All campaign operations after the server starts are available in the UI: create, baseline, retry failed baseline, run a supervised or automatic round, stop, resume, review labels, inspect planner questions and their answers, inspect artifacts, open Langfuse traces, read safely rendered experiment Markdown with a heading-derived section navigator, and promote a candidate. A V2 baseline automatically calibrates its target-excluded guard; later V2 retries rerun only the excluded cohort and reuse archived standard artifacts.
 
 The overview separates live execution from durable experiment results. Each active experiment matrix synthesizes every configured benchmark and replicate slot, then joins persisted execution state and final replicate facts. Completed, current, and pending rows remain visible together; pending measurements use dashes rather than zero. V2 target sections show only excluded executions and identify the standard primary rows as the comparison control. Live decisions are the latest accepted checkpoint and can change after a planner question or successor run.
+
+Polling and server events update mounted views in place, preserving scroll, focus, disclosures, and unsaved inputs. Structural changes around an open native select wait until it closes; other data continues refreshing. Markdown and artifacts retain their last-good content while updates load. To verify native menu behavior in a real browser window (macOS headless Chrome dismisses native menus itself), run `npm run test:e2e -- --grep 'live target questions' --headed`.
 
 The experiment ledger supports URL-synchronized lifecycle, round, lineage, result, search, and sort controls. The lineage view uses the same lexicographic score ordering as promotion and keeps verified accuracy, provisional accuracy, agreement, holdout state, cohort drift, latency, and planner tokens separate rather than manufacturing a composite score.
 

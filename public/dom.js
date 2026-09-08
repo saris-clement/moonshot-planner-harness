@@ -1,3 +1,12 @@
+const listeners = new WeakMap();
+
+export function syncListeners(target, source) {
+  for (const [name, listener] of Object.entries(listeners.get(target) ?? {})) target.removeEventListener(name, listener);
+  const next = listeners.get(source) ?? {};
+  for (const [name, listener] of Object.entries(next)) target.addEventListener(name, listener);
+  listeners.set(target, next);
+}
+
 export function element(tag, options = {}, children = []) {
   const value = document.createElement(tag);
   if (options.className) value.className = options.className;
@@ -10,6 +19,7 @@ export function element(tag, options = {}, children = []) {
   for (const [name, listener] of Object.entries(options.on ?? {})) {
     value.addEventListener(name, listener);
   }
+  listeners.set(value, options.on ?? {});
   value.append(...children.filter(Boolean));
   return value;
 }
