@@ -16,7 +16,10 @@ export const InvestigatorActionSchema = z.discriminatedUnion('action', [
       testFiles: z.array(z.string().min(1).max(2_048)).optional(),
     })
     .strict(),
-  z.object({ action: z.literal('evaluate_primary'), ...actionFields }).strict(),
+  // Raw reviews reach strict coordinator admission so rejections are archived with measured turn usage.
+  z.object({ action: z.literal('probe'), ...actionFields, review: z.unknown().optional(),
+    testFiles: z.array(z.string().min(1).max(2_048)).min(1).max(30) }).strict(),
+  z.object({ action: z.literal('evaluate_primary'), ...actionFields, review: z.unknown().optional() }).strict(),
   z.object({ action: z.literal('finalize'), ...actionFields }).strict(),
   z.object({ action: z.literal('abandon'), ...actionFields }).strict(),
 ]);
@@ -34,6 +37,8 @@ export interface InvestigationActionRecord {
   artifactDirectory: string | null;
   result: unknown;
   error: string | null;
+  /** False only for a rejected diagnostic admission, before primary execution. Historical attempts still count. */
+  admitted?: boolean;
 }
 
 export interface InvestigationState {
@@ -58,6 +63,17 @@ export interface InvestigatorTurnResult {
   usage: { tokens: number | null; costUsd: number | null };
 }
 
+/** Invalid final requests do not erase usage reported by a completed model turn. */
+export class InvestigatorOutputParseError extends Error {
+  constructor(
+    readonly sessionId: string,
+    readonly usage: InvestigatorTurnResult['usage'],
+  ) {
+    super('investigator returned invalid structured final output');
+    this.name = 'InvestigatorOutputParseError';
+  }
+}
+
 /** Consume OpenCode JSONL without retaining tool payloads or concatenating progress into the answer. */
 export class InvestigatorEventParser {
   private readonly decoder = new StringDecoder('utf8');
@@ -65,7 +81,6 @@ export class InvestigatorEventParser {
   private sessionId: string | null = null;
   private finalText = '';
   private finishReason: string | null = null;
-  private steps = 0;
   private tokens: number | null = 0;
   private costUsd: number | null = 0;
 
@@ -121,7 +136,6 @@ export class InvestigatorEventParser {
       this.finishReason = null;
     }
     if (event.type === 'step_finish') {
-      this.steps += 1;
       this.finishReason = typeof part.reason === 'string' ? part.reason : null;
       const tokens =
         part.tokens && typeof part.tokens === 'object' ? part.tokens as Record<string, unknown> : {};
@@ -149,21 +163,26 @@ export class InvestigatorEventParser {
     this.consume(this.pending);
     this.pending = '';
     if (!this.sessionId) throw new Error('investigator output is missing a session ID');
-    if (!this.finalText || (this.finishReason !== null && this.finishReason !== 'stop')) {
+    if ((!this.finalText && this.finishReason === null) || (this.finishReason !== null && this.finishReason !== 'stop')) {
       throw new Error('investigator returned incomplete final output');
     }
     const text = this.finalText.trim();
     const fenced = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(text)?.[1];
+    // A prior tool step's usage is not the total when the final step has no completion event.
+    const usage = {
+      tokens: this.finishReason === 'stop' ? this.tokens : null,
+      costUsd: this.finishReason === 'stop' ? this.costUsd : null,
+    };
     let action: InvestigatorAction;
     try {
       action = InvestigatorActionSchema.parse(JSON.parse(fenced ?? text) as unknown);
     } catch {
-      throw new Error('investigator returned invalid structured final output');
+      throw new InvestigatorOutputParseError(this.sessionId, usage);
     }
     return {
       sessionId: this.sessionId,
       action,
-      usage: { tokens: this.steps ? this.tokens : null, costUsd: this.steps ? this.costUsd : null },
+      usage,
     };
   }
 }

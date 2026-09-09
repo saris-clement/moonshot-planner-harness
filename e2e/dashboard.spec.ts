@@ -1707,6 +1707,75 @@ test('retains a central dirty review draft across SSE and guards navigation befo
   await expect(page).toHaveURL(`${baseUrl}/campaigns/${campaignId}/overview`);
 });
 
+test('offline diagnostic probes show unverified receipts without primary credit or eager review reads', async ({ page }) => {
+  const details = await (await page.request.get(`${baseUrl}/api/campaigns/${investigatorCampaignId}`)).json();
+  const variant = details.variants.find((item: { id: string }) => item.id === investigatorId);
+  const historicalTrial = variant.investigation.actions.find((action: { id: string }) => action.id === 'primary-trial');
+  const diagnosticReview = {
+    reviewHash: `sha256:${'2'.repeat(64)}`, artifactHash: `sha256:${'3'.repeat(64)}`,
+    artifactPath: 'diagnostic-review.json', interpretationStatus: 'unverified_model_judgment',
+  };
+  historicalTrial.result.diagnosticReview = diagnosticReview;
+  const probe = { ...historicalTrial, id: 'probe', kind: 'probe', artifactDirectory: 'investigation/probe', result: {
+    kind: 'diagnostic_probe', executionPassed: true, providerCalls: 0,
+    imageId: `sha256:${'4'.repeat(64)}`, inputHash: `sha256:${'5'.repeat(64)}`,
+    testFiles: ['server/test/diagnostic.test.ts'], logPaths: ['investigation/probe/probe.log'],
+    interpretation: 'Offline fixtures do not establish planner correctness.', diagnosticReview,
+  } };
+  const blocked = { ...historicalTrial, id: 'not-admitted', admitted: false, status: 'failed', result: null, error: 'Not admitted: diagnostic review required' };
+  variant.investigation.actions = [historicalTrial,
+    { ...historicalTrial, id: 'admitted-failure', admitted: true, status: 'failed', result: null, error: 'Planner execution failed.' },
+    probe, blocked,
+    { ...blocked, id: 'not-admitted-no-error', status: 'completed', error: null },
+  ];
+  await page.route(`${baseUrl}/api/campaigns/${investigatorCampaignId}`, (route) => route.fulfill({ json: details }));
+  let archiveReads = 0;
+  const rawReads: string[] = [];
+  await page.route(`**/variants/${investigatorId}/artifacts*`, (route) => {
+    const artifactPath = new URL(route.request().url()).searchParams.get('path');
+    if (artifactPath) { rawReads.push(artifactPath); return route.fulfill({ json: { raw: 'FULL_REVIEW_MUST_NOT_AUTOLOAD' } }); }
+    archiveReads++;
+    return route.fulfill({ json: { files: [{ path: 'investigation/probe/diagnostic-review.json' }, { path: 'investigation/probe/probe.log' }] } });
+  });
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 1000 });
+    const before = archiveReads;
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${investigatorId}?tab=investigation`);
+    const status = page.getByTestId(`investigator-${investigatorId}`);
+    await expect(status).toContainText('2 primary trials / 0 tests; latest: Not admitted: diagnostic review required');
+    await expect(status.locator('dt', { hasText: /^Primary trials$/ }).locator('..')).toContainText('2 / 3');
+    await expect(page.locator('.investigation-comparison')).toContainText('primary-trial');
+    const row = page.getByTestId('investigation-action-probe');
+    await expect(row).toContainText('Offline diagnostic probe');
+    await expect(row).toContainText('Execution passed (diagnostic only)');
+    await expect(row).not.toContainText('Tests passed');
+    await expect(row.locator('.investigation-score')).toHaveCount(0);
+    for (const id of ['not-admitted', 'not-admitted-no-error']) {
+      const rejected = page.getByTestId(`investigation-action-${id}`);
+      await expect(rejected).toContainText('Not admitted: diagnostic review required');
+      await expect(rejected).not.toContainText('Primary evaluation failed');
+    }
+    await row.getByText('Hypothesis, result and logs', { exact: true }).click();
+    await expect(row).toContainText(`Input hash: ${probe.result.inputHash}`);
+    await expect(row).toContainText(`Image: ${probe.result.imageId}`);
+    await expect(row).toContainText('Provider calls: 0');
+    await expect(row).toContainText('not full configured tests, primary evaluation, or promotion');
+    for (const id of ['probe', 'primary-trial']) {
+      const action = page.getByTestId(`investigation-action-${id}`);
+      if (id !== 'probe') await action.getByText('Hypothesis, result and logs', { exact: true }).click();
+      await expect(action).toContainText(`Review hash: ${diagnosticReview.reviewHash}`);
+      await expect(action).toContainText(`Review artifact hash: ${diagnosticReview.artifactHash}`);
+      await expect(action).toContainText('Diagnostic review / unverified model judgment');
+      await expect(action).toContainText('diagnostic-review.json');
+    }
+    expect(archiveReads).toBe(before);
+    await row.getByText('Artifact paths and logs', { exact: true }).click();
+    await expect(row.getByRole('link', { name: 'investigation/probe/diagnostic-review.json' })).toHaveAttribute('href', /path=investigation%2Fprobe%2Fdiagnostic-review\.json$/);
+    expect(rawReads).toEqual([]);
+    expect(await page.evaluate<number>('document.documentElement.scrollWidth')).toBe(width);
+  }
+});
+
 test('keeps investigator budgets separate from planner usage and links compact trial summaries', async ({ page }) => {
   await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/overview`);
   const investigator = page.getByTestId(`investigator-${investigatorId}`);

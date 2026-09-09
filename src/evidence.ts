@@ -4,7 +4,8 @@ import { lstat, open, readdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 import { DecisionSchema, type RunFacts } from './types.js';
-import { redactResearchText } from './researchSandboxSnapshot.js';
+import { redactResearchText, researchSecretByteSpans } from './researchSandboxSnapshot.js';
+import type { PreparedDiagnosticReview } from './investigatorDiagnostics.js';
 
 export type EvidenceArm = 'standard' | 'control' | 'excluded';
 /** Coordinator input only. Never deserialize this manifest from a model tool argument. */
@@ -706,6 +707,208 @@ export class EvidenceStore {
       if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
       throw error;
     }
+  }
+
+  /** Coordinator-only. expected is the coordinator's parent and PRIMARY benchmark, never model input.
+   * Produces an offline fixture only: no source mounts, planner calls, or correctness certification.
+   */
+  async prepareDiagnosticReview(input: unknown, expected: { parentVariantId: string; benchmark: string }): Promise<PreparedDiagnosticReview> {
+    // Read-only evidence helpers are published separately and do not need this coordinator module.
+    const { DiagnosticReviewSchema } = await import('./investigatorDiagnostics.js');
+    const review = DiagnosticReviewSchema.parse(input);
+    if (expected.parentVariantId !== path.basename(this.scope.parentArtifactDirectory) ||
+        !scopeId.test(expected.benchmark)) throw new Error('Diagnostic parent or primary benchmark disagrees with coordinator scope');
+    const selected = await this.observation(review.observationRef);
+    await this.refresh();
+    if (!this.catalog.some((row) => row.kind === 'observation' && row.snapshotRef === selected.snapshotRef) ||
+        selected.variantId !== expected.parentVariantId || selected.arm !== 'standard' ||
+        selected.role !== 'baseline' || selected.actionId !== null) {
+      throw new Error('Diagnostic observation must be a current parent standard baseline, not a historical or other-scope observation');
+    }
+    const frozen = this.baselineRef ? this.observations.get(this.baselineRef) : null;
+    const frozenPrimary = selected.snapshotRef === this.baselineRef && this.reference !== null &&
+      selected.files.some((file) => file.evidenceRef === this.reference!.evidenceRef);
+    if (!frozenPrimary && selected.replicas.some((replica) => path.resolve(replica.file.root) !== path.resolve(this.scope.parentArtifactDirectory))) {
+      throw new Error('Diagnostic observation is not from the current parent archive');
+    }
+    if ((this.reference && record(this.referenceValue.baseline).id !== expected.parentVariantId) ||
+        (frozen?.benchmark != null && frozen.benchmark !== expected.benchmark) ||
+        (selected.benchmark !== expected.benchmark && !(selected.benchmark === null && frozenPrimary))) {
+      throw new Error('Diagnostic observation benchmark disagrees with the coordinator primary frozen reference');
+    }
+
+    const maximum = 2 * 1_024 * 1_024;
+    const limitations = [
+      'Artifact hashes and unit membership are verified, not correctness. Source relevance and diagnosis quality remain model judgments.',
+      'This is a redacted, schema-projected research copy, not verbatim replay or paid unit reevaluation. Only selected citation windows are included.',
+      'Credential patterns and host paths are redacted; uncaptured inputs are not reconstructed.',
+    ];
+    const hostRoots = [this.scope.artifactRoot, this.scope.workflowsSource, this.scope.plannerSource]
+      .map((root) => path.resolve(root)).filter((root) => root !== path.parse(root).root).sort((a, b) => b.length - a.length);
+    const sanitize = (value: string) => {
+      let text = redactResearchText(value);
+      for (const root of hostRoots) text = text.replaceAll(root, '[REDACTED HOST PATH]');
+      return text.replace(/(?:\/(?:Users|home|private|var|tmp|Volumes|mnt|opt|etc|root|workspace|workspaces)\/|[A-Za-z]:[\\/])[^\s"'<>()[\]{},;]*/g, '[REDACTED HOST PATH]');
+    };
+    const replicas = selected.replicas.map((replica) => ({ ...replica, units: units(replica.facts) }));
+    const boundUnits = new Map(replicas.flatMap((replica) => [...replica.units.keys()].map((key) => [this.id('unit', [selected.snapshotRef, key]), key])));
+    for (const item of review.examples) {
+      if (!boundUnits.has(item.unitRef)) throw new Error('Diagnostic unit is not captured in the selected observation');
+    }
+
+    const referenceFile = this.reference ?? selected.scoreBasis?.file ?? null;
+    const referenceValue = this.reference ? this.referenceValue : selected.scoreBasis?.value ?? {};
+    const used = new Map(selected.files.map((file) => [file.evidenceRef, file]));
+    if (referenceFile) used.set(referenceFile.evidenceRef, referenceFile);
+    const allowed = new Map(selected.files.map((file) => [file.evidenceRef, file]));
+    const source = selected.sourceRef ? this.sources.get(selected.sourceRef) : null;
+    if (review.examples.some((item) => item.citations.some((citation) => !allowed.has(citation.evidenceRef)))) {
+      if (source) {
+        if (source.role !== 'workflows' || source.arm !== 'standard') throw new Error('Diagnostic workflows source scope mismatch');
+        await this.loadSource(source);
+        for (const file of source.files) allowed.set(file.evidenceRef, file);
+      }
+    }
+
+    let capturedBytes = bytes(review);
+    const windows = review.examples.map((item) => item.citations.map((citation) => {
+      const file = allowed.get(citation.evidenceRef);
+      if (!file) throw new Error('Diagnostic citation is outside the observation and its workflows evidence scope');
+      const offset = citation.offset ?? 0;
+      if (offset >= file.size) throw new Error('Diagnostic citation byte offset is out of range or the file is empty');
+      const end = Math.min(file.size, offset + (citation.limit ?? 16_384));
+      capturedBytes += end - offset;
+      if (capturedBytes > maximum) throw new Error('Diagnostic preparation exceeds the 2 MiB byte limit');
+      used.set(file.evidenceRef, file);
+      return { file, offset, end, content: Buffer.alloc(end - offset) };
+    }));
+
+    // Rehash originals even when cached. Reads stay at most 16 KiB; retain full redaction context
+    // for one bounded original at a time, but publish only the selected windows.
+    // The original-file hash binds provenance; it is deliberately not the hash of redacted text.
+    for (const file of used.values()) {
+      const { candidate, canonicalRoot } = await this.stateScoped(file.root, file.relative);
+      const handle = await open(candidate, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        const before = await handle.stat();
+        if (!before.isFile() || before.size !== file.size) throw new Error('Diagnostic evidence integrity failure: artifact changed');
+        const ranges = windows.flat().filter((window) => window.file.evidenceRef === file.evidenceRef);
+        const decoder = ranges.length ? new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }) : null;
+        let originalText = '';
+        const buffer = Buffer.alloc(16_384);
+        const digest = createHash('sha256');
+        for (let position = 0; position < before.size;) {
+          const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, before.size - position), position);
+          if (!bytesRead) throw new Error('Diagnostic evidence changed during read');
+          const chunk = buffer.subarray(0, bytesRead);
+          digest.update(chunk);
+          if (decoder) {
+            if (chunk.includes(0)) throw new Error('Diagnostic citation is not UTF-8 text');
+            originalText += decoder.decode(chunk, { stream: true });
+          }
+          for (const window of ranges) {
+            const start = Math.max(position, window.offset);
+            const end = Math.min(position + bytesRead, window.end);
+            if (end > start) chunk.copy(window.content, start - window.offset, start - position, end - position);
+          }
+          position += bytesRead;
+        }
+        if (decoder) originalText += decoder.decode();
+        const after = await this.stateScoped(file.root, file.relative);
+        if (canonicalRoot !== after.canonicalRoot || stamp(before) !== stamp(after.details) ||
+            stamp(before) !== stamp(await handle.stat()) || digest.digest('hex') !== file.sha256) {
+          throw new Error('Diagnostic evidence integrity failure: artifact changed');
+        }
+        for (const window of ranges) {
+          if ((window.content[0]! & 0xc0) === 0x80) throw new Error('Invalid diagnostic UTF-8 byte offset');
+          let length = 0;
+          // Validate original boundaries before masking could hide an invalid UTF-8 offset.
+          for (let trim = 0; trim <= 3 && trim < window.content.length; trim++) {
+            try {
+              new TextDecoder('utf-8', { fatal: true }).decode(window.content.subarray(0, window.content.length - trim));
+              length = window.content.length - trim;
+              break;
+            } catch { /* Try the preceding character boundary. */ }
+          }
+          if (!length) throw new Error('Diagnostic citation limit is too small for a UTF-8 character');
+          window.content = window.content.subarray(0, length);
+          window.end = window.offset + length;
+        }
+        for (const span of researchSecretByteSpans(originalText)) {
+          for (const window of ranges) {
+            const start = Math.max(span.start, window.offset);
+            const end = Math.min(span.end, window.end);
+            // One ASCII X per original sensitive byte preserves coordinates, including Unicode.
+            if (end > start) window.content.fill('X', start - window.offset, end - window.offset);
+          }
+        }
+      } finally { await handle.close(); }
+    }
+
+    const labels = records(referenceValue.labels).filter((label) => label.campaignId === this.scope.campaignId && label.benchmark === expected.benchmark);
+    const prepared: PreparedDiagnosticReview = {
+      schemaVersion: 1, kind: 'diagnostic_review', interpretationStatus: 'unverified_model_judgment', structuralStatus: 'recorded',
+      review, reviewHash: '', binding: {
+        campaignId: this.scope.campaignId, variantId: selected.variantId, observationRef: selected.snapshotRef,
+        benchmark: expected.benchmark, arm: 'standard', observationBenchmark: selected.benchmark,
+        benchmarkBinding: selected.benchmark === null ? 'coordinator_primary_frozen_reference' : 'observation',
+        referenceRef: referenceFile?.evidenceRef ?? null, referenceHash: referenceFile ? `sha256:${referenceFile.sha256}` : null,
+        labelSetHash: typeof referenceValue.labelSetHash === 'string' ? referenceValue.labelSetHash :
+          typeof referenceValue.labelHash === 'string' ? referenceValue.labelHash : null,
+        workflowsSourceRef: selected.sourceRef,
+        artifactBindings: [...used.values()].map((file) => ({ evidenceRef: file.evidenceRef, sha256: `sha256:${file.sha256}`, bytes: file.size, integrity: 'verified_content_hash' })),
+      }, examples: [], limitations,
+    };
+    for (const [index, item] of review.examples.entries()) {
+      const key = boundUnits.get(item.unitRef)!;
+      const omissions: string[] = [];
+      const candidates = labels.filter((label) => label.unitKey === key).flatMap((label) => {
+        const parsed = researchLabelSchema.safeParse(label);
+        if (!parsed.success) { omissions.push('Invalid reference label omitted.'); return []; }
+        return [parsed.data];
+      });
+      const preferred = candidates.some((label) => label.status === 'verified') ? candidates.filter((label) => label.status === 'verified') : candidates;
+      const label = new Set(preferred.map((candidate) => candidate.expectedDecision)).size === 1 ? preferred[0] : null;
+      if (!label) omissions.push(preferred.length ? 'Conflicting reference labels; expected reference decision is uncertain.' : 'Reference label not captured.');
+      if (label?.status !== 'verified') omissions.push('Verified reference label not captured; diagnostic expectedDecision remains a model judgment.');
+      if (item.assessment === 'uncertain' || item.expectedDecision === null) omissions.push('Reviewer uncertainty is retained; no expected decision is inferred.');
+      const entry: PreparedDiagnosticReview['examples'][number] = {
+        unitRef: item.unitRef, unitKey: key, referenceLabel: label && referenceFile ? {
+          expectedDecision: label.expectedDecision, status: label.status, artifactRef: referenceFile.evidenceRef,
+        } : null,
+        replicates: replicas.map((replica) => {
+          const unit = replica.units.get(key);
+          const semantics = typeof unit?.semantics === 'string' && unit.semantics.trim() ? unit.semantics : null;
+          const decision = DecisionSchema.safeParse(unit?.decision);
+          if (!unit) omissions.push(`Unit not captured in replicate ${replica.replicate}.`);
+          else if (!semantics || !decision.success) omissions.push(`Requirement semantics or observed decision not captured in replicate ${replica.replicate}.`);
+          return { replicate: replica.replicate, artifactRef: replica.file.evidenceRef,
+            availability: !unit ? 'not_captured' : semantics && decision.success ? 'available' : 'partial',
+            requirementSemantics: semantics, observedDecision: decision.success ? decision.data : null };
+        }),
+        citations: windows[index]!.map((window) => {
+          const endOffset = window.end;
+          const complete = window.offset === 0 && endOffset === window.file.size;
+          if (!complete) omissions.push('Citation is a bounded window; uncited original text is omitted.');
+          const text = sanitize(window.content.toString('utf8'));
+          if (Buffer.byteLength(text) > 16_384) throw new Error('Redacted diagnostic citation exceeds the 16 KiB byte limit');
+          return { evidenceRef: window.file.evidenceRef, sha256: `sha256:${window.file.sha256}`, originalBytes: window.file.size,
+            offset: window.offset, endOffset, offsetUnit: 'utf8_bytes', complete, truncated: !complete, text,
+            copyKind: 'redacted_research_copy', integrity: 'verified_content_hash' };
+        }), limitations: [...new Set(omissions)],
+      };
+      prepared.examples.push(entry);
+      if (bytes(prepared) > maximum) throw new Error('Diagnostic preparation exceeds the 2 MiB byte limit');
+    }
+    if (!this.reference) limitations.push('Current frozen investigator reference not captured; only the explicit observation benchmark is bound.');
+    if (!source?.available) limitations.push('Observation workflows source not captured; no source root is substituted.');
+    if (prepared.examples.some((item) => item.referenceLabel?.status !== 'verified')) limitations.push('Verified reference labels not captured for every reviewed example.');
+    if (prepared.examples.some((item) => item.replicates.some((replica) => replica.availability !== 'available'))) limitations.push('Some unit inputs are not captured; see per-example limitations.');
+    const sanitized = JSON.parse(JSON.stringify(prepared), (_key: string, value: unknown) => typeof value === 'string' ? sanitize(value) : value) as PreparedDiagnosticReview;
+    sanitized.review = DiagnosticReviewSchema.parse(sanitized.review);
+    sanitized.reviewHash = `sha256:${hash(sanitized.review)}`;
+    if (bytes(sanitized) > maximum) throw new Error('Diagnostic preparation exceeds the 2 MiB byte limit');
+    return sanitized;
   }
 
   /** Coordinator-only bridge to a curated research bundle. No writes and no raw artifact-root mounts.

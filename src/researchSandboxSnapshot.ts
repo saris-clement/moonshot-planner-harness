@@ -6,13 +6,33 @@ import type { ResearchScope } from './researchSandbox.js';
 
 const OMIT = /^(?:\.git(?:config|-credentials)?|\.env.*|\.aws|\.ssh|\.docker|\.config|\.npmrc|\.netrc|\.data|node_modules|dist|coverage|logs?|raw|(?:secrets?|credentials?)(?:\..*)?|id_(?:rsa|ed25519|ecdsa)|service[-_]account(?:\..*)?)(?:$)|(?:\.log(?:\..*)?|\.pem|\.key|\.p12|\.pfx|\.sqlite(?:3)?|\.db|\.zip|\.gz|\.tar|\.tgz|\.bin)$/i;
 
+const RESEARCH_REDACTIONS = [
+  { pattern: /-----BEGIN [^-\r\n]{0,64}PRIVATE KEY-----[\s\S]*?(?:-----END [^-\r\n]{0,64}PRIVATE KEY-----|$)/gd, replacement: '[REDACTED PRIVATE KEY]', secretGroup: 0 },
+  { pattern: /\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{16,}|AKIA[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/gd, replacement: '[REDACTED]', secretGroup: 0 },
+  { pattern: /(\b(?:Bearer|Basic)\s+)([A-Za-z0-9+/_.=-]+)/gid, replacement: '$1[REDACTED]', secretGroup: 2 },
+  { pattern: /(["']?\b[\w.-]{0,64}(?:api[_-]?key|token|secret|password|credential|authorization|cookie)[\w.-]{0,64}["']?\s{0,64}[:=]\s{0,64})("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,;}]+)/gid, replacement: '$1"[REDACTED]"', secretGroup: 2 },
+  { pattern: /(https?:\/\/)([^\s/@]+:[^\s/@]+)@/gid, replacement: '$1[REDACTED]@', secretGroup: 2 },
+];
+
 export function redactResearchText(text: string): string {
-  return text
-    .replace(/-----BEGIN [^-\r\n]{0,64}PRIVATE KEY-----[\s\S]*?(?:-----END [^-\r\n]{0,64}PRIVATE KEY-----|$)/g, '[REDACTED PRIVATE KEY]')
-    .replace(/\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{16,}|AKIA[A-Z0-9]{16}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, '[REDACTED]')
-    .replace(/(\b(?:Bearer|Basic)\s+)[A-Za-z0-9+/_.=-]+/gi, '$1[REDACTED]')
-    .replace(/(["']?\b[\w.-]{0,64}(?:api[_-]?key|token|secret|password|credential|authorization|cookie)[\w.-]{0,64}["']?\s{0,64}[:=]\s{0,64})("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,;}]+)/gi, '$1"[REDACTED]"')
-    .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[REDACTED]@');
+  for (const { pattern, replacement } of RESEARCH_REDACTIONS) text = text.replace(pattern, replacement);
+  return text;
+}
+
+/** Match full original context, never already-redacted text. Spans use original UTF-8 byte offsets. */
+export function* researchSecretByteSpans(text: string): Generator<{ start: number; end: number }> {
+  for (const { pattern, secretGroup } of RESEARCH_REDACTIONS) {
+    let characterOffset = 0;
+    let byteOffset = 0;
+    for (const match of text.matchAll(pattern)) {
+      const [start, end] = match.indices![secretGroup]!;
+      byteOffset += Buffer.byteLength(text.slice(characterOffset, start));
+      const startByte = byteOffset;
+      byteOffset += Buffer.byteLength(text.slice(start, end));
+      characterOffset = end;
+      yield { start: startByte, end: byteOffset };
+    }
+  }
 }
 
 export async function canonicalResearchScope(scope: ResearchScope): Promise<ResearchScope> {

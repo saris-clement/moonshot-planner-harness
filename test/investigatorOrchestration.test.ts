@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
@@ -9,10 +9,13 @@ import { S3Client } from '@aws-sdk/client-s3';
 import { AgentRunner } from '../src/agents.js';
 import { sha256File, writeResolvedCampaignConfig } from '../src/config.js';
 import { HarnessDatabase } from '../src/db.js';
+import { EvidenceStore } from '../src/evidence.js';
+import { evidenceScopeFromContext } from '../src/evidenceAccess.js';
 import { hypothesisComplianceResultPath } from '../src/hypothesisCompliance.js';
+import { DiagnosticReviewSchema, type PreparedDiagnosticReview } from '../src/investigatorDiagnostics.js';
 import { canonicalHash } from '../src/metrics.js';
 import { runInvestigatorLoop } from '../src/investigatorLoop.js';
-import type { InvestigationActionRecord, InvestigationState, InvestigatorAction } from '../src/investigator.js';
+import { InvestigatorActionSchema, type InvestigationActionRecord, type InvestigationState, type InvestigatorAction } from '../src/investigator.js';
 import { CampaignOrchestrator } from '../src/orchestrator.js';
 import { ensureHarnessPaths, harnessPaths, variantArtifactDirectory } from '../src/paths.js';
 import { runCommand } from '../src/process.js';
@@ -38,13 +41,17 @@ interface Internals {
   promoteUnlocked: (campaignId: string, variantId: string) => Promise<VariantRecord>;
 }
 
-async function fixture(mode: 'supervised' | 'automatic' = 'supervised') {
+async function fixture(mode: 'supervised' | 'automatic' = 'supervised', options: { existingTest?: boolean } = {}) {
   const root = await mkdtemp(path.join(os.tmpdir(), 'investigator-orchestration-'));
   const paths = harnessPaths(root);
   await ensureHarnessPaths(paths);
   const repo = path.join(root, 'planner');
   await mkdir(path.join(repo, 'server/src'), { recursive: true });
   await writeFile(path.join(repo, 'server/src/evidence.ts'), 'export const evidence = false;\n');
+  if (options.existingTest) {
+    await mkdir(path.join(repo, 'server/test'), { recursive: true });
+    await writeFile(path.join(repo, 'server/test/evidence.test.ts'), "import { it, expect } from 'vitest';\nit('checks existing evidence', () => expect(true).toBe(true));\n");
+  }
   await runCommand('git', ['init', '--quiet'], { cwd: repo });
   await runCommand('git', ['add', '.'], { cwd: repo });
   await runCommand('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
@@ -104,10 +111,65 @@ function record(state: InvestigationState, kind: string, status: InvestigationAc
     result: status === 'completed' ? { passed: true } : null, error: null };
 }
 
+async function scopedDiagnosticReview(f: Awaited<ReturnType<typeof fixture>>) {
+  const paths = f.orchestrator.paths;
+  const workflowsSource = path.join(paths.worktrees, f.campaign.id, 'frozen-workflows');
+  const parentDirectory = variantArtifactDirectory(paths, f.campaign.id, f.variant.parentVariantId!);
+  await mkdir(workflowsSource, { recursive: true });
+  await writeFile(path.join(workflowsSource, 'existing.ts'), 'export const supportsRequiredBehavior = false;\n');
+  const facts: RunFacts = { ...f.database.getVariant(f.variant.parentVariantId!).facts!, unitCount: 1,
+    decisions: { build: 1, reuse: 0, extend: 0, defer: 0, question: 0 },
+    units: [{ id: 'requirement-1', key: 'required-behavior', ref: { entity: 'requirement', anchor: 'one' },
+      kind: 'behavior', semantics: 'Support behavior absent from the existing workflow.', decision: 'build', confidence: 'high',
+      rationale: 'The recorded source does not implement the required behavior.', selectedCandidateIds: [],
+      discoveredEvidenceCount: 0, shortlistCandidateCount: 0, uncoveredSemantics: [], sourceRefs: [] }] };
+  await mkdir(path.join(parentDirectory, 'primary/replicate-1'), { recursive: true });
+  await writeFile(path.join(parentDirectory, 'primary/replicate-1/facts.json'), JSON.stringify(facts));
+  f.database.updateVariant(f.variant.parentVariantId!, { facts, replicateFacts: [facts] });
+  const labels = [{ campaignId: f.campaign.id, benchmark: 'primary', unitKey: facts.units[0]!.key,
+    expectedDecision: 'build', status: 'suggested', rationale: 'Provisional reference, not verified truth.' }];
+  const referencePath = path.join(f.artifacts, 'investigator-reference.json');
+  const contextPath = path.join(f.artifacts, 'investigator-context.json');
+  const reference = { labels, labelSetHash: canonicalHash(labels), baseline: { id: f.variant.parentVariantId, facts, replicateFacts: [facts] } };
+  const context = { primary: f.campaign.config.benchmarks[0], referencePath, labelSetHash: reference.labelSetHash,
+    baseline: { id: f.variant.parentVariantId }, artifacts: {
+      current: f.artifacts, parent: parentDirectory, workflowsSource,
+      priorExperiments: [{ id: f.variant.parentVariantId, directory: parentDirectory }],
+    } };
+  // Complete the fixture before coordinator invocation; production must never rewrite these frozen inputs.
+  await writeFile(referencePath, JSON.stringify(reference));
+  await writeFile(contextPath, JSON.stringify(context));
+  f.state.harnessPins = { ...f.state.harnessPins, contextHash: await sha256File(contextPath),
+    referenceHash: await sha256File(referencePath), labelSetHash: reference.labelSetHash };
+  f.database.updateVariant(f.variant.id, { investigation: f.state });
+  f.internal.ensureFrozenWorkflowsSource = async () => workflowsSource;
+  const store = new EvidenceStore(evidenceScopeFromContext(f.campaign, f.variant, f.worktree, f.artifacts, context));
+  const observations = await store.listObservations({ kind: 'observation', limit: 100 });
+  const observationRef = observations.baselineSnapshotRef;
+  assert.ok(observationRef);
+  const compared = await store.compareTrial({ snapshotRef: observationRef });
+  assert.equal(compared.items.length, 1);
+  const source = await store.searchSource({ query: 'supportsRequiredBehavior' });
+  assert.equal(source.items.length, 1);
+  const review = DiagnosticReviewSchema.parse({ schemaVersion: 1, observationRef,
+    selectionRationale: 'A correct build decision is a useful counterexample to indiscriminate reuse.',
+    examples: [{ unitRef: compared.items[0]!.unitRef, assessment: 'useful', expectedDecision: 'build',
+      whyThisExample: 'Distinguishes actual capability gaps from missed reusable implementations.',
+      requirementUnderstanding: facts.units[0]!.semantics,
+      codeAssessment: 'The recorded workflow does not implement the required behavior.',
+      citations: [{ evidenceRef: source.items[0]!.evidenceRef }],
+      limitations: 'Source relevance and the suggested label remain unverified judgments.',
+      discriminatingCheck: 'Check whether the required behavior is actually supported.' }],
+    mechanism: 'Evidence selection may mistake a workflow name for behavioral coverage.',
+    falsificationCriterion: 'Reject the mechanism if behavioral coverage is already checked.' });
+  return { review, store, facts, contextPath, referencePath, workflowsSource };
+}
+
 async function fakeDocker(t: TestContext, f: Awaited<ReturnType<typeof fixture>>) {
   const bin = path.join(f.root, 'bin');
   const callsPath = path.join(f.root, 'docker-calls.jsonl');
   await mkdir(bin);
+  await writeFile(callsPath, '');
   await writeFile(path.join(bin, 'docker'), `#!${process.execPath} --
 const { appendFileSync } = require('node:fs');
 const args = process.argv.slice(2);
@@ -125,9 +187,290 @@ if (args[0] === 'image' && args[1] === 'inspect') console.log('sha256:' + 'a'.re
   f.campaign.environmentSha = await sha256File(f.campaign.config.environmentFile);
   // No Docker daemon, registry, S3 endpoint, or provider is contacted by these tests.
   t.mock.method(S3Client.prototype, 'send', async () => ({ Contents: [] }));
-  return async (): Promise<string[][]> => (await readFile(callsPath, 'utf8')).trim().split('\n')
+  return async (): Promise<string[][]> => (await readFile(callsPath, 'utf8')).trim().split('\n').filter(Boolean)
     .map((line) => JSON.parse(line) as string[]);
 }
+
+test('primary diagnostic review is required after exact-patch tests and blocks all Docker and campaign execution', async (t) => {
+  const f = await fixture();
+  try {
+    const calls = await fakeDocker(t, f);
+    const evaluation = t.mock.method(f.internal, 'runBenchmarkReplicates', async () => { throw new Error('must not evaluate'); });
+    const collection = t.mock.method(S3Client.prototype, 'send', async () => { throw new Error('must not collect'); });
+    f.state.actions.push(record(f.state, 'test', 'completed', f.patchHash));
+    const prior = structuredClone(f.state.actions);
+    f.state.turnCount = 1;
+    f.campaign.config.investigator!.maxTurns = 2;
+    f.database.updateVariant(f.variant.id, { investigation: f.state });
+    const action = InvestigatorActionSchema.parse({ action: 'evaluate_primary', rationale: 'Review was omitted', hypothesis });
+    t.mock.method(AgentRunner.prototype, 'investigate', async () => ({ sessionId: f.state.sessionId!, usage: { tokens: 1, costUsd: 0 }, action }));
+    const result = await f.internal.runInvestigatorCandidate(f.campaign, f.database.getVariant(f.variant.id), f.worktree, f.artifacts, f.baseline);
+    const rejected = result.investigation!.actions.at(-1)!;
+    assert.equal(rejected.status, 'failed');
+    assert.match(rejected.error!, /diagnostic review/i);
+    assert.equal(rejected.admitted, false);
+    assert.equal(rejected.patchHash, f.patchHash);
+    assert.deepEqual(result.investigation!.actions.slice(0, -1), prior);
+    assert.deepEqual(await calls(), []);
+    assert.equal(evaluation.mock.callCount(), 0);
+    assert.equal(collection.mock.callCount(), 0);
+    assert.equal(result.facts, null);
+    assert.equal(result.score, null);
+    assert.equal(result.artifactCollectionComplete, false);
+    const failure = JSON.parse(await readFile(path.join(f.artifacts, rejected.artifactDirectory!, 'failure.json'), 'utf8'));
+    assert.match(failure.error, /diagnostic review/i);
+    assert.equal(failure.patchHash, f.patchHash);
+  } finally { await f.close(); }
+});
+
+test('diagnostic probe accepts an unchanged existing test and mounts only the prepared fixture without analysis or score credit', async (t) => {
+  const f = await fixture('supervised', { existingTest: true });
+  try {
+    const { review, store, contextPath, referencePath } = await scopedDiagnosticReview(f);
+    await writeFile(path.join(f.worktree, 'server/src/evidence.ts'), 'export const evidence = false;\n');
+    const prepared = await store.prepareDiagnosticReview(review, { parentVariantId: f.variant.parentVariantId!, benchmark: 'primary' });
+    const calls = await fakeDocker(t, f);
+    const evaluation = t.mock.method(f.internal, 'runBenchmarkReplicates', async () => { throw new Error('probe must not evaluate'); });
+    const collection = t.mock.method(S3Client.prototype, 'send', async () => { throw new Error('probe must not collect'); });
+    const fetch = t.mock.method(globalThis, 'fetch', async () => { throw new Error('probe must not call providers'); });
+    const compliance = t.mock.method(AgentRunner.prototype, 'assessHypothesisCompliance', async () => { throw new Error('probe must not finalize'); });
+    const parent = f.database.getVariant(f.variant.parentVariantId!);
+    const labels = f.database.listLabels(f.campaign.id);
+    f.state.actions.push(record(f.state, 'test', 'failed', f.patchHash));
+    const prior = structuredClone(f.state.actions);
+    f.state.turnCount = 1;
+    f.campaign.config.investigator!.maxTurns = 2;
+    f.database.updateVariant(f.variant.id, { investigation: f.state });
+    const action = { action: 'probe' as const, rationale: 'Discriminate the hypothesis without a treatment', hypothesis,
+      testFiles: ['server/test/evidence.test.ts'], review };
+    assert.deepEqual(InvestigatorActionSchema.parse(action), action);
+    for (const invalid of [
+      { ...action, testFiles: undefined }, { ...action, testFiles: [] },
+    ]) assert.equal(InvestigatorActionSchema.safeParse(invalid).success, false);
+    for (const unqualified of [undefined, { ...review, examples: [] }, { ...review, trusted: true }]) {
+      assert.equal(InvestigatorActionSchema.safeParse({ ...action, review: unqualified }).success, true,
+        'review rejection belongs to coordinator admission, preserving measured usage');
+      await assert.rejects(store.prepareDiagnosticReview(unqualified, { parentVariantId: f.variant.parentVariantId!, benchmark: 'primary' }));
+    }
+    t.mock.method(AgentRunner.prototype, 'investigate', async () => ({ sessionId: f.state.sessionId!, usage: { tokens: 1, costUsd: 0 },
+      action }));
+    const result = await f.internal.runInvestigatorCandidate(f.campaign, f.database.getVariant(f.variant.id), f.worktree, f.artifacts, f.baseline);
+    const probe = result.investigation!.actions.at(-1)!;
+    assert.equal(probe.status, 'completed', probe.error ?? undefined);
+    assert.equal(probe.kind, 'probe');
+    const directory = path.join(f.artifacts, probe.artifactDirectory!);
+    assert.equal(await readFile(path.join(directory, 'variant.patch'), 'utf8'), '');
+    assert.equal(probe.patchHash, await sha256File(path.join(directory, 'variant.patch')));
+    const receipt = JSON.parse(await readFile(path.join(directory, 'receipt.json'), 'utf8'));
+    assert.deepEqual(receipt.result, probe.result);
+    assert.equal(receipt.result.kind, 'diagnostic_probe');
+    assert.equal(receipt.result.executionPassed, true);
+    assert.equal('passed' in receipt.result, false);
+    assert.equal(receipt.result.providerCalls, 0);
+    assert.equal('score' in receipt.result, false);
+    assert.equal('facts' in receipt.result, false);
+    const archived = JSON.parse(await readFile(path.join(directory, 'diagnostic-review.json'), 'utf8'));
+    assert.deepEqual(archived, prepared);
+    assert.deepEqual(JSON.parse(await readFile(path.join(directory, 'diagnostic-input.json'), 'utf8')), prepared);
+    const binding = { reviewHash: prepared.reviewHash, artifactHash: await sha256File(path.join(directory, 'diagnostic-review.json')),
+      artifactPath: 'diagnostic-review.json', interpretationStatus: 'unverified_model_judgment' };
+    assert.deepEqual(receipt.result.diagnosticReview, binding);
+    const pins = JSON.parse(await readFile(path.join(directory, 'pins.json'), 'utf8'));
+    assert.ok(JSON.stringify(pins).includes(binding.reviewHash), 'action pins bind the normalized review');
+    assert.ok(JSON.stringify(pins).includes(binding.artifactHash), 'action pins bind the archived review bytes');
+    assert.equal(receipt.result.inputHash, await sha256File(path.join(directory, 'diagnostic-input.json')));
+    const runs = (await calls()).filter((args) => args[0] === 'run');
+    assert.equal(runs.length, 2, 'only selected-file validation and the diagnostic test run');
+    for (const args of runs) {
+      assert.equal(args[args.indexOf('--network') + 1], 'none');
+      assert.ok(args.includes('--read-only'));
+      assert.ok(args.includes('HARNESS_DIAGNOSTIC_INPUT=/harness/diagnostic-input.json'));
+      assert.deepEqual(args.flatMap((value, index) => value === '--mount' ? [args[index + 1]] : []),
+        [`type=bind,source=${await realpath(path.join(directory, 'diagnostic-input.json'))},target=/harness/diagnostic-input.json,readonly`]);
+    }
+    assert.ok(runs.some((args) => args.includes('vitest') && args.includes('test/evidence.test.ts')));
+    assert.equal((await calls()).some((args) => args.includes('compose')), false);
+    for (const mock of [evaluation, collection, fetch, compliance]) assert.equal(mock.mock.callCount(), 0);
+    assert.deepEqual(result.investigation!.actions.slice(0, -1), prior);
+    assert.equal(result.investigation!.status, 'budget_exhausted');
+    assert.equal(result.facts, null);
+    assert.equal(result.replicateFacts, null);
+    assert.equal(result.score, null);
+    assert.equal(result.holdoutFacts, null);
+    assert.equal(result.artifactCollectionComplete, false);
+    assert.deepEqual(f.database.getVariant(parent.id), parent);
+    assert.deepEqual(f.database.listLabels(f.campaign.id), labels);
+    assert.equal(await sha256File(contextPath), f.state.harnessPins!.contextHash);
+    assert.equal(await sha256File(referencePath), f.state.harnessPins!.referenceHash);
+  } finally { await f.close(); }
+});
+
+test('diagnostic reviews reject foreign observation, unit, and citation handles before image build or campaign services', async (t) => {
+  for (const kind of ['evaluate_primary', 'probe'] as const) {
+    for (const foreign of ['observation', 'unit', 'citation'] as const) {
+      await t.test(`${kind}: ${foreign}`, async (t) => {
+        const f = await fixture();
+        try {
+          const { review } = await scopedDiagnosticReview(f);
+          if (foreign === 'observation') review.observationRef = `snapshot_${'f'.repeat(64)}`;
+          if (foreign === 'unit') review.examples[0]!.unitRef = `unit_${'f'.repeat(64)}`;
+          if (foreign === 'citation') review.examples[0]!.citations = [{ evidenceRef: `evidence_${'f'.repeat(64)}` }];
+          assert.ok(DiagnosticReviewSchema.safeParse(review).success, 'well-formed handles still require scoped validation');
+          const calls = await fakeDocker(t, f);
+          const evaluation = t.mock.method(f.internal, 'runBenchmarkReplicates', async () => { throw new Error('must not evaluate'); });
+          const collection = t.mock.method(S3Client.prototype, 'send', async () => { throw new Error('must not collect'); });
+          f.state.actions.push(record(f.state, 'test', 'completed', f.patchHash));
+          f.state.turnCount = 1;
+          f.campaign.config.investigator!.maxTurns = 2;
+          f.database.updateVariant(f.variant.id, { investigation: f.state });
+          t.mock.method(AgentRunner.prototype, 'investigate', async () => ({ sessionId: f.state.sessionId!, usage: { tokens: 1, costUsd: 0 },
+            action: kind === 'probe'
+              ? { action: kind, rationale: 'Reject foreign evidence', hypothesis, review, testFiles: ['server/test/evidence.test.ts'] }
+              : { action: kind, rationale: 'Reject foreign evidence', hypothesis, review } }));
+          const result = await f.internal.runInvestigatorCandidate(f.campaign, f.database.getVariant(f.variant.id), f.worktree, f.artifacts, f.baseline);
+          const rejected = result.investigation!.actions.at(-1)!;
+          assert.equal(rejected.status, 'failed');
+          assert.match(rejected.error!, /observation|snapshot|unit|citation|evidence|scope/i);
+          assert.equal(rejected.admitted, false);
+          assert.equal(rejected.patchHash, f.patchHash);
+          assert.deepEqual(await calls(), []);
+          assert.equal(evaluation.mock.callCount(), 0);
+          assert.equal(collection.mock.callCount(), 0);
+          await assert.rejects(readFile(path.join(f.artifacts, rejected.artifactDirectory!, 'diagnostic-review.json')), { code: 'ENOENT' });
+          assert.equal(result.facts, null);
+          assert.equal(result.score, null);
+        } finally { await f.close(); }
+      });
+    }
+  }
+});
+
+test('primary diagnostic reviews accept correct-build and uncertain examples without charging rejected requests to the primary quota', async (t) => {
+  for (const assessment of ['useful', 'uncertain'] as const) {
+    await t.test(assessment, async (t) => {
+      const f = await fixture();
+      try {
+        const { review, store, facts, contextPath, referencePath } = await scopedDiagnosticReview(f);
+        review.examples[0]!.assessment = assessment;
+        review.examples[0]!.expectedDecision = assessment === 'useful' ? 'build' : null;
+        const prepared = await store.prepareDiagnosticReview(review, { parentVariantId: f.variant.parentVariantId!, benchmark: 'primary' });
+        const calls = await fakeDocker(t, f);
+        f.database.createTargetExcludedConfig(f.campaign.id, {
+          protocol: 'standard-primary-v2', normalArmSource: 'standard_primary', targetImplementationWorkflow: 'fixture/workflow',
+          baselineVariantId: f.variant.parentVariantId!, primaryResolvedArtifactSha: `sha256:${'b'.repeat(64)}`,
+          comparatorImage: `sha256:${'a'.repeat(64)}`, configuredAt: f.state.startedAt,
+        });
+        const resolution = t.mock.method(f.internal, 'resolveV2PrimaryBenchmark', async (_campaign: CampaignRecord, benchmark: Benchmark) => ({ benchmark }));
+        const evaluation = t.mock.method(f.internal, 'runBenchmarkReplicates', async () => ({ facts, replicates: [facts], questions: [] }));
+        const parent = f.database.getVariant(f.variant.parentVariantId!);
+        const labels = f.database.listLabels(f.campaign.id);
+        const contextBytes = await readFile(contextPath);
+        const referenceBytes = await readFile(referencePath);
+        f.state.actions.push(record(f.state, 'test', 'completed', f.patchHash));
+        const prior = structuredClone(f.state.actions);
+        f.state.turnCount = 1;
+        f.campaign.config.investigator!.maxPrimaryEvaluations = 1;
+        f.campaign.config.investigator!.maxTurns = 4;
+        f.database.updateVariant(f.variant.id, { investigation: f.state });
+        const request = { action: 'evaluate_primary' as const, rationale: 'Evaluate only after a scoped diagnostic review', hypothesis };
+        const requests = [request, { ...request, review: { ...review, observationRef: `snapshot_${'f'.repeat(64)}` } }, { ...request, review }];
+        assert.deepEqual(InvestigatorActionSchema.parse(requests[2]), requests[2]);
+        let turns = 0;
+        t.mock.method(AgentRunner.prototype, 'investigate', async () => ({ sessionId: f.state.sessionId!, usage: { tokens: 1, costUsd: 0 }, action: requests[turns++]! }));
+        const result = await f.internal.runInvestigatorCandidate(f.campaign, f.database.getVariant(f.variant.id), f.worktree, f.artifacts, f.baseline);
+        assert.deepEqual(result.investigation!.actions.map(({ status }) => status), ['completed', 'failed', 'failed', 'completed']);
+        assert.deepEqual(result.investigation!.actions.slice(0, 1), prior);
+        assert.deepEqual(result.investigation!.actions.slice(1, 3).map(({ admitted }) => admitted), [false, false]);
+        const trial = result.investigation!.actions.at(-1)!;
+        assert.notEqual(trial.admitted, false);
+        const directory = path.join(f.artifacts, trial.artifactDirectory!);
+        const archived: PreparedDiagnosticReview = JSON.parse(await readFile(path.join(directory, 'diagnostic-review.json'), 'utf8'));
+        assert.deepEqual(archived, prepared);
+        assert.equal(archived.binding.variantId, parent.id);
+        assert.equal(archived.binding.benchmark, 'primary');
+        assert.equal(archived.binding.referenceHash, f.state.harnessPins!.referenceHash);
+        assert.equal(archived.examples[0]!.referenceLabel!.status, 'suggested');
+        assert.equal(archived.examples[0]!.replicates[0]!.observedDecision, 'build');
+        assert.equal(archived.review.examples[0]!.expectedDecision, assessment === 'useful' ? 'build' : null);
+        const binding = { reviewHash: prepared.reviewHash, artifactHash: await sha256File(path.join(directory, 'diagnostic-review.json')),
+          artifactPath: 'diagnostic-review.json', interpretationStatus: 'unverified_model_judgment' };
+        const receipt = JSON.parse(await readFile(path.join(directory, 'receipt.json'), 'utf8'));
+        assert.deepEqual(receipt.result, trial.result);
+        assert.deepEqual(receipt.result.diagnosticReview, binding);
+        const pins = JSON.parse(await readFile(path.join(directory, 'pins.json'), 'utf8'));
+        assert.ok(JSON.stringify(pins).includes(binding.reviewHash));
+        assert.ok(JSON.stringify(pins).includes(binding.artifactHash));
+        assert.equal(resolution.mock.callCount(), 1);
+        assert.equal(evaluation.mock.callCount(), 1);
+        assert.equal(evaluation.mock.calls[0]!.arguments[3]!.name, 'primary');
+        assert.ok((await calls()).some((args) => args.includes('build')));
+        assert.equal(result.facts, null, 'screening facts are not a final full-pack result');
+        assert.equal(result.score, null);
+        assert.equal(result.artifactCollectionComplete, false);
+        assert.deepEqual(f.database.getVariant(parent.id), parent);
+        assert.deepEqual(f.database.listLabels(f.campaign.id), labels);
+        assert.deepEqual(await readFile(contextPath), contextBytes);
+        assert.deepEqual(await readFile(referencePath), referenceBytes);
+      } finally { await f.close(); }
+    });
+  }
+});
+
+test('completed diagnostic probes cannot substitute for exact-patch tests or primary finalization prerequisites', async (t) => {
+  const f = await fixture();
+  try {
+    const { review } = await scopedDiagnosticReview(f);
+    const calls = await fakeDocker(t, f);
+    const evaluation = t.mock.method(f.internal, 'runBenchmarkReplicates', async () => { throw new Error('must not evaluate'); });
+    const compliance = t.mock.method(AgentRunner.prototype, 'assessHypothesisCompliance', async () => { throw new Error('must not finalize'); });
+    f.state.actions.push({ ...record(f.state, 'probe', 'completed', f.patchHash),
+      result: { kind: 'diagnostic_probe', executionPassed: true, providerCalls: 0 } });
+    const prior = structuredClone(f.state.actions);
+    f.state.turnCount = 1;
+    f.campaign.config.investigator!.maxTurns = 3;
+    f.campaign.config.investigator!.maxPrimaryEvaluations = 1;
+    f.database.updateVariant(f.variant.id, { investigation: f.state });
+    const requests = [
+      { action: 'evaluate_primary' as const, rationale: 'A probe is not a trusted test', hypothesis, review },
+      { action: 'finalize' as const, rationale: 'A probe is not a primary trial', hypothesis },
+    ];
+    let turns = 0;
+    t.mock.method(AgentRunner.prototype, 'investigate', async () => ({ sessionId: f.state.sessionId!, usage: { tokens: 1, costUsd: 0 }, action: requests[turns++]! }));
+    const result = await f.internal.runInvestigatorCandidate(f.campaign, f.database.getVariant(f.variant.id), f.worktree, f.artifacts, f.baseline);
+    assert.deepEqual(result.investigation!.actions.map(({ status }) => status), ['completed', 'failed', 'failed']);
+    assert.match(result.investigation!.actions[1]!.error!, /trusted tests.*exact patch/i);
+    assert.match(result.investigation!.actions[2]!.error!, /completed primary evaluation.*exact patch.*preregistered hypothesis/i);
+    assert.deepEqual(result.investigation!.actions.slice(0, 1), prior);
+    assert.deepEqual(await calls(), []);
+    assert.equal(evaluation.mock.callCount(), 0);
+    assert.equal(compliance.mock.callCount(), 0);
+    assert.notEqual(result.investigation!.status, 'finalized');
+  } finally { await f.close(); }
+});
+
+test('primary quota still counts executed failures and historical actions without an admission field', async (t) => {
+  for (const scenario of [
+    { status: 'failed', admitted: true }, { status: 'failed' }, { status: 'completed' },
+  ] as const) {
+    await t.test(JSON.stringify(scenario), async () => {
+      const timestamp = new Date().toISOString();
+      const state: InvestigationState = { schemaVersion: 1, sessionId: 'ses-quota', status: 'running', startedAt: timestamp,
+        updatedAt: timestamp, turnCount: 1, agentTokens: 0, agentCostUsd: 0, reason: null, actions: [] };
+      state.actions.push({ ...record(state, 'evaluate_primary', scenario.status, 'sha256:historical'), ...scenario });
+      const prior = structuredClone(state.actions);
+      let executions = 0;
+      const result = await runInvestigatorLoop(state, { maxTurns: 2, maxPrimaryEvaluations: 1, maxWallTimeMs: 60_000, maxAgentTokens: 100 }, {
+        save: () => {}, stopped: () => false,
+        turn: async () => ({ sessionId: state.sessionId!, usage: { tokens: 1, costUsd: 0 },
+          action: { action: 'evaluate_primary', rationale: 'Quota must include the earlier trial', hypothesis } }),
+        execute: async () => { executions += 1; throw new Error('primary quota must prevent execution'); },
+      });
+      assert.equal(executions, 0);
+      assert.deepEqual(result.actions, prior);
+      assert.match(result.reason!, /primary evaluation budget exhausted/i);
+    });
+  }
+});
 
 test('post-turn budget stops archive the latest unexecuted mutation and hypothesis', async (t) => {
   const f = await fixture();
@@ -577,6 +920,7 @@ test('a second token grant uses the prior effective limit and never replays a re
 test('primary retries use action-specific stacks even when collection preserves the previous volumes', async (t) => {
   const f = await fixture();
   try {
+    const { review } = await scopedDiagnosticReview(f);
     f.campaign.config.evaluation.replicates = 2;
     const calls = await fakeDocker(t, f);
     let collections = 0;
@@ -604,7 +948,7 @@ test('primary retries use action-specific stacks even when collection preserves 
     t.mock.method(AgentRunner.prototype, 'investigate', async () => ({
       sessionId: f.state.sessionId!, usage: { tokens: 1, costUsd: 0 },
       action: { action: ++turns <= 2 ? 'evaluate_primary' as const : 'abandon' as const,
-        rationale: 'Retry after the archived collection failure', hypothesis },
+        rationale: 'Retry after the archived collection failure', hypothesis, ...(turns <= 2 ? { review } : {}) },
     }));
     const result = await f.internal.runInvestigatorCandidate(f.campaign, f.database.getVariant(f.variant.id), f.worktree, f.artifacts, f.baseline);
     assert.deepEqual(result.investigation?.actions.map(({ status }) => status), ['completed', 'failed', 'completed', 'completed']);
@@ -624,11 +968,48 @@ test('primary retries use action-specific stacks even when collection preserves 
     assert.equal(teardown[1]!.includes('--volumes'), true);
     const receipt = JSON.parse(await readFile(path.join(f.artifacts, 'investigation/action-003/receipt.json'), 'utf8'));
     assert.equal(receipt.patchHash, f.patchHash);
+    assert.notEqual(result.investigation!.actions[1]!.admitted, false, 'an executed collection failure still consumes a primary trial');
+    assert.deepEqual(JSON.parse(await readFile(path.join(f.artifacts, 'investigation/action-002/diagnostic-review.json'), 'utf8')),
+      JSON.parse(await readFile(path.join(f.artifacts, 'investigation/action-003/diagnostic-review.json'), 'utf8')));
     assert.equal(result.facts, null, 'trial facts must not become final evaluation facts');
   } finally { await f.close(); }
 });
 
-test('finalizing a restored patch binds compliance to the last matching trial, not a later different treatment', async (t) => {
+test('finalization verifies new trial review archives before building, without rewriting their interpretation', async (t) => {
+  for (const mode of ['valid', 'tampered', 'foreign-parent', 'unsafe-path'] as const) {
+    await t.test(mode, async (t) => {
+      const f = await fixture();
+      try {
+        const { store, review } = await scopedDiagnosticReview(f);
+        const prepared = await store.prepareDiagnosticReview(review, { parentVariantId: f.variant.parentVariantId!, benchmark: 'primary' });
+        if (mode === 'foreign-parent') prepared.binding.variantId = 'other-parent';
+        const relative = 'investigation/action-001';
+        const directory = path.join(f.artifacts, relative);
+        await mkdir(directory, { recursive: true });
+        const file = path.join(directory, 'diagnostic-review.json');
+        await writeFile(file, JSON.stringify(prepared));
+        const binding = { reviewHash: prepared.reviewHash, artifactHash: await sha256File(file),
+          artifactPath: mode === 'unsafe-path' ? '../diagnostic-review.json' : 'diagnostic-review.json',
+          interpretationStatus: 'unverified_model_judgment' };
+        if (mode === 'tampered') await writeFile(file, JSON.stringify({ ...prepared, structuralStatus: 'changed' }));
+        f.state.actions.push({ ...record(f.state, 'evaluate_primary', 'completed', f.patchHash),
+          artifactDirectory: relative, result: { diagnosticReview: binding } });
+        f.state.turnCount = 1;
+        f.campaign.config.investigator!.maxTurns = 2;
+        f.database.updateVariant(f.variant.id, { investigation: f.state });
+        const previous = structuredClone(f.state.actions[0]);
+        t.mock.method(AgentRunner.prototype, 'investigate', async () => ({ sessionId: f.state.sessionId!,
+          usage: { tokens: 1, costUsd: 0 }, action: { action: 'finalize' as const, rationale: 'Finish the registered experiment', hypothesis } }));
+        const result = await f.internal.runInvestigatorCandidate(f.campaign, f.database.getVariant(f.variant.id), f.worktree, f.artifacts, f.baseline);
+        assert.match(result.investigation!.actions.at(-1)!.error!, mode === 'valid' ? /frozen environment hash changed/i : /diagnostic review.*(modified|binding)|invalid diagnostic review archive/i);
+        assert.deepEqual(result.investigation!.actions[0], previous);
+        assert.equal(result.hypothesisComplianceAttempts.length, 0);
+      } finally { await f.close(); }
+    });
+  }
+});
+
+test('finalizing a restored historical patch binds the last matching trial without retroactive diagnostic review', async (t) => {
   const f = await fixture();
   try {
     await fakeDocker(t, f);
@@ -672,6 +1053,8 @@ test('finalizing a restored patch binds compliance to the last matching trial, n
     assert.equal(result.investigation?.status, 'finalized', result.investigation?.reason ?? undefined);
     assert.equal(assess.mock.callCount(), 1);
     assert.deepEqual(result.investigation.actions.slice(0, -1), prior);
+    assert.ok(result.investigation.actions.slice(0, -1).every((action) => !('diagnosticReview' in (action.result as object))));
+    await assert.rejects(readFile(path.join(f.artifacts, 'investigation/action-006/diagnostic-review.json')), { code: 'ENOENT' });
     assert.equal(result.patchHash, f.patchHash);
     assert.equal(result.hypothesisComplianceCandidatePatchHash, f.patchHash);
     await f.internal.verifyVariantHypothesisCompliance(f.campaign, result);
@@ -869,7 +1252,7 @@ test('primary evaluation requires a completed test on the exact current patch an
       { kind: 'evaluate_primary', prior: [], expected: /trusted tests.*exact patch/i },
       { kind: 'evaluate_primary', prior: [record(f.state, 'test', 'failed', f.patchHash)], expected: /trusted tests.*exact patch/i },
       { kind: 'evaluate_primary', prior: [record(f.state, 'test', 'completed', 'sha256:other')], expected: /trusted tests.*exact patch/i },
-      { kind: 'evaluate_primary', prior: [record(f.state, 'test', 'completed', f.patchHash)], expected: /frozen environment hash changed/i },
+      { kind: 'evaluate_primary', prior: [record(f.state, 'test', 'completed', f.patchHash)], expected: /diagnostic review/i },
       { kind: 'finalize', prior: [record(f.state, 'evaluate_primary', 'completed', f.patchHash)], expected: /preregistered hypothesis/i },
       { kind: 'finalize', prior: [{ ...record(f.state, 'evaluate_primary', 'completed', f.patchHash), hypothesis: revised }], expected: /frozen environment hash changed/i },
     ];

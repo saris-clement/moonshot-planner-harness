@@ -74,6 +74,7 @@ export function buildInvestigatorBriefing(context: unknown, state: Investigation
   const baselineCounts = { decisions: counts(baseline.decisions), evidence: counts(baseline.evidence), shortlist: counts(baseline.shortlist) };
   let recentActions = state.actions.slice(-20).map((action): Row => ({
     id: bounded('actionId', action.id, 'state', 256), kind: bounded('actionKind', action.kind, 'state', 80), status: action.status,
+    ...(action.admitted === false ? { admitted: false } : {}),
     patchHash: bounded('patchHash', action.patchHash, 'state', 128),
   }));
   if (bytes(recentActions) > 4_096) {
@@ -101,6 +102,8 @@ export function buildInvestigatorBriefing(context: unknown, state: Investigation
       id: bounded('latestActionId', latest.id, 'state', 256), kind: bounded('latestActionKind', latest.kind, 'state', 80), status: latest.status,
       score: compactScore(latestResult.score), baselineScore: compactScore(latestResult.baselineScore),
       resultSummary: { passed: typeof latestResult.passed === 'boolean' ? latestResult.passed : null,
+        executionPassed: typeof latestResult.executionPassed === 'boolean' ? latestResult.executionPassed : null,
+        diagnosticReview: bounded('diagnosticReview', latestResult.diagnosticReview, 'feedback', 1_024),
         testsPassed: typeof record(latestResult.tests).passed === 'boolean' ? record(latestResult.tests).passed : null,
         unitCount: typeof record(latestResult.facts).unitCount === 'number' ? record(latestResult.facts).unitCount : null,
         decisions: bounded('latestDecisionCounts', counts(record(latestResult.facts).decisions), 'feedback', 512),
@@ -110,7 +113,7 @@ export function buildInvestigatorBriefing(context: unknown, state: Investigation
     recentActions,
     ...(unitSamples ? { unitSamples: bounded('unitSamples', unitSamples, 'context', 2_048) } : {}),
     referenceHandles: Object.fromEntries(Object.entries(referenceHandles).filter(([key, value]) => key.length <= 80 && typeof value === 'string' && value.length <= 256).slice(0, 20)),
-    budget: { ...counts(budgetConfig), turnsUsed: state.turnCount, primaryEvaluationsUsed: state.actions.filter((action) => action.kind === 'evaluate_primary').length,
+    budget: { ...counts(budgetConfig), turnsUsed: state.turnCount, primaryEvaluationsUsed: state.actions.filter((action) => action.kind === 'evaluate_primary' && action.admitted !== false).length,
       agentTokens: state.agentTokens, agentCostUsd: state.agentCostUsd,
       elapsedMsAtLastSave: Number.isFinite(Date.parse(state.updatedAt) - Date.parse(state.startedAt)) ? Math.max(0, Date.parse(state.updatedAt) - Date.parse(state.startedAt)) : null },
     omissions,

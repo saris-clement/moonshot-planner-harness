@@ -15,6 +15,9 @@ import { AgentRunner, type SourceQuestionAnswer } from './agents.js';
 import { normalizeExecutionFailure } from './failures.js';
 import { runInvestigatorLoop } from './investigatorLoop.js';
 import type { InvestigationState } from './investigator.js';
+import { EvidenceStore } from './evidence.js';
+import { evidenceScopeFromContext } from './evidenceAccess.js';
+import type { PreparedDiagnosticReview } from './investigatorDiagnostics.js';
 import { effectiveInvestigatorLimits, InvestigatorTokenGrantInputSchema, verifyInvestigatorTokenGrantReceipts,
   type InvestigatorTokenGrant } from './investigatorBudget.js';
 import {
@@ -71,6 +74,7 @@ import {
   reattachVariantStack,
   runVariantGates,
   runInvestigatorTests,
+  runInvestigatorProbe,
   startVariantStack,
   stageMutationBaseline,
   stopVariantStack,
@@ -2260,7 +2264,7 @@ export class CampaignOrchestrator {
         if (!Number.isSafeInteger(state.turnCount) || state.turnCount < 0 || state.turnCount >= oldLimits.maxTurns) {
           throw new Error('Investigator turn budget is exhausted or unknown');
         }
-        if (state.actions.filter((action) => action.kind === 'evaluate_primary').length >= oldLimits.maxPrimaryEvaluations) {
+        if (state.actions.filter((action) => action.kind === 'evaluate_primary' && action.admitted !== false).length >= oldLimits.maxPrimaryEvaluations) {
           throw new Error('Investigator primary evaluation budget is exhausted');
         }
       };
@@ -2737,7 +2741,7 @@ export class CampaignOrchestrator {
           record.artifactDirectory = relativeDirectory;
           save({ ...current, actions: current.actions.map((item) => item.id === record.id ? { ...record } : item) });
           this.database.updateVariant(variant.id, { patchPath: candidate.patchPath, patchHash: candidateHash });
-          if (action.action !== 'abandon' && treatment.result.changedFiles.length === 0) throw new Error('No treatment beyond inherited parent. Make a bounded change or abandon.');
+          if (action.action !== 'abandon' && action.action !== 'probe' && treatment.result.changedFiles.length === 0) throw new Error('No treatment beyond inherited parent. Make a bounded change or abandon.');
           if (action.action === 'abandon') {
             const receipt = { patchHash: candidateHash, artifactDirectory: relativeDirectory, result: { reason: action.rationale } };
             await writeFile(path.join(directory, 'receipt.json'), `${JSON.stringify(receipt, null, 2)}\n`, { flag: 'wx' });
@@ -2751,11 +2755,45 @@ export class CampaignOrchestrator {
           if (action.action === 'finalize' && !evaluatedTrial) {
             throw new Error('Finalize requires a completed primary evaluation of this exact patch and preregistered hypothesis. Test/evaluate revised patches first.');
           }
+          let diagnosticReview: PreparedDiagnosticReview | undefined;
+          let diagnosticReceipt: { reviewHash: string; artifactHash: string; artifactPath: string; interpretationStatus: 'unverified_model_judgment' } | undefined;
+          if (action.action === 'probe' || action.action === 'evaluate_primary') {
+            try {
+              if (!action.review) throw new Error('Provide model-selected examples, their qualification, and bound evidence citations.');
+              const context = JSON.parse(await readFile(contextPath, 'utf8'));
+              const store = new EvidenceStore(evidenceScopeFromContext(campaign, variant, worktree, artifactDirectory, context));
+              diagnosticReview = await store.prepareDiagnosticReview(action.review, { parentVariantId: parent.id, benchmark: primary.name });
+            } catch (error) {
+              record.admitted = false;
+              throw new Error(`Diagnostic review required before execution: ${errorMessage(error)}`);
+            }
+            const reviewPath = path.join(directory, 'diagnostic-review.json');
+            await writeFile(reviewPath, `${JSON.stringify(diagnosticReview, null, 2)}\n`, { flag: 'wx' });
+            diagnosticReceipt = { reviewHash: diagnosticReview.reviewHash, artifactHash: await sha256File(reviewPath),
+              artifactPath: 'diagnostic-review.json', interpretationStatus: 'unverified_model_judgment' };
+          }
+          // New trial reviews are immutable preregistration inputs. Historical trials are not backfilled.
+          const trialReview = (evaluatedTrial?.result as { diagnosticReview?: typeof diagnosticReceipt } | undefined)?.diagnosticReview;
+          if (action.action === 'finalize' && trialReview) {
+            if (trialReview.artifactPath !== 'diagnostic-review.json' || !/^investigation\/action-\d+$/.test(evaluatedTrial!.artifactDirectory ?? '')) {
+              throw new Error('Invalid diagnostic review archive binding');
+            }
+            const reviewPath = path.join(artifactDirectory, evaluatedTrial!.artifactDirectory!, trialReview.artifactPath);
+            if (await sha256File(reviewPath) !== trialReview.artifactHash) throw new Error('Preregistered diagnostic review was modified');
+            diagnosticReview = JSON.parse(await readFile(reviewPath, 'utf8')) as PreparedDiagnosticReview;
+            if (diagnosticReview.reviewHash !== trialReview.reviewHash || diagnosticReview.binding.variantId !== parent.id) {
+              throw new Error('Preregistered diagnostic review binding disagrees with the completed trial');
+            }
+          }
           this.database.updateVariant(variant.id, { status: 'building' });
           const built = await buildVariantImage(campaign, variant, worktree, directory, trustedPlanner);
           const imageId = (await runCommand('docker', ['image', 'inspect', '--format', '{{.Id}}', built.imageTag])).stdout.trim();
-          await writeFile(path.join(directory, 'pins.json'), `${JSON.stringify({ hypothesis: action.hypothesis, candidateHash, treatmentHash: await sha256File(treatment.patchPath), contextHash, imageId, harness: { ...state.harnessPins, ...executionHarnessPins } }, null, 2)}\n`, { flag: 'wx' });
+          await writeFile(path.join(directory, 'pins.json'), `${JSON.stringify({ hypothesis: action.hypothesis, candidateHash, treatmentHash: await sha256File(treatment.patchPath), contextHash, imageId, diagnosticReview: diagnosticReceipt ?? trialReview, harness: { ...state.harnessPins, ...executionHarnessPins } }, null, 2)}\n`, { flag: 'wx' });
           let result: unknown;
+          if (action.action === 'probe') {
+            this.database.updateVariant(variant.id, { status: 'gating' });
+            result = await runInvestigatorProbe(campaign, built.testImageTag, directory, built.environment, action.testFiles, diagnosticReview);
+          }
           if (action.action === 'test' || action.action === 'finalize') {
             this.database.updateVariant(variant.id, { status: 'gating' });
             result = await runInvestigatorTests(campaign, built.testImageTag, directory, built.environment,
@@ -2804,6 +2842,7 @@ export class CampaignOrchestrator {
               hypothesis: action.hypothesis,
               trustedTestResult: result,
               evaluatedTrial,
+              ...(diagnosticReview ? { diagnosticReview } : {}),
             }, null, 2)}\n`);
             const rootTreatment = await captureMutationDiff(campaign, variant, worktree, artifactDirectory, mutationBaselineTree);
             const rootCandidate = await captureAndGateDiff(campaign, variant, worktree, artifactDirectory);
@@ -2812,6 +2851,7 @@ export class CampaignOrchestrator {
             this.database.updateVariant(variant.id, { patchPath: rootCandidate.patchPath, patchHash: await sha256File(rootCandidate.patchPath) });
             result = { passed: true, tests: result, compliance: this.database.getVariant(variant.id).hypothesisCompliance };
           }
+          if (diagnosticReceipt) result = { ...(result as Record<string, unknown>), diagnosticReview: diagnosticReceipt };
           const returned = { patchHash: candidateHash, artifactDirectory: relativeDirectory, result };
           await writeFile(path.join(directory, 'receipt.json'), `${JSON.stringify(returned, null, 2)}\n`, { flag: 'wx' });
           return returned;

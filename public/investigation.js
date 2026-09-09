@@ -16,12 +16,17 @@ export const investigatorDefaults = {
   maxAgentTokens: 2_000_000,
 };
 
-const actionNames = { test: 'Test', evaluate_primary: 'Primary evaluation', finalize: 'Finalize', abandon: 'Abandon' };
+const actionNames = { test: 'Test', probe: 'Offline diagnostic probe', evaluate_primary: 'Primary evaluation', finalize: 'Finalize', abandon: 'Abandon' };
 const knownNumber = (value, format = formatNumber) => Number.isFinite(value) ? format(value) : 'Unknown';
+const isPrimaryTrial = (action) => action.kind === 'evaluate_primary' && action.admitted !== false;
 
 function actionOutcome(action) {
   if (!action) return 'No actions recorded';
+  if (action.kind === 'evaluate_primary' && action.admitted === false) return sanitizeDiagnosticValue(action.error) || 'Not admitted: diagnostic review required';
   if (action.status !== 'completed') return `${actionNames[action.kind] ?? 'Action'} ${action.status ?? 'status unknown'}`;
+  if (action.kind === 'probe') {
+    return action.result?.executionPassed === true ? 'Execution passed (diagnostic only)' : action.result?.executionPassed === false ? 'Execution failed (diagnostic only)' : 'Diagnostic execution result unknown';
+  }
   if (action.kind === 'test') {
     return action.result?.passed === true ? 'Tests passed (not correctness)' : action.result?.passed === false ? 'Tests failed' : 'Test result unknown';
   }
@@ -34,7 +39,7 @@ function actionOutcome(action) {
 export function investigationSummary(investigation) {
   if (!investigation) return 'No investigation recorded';
   const actions = investigation.actions ?? [];
-  const trials = actions.filter((action) => action.kind === 'evaluate_primary').length;
+  const trials = actions.filter(isPrimaryTrial).length;
   const tests = actions.filter((action) => action.kind === 'test').length;
   return `${trials} primary trial${trials === 1 ? '' : 's'} / ${tests} test${tests === 1 ? '' : 's'}; latest: ${actionOutcome(actions.at(-1))}`;
 }
@@ -73,7 +78,7 @@ export function investigationStatus(campaign, variant) {
     ['Session', investigation.sessionId ?? 'Not assigned'],
     ['Current action', current ? `${current.id} / ${actionNames[current.kind] ?? current.kind}` : 'None running'],
     ['Turns', `${knownNumber(investigation.turnCount)} / ${formatNumber(limits.maxTurns)}`],
-    ['Primary trials', `${actions.filter((action) => action.kind === 'evaluate_primary').length} / ${formatNumber(limits.maxPrimaryEvaluations)}`],
+    ['Primary trials', `${actions.filter(isPrimaryTrial).length} / ${formatNumber(limits.maxPrimaryEvaluations)}`],
     ['Primary screening', `${formatNumber(screening.replicateCount)} ${screening.countSource} / trial`],
     ['Baseline and final', `${formatNumber(campaign.config.evaluation.replicates)} / benchmark`],
     ['Wall time', `${knownNumber(Number.isFinite(start) && Number.isFinite(end) ? Math.max(0, end - start) : null, formatDuration)} / ${formatDuration(limits.maxWallTimeMs)}`],
@@ -153,7 +158,7 @@ export function investigationPanel(campaign, variant) {
     investigationStatus(campaign, variant),
   ]);
   if (!investigation) return panel;
-  const latestTrial = investigation.actions?.findLast((action) => action.kind === 'evaluate_primary' && action.status === 'completed');
+  const latestTrial = investigation.actions?.findLast((action) => isPrimaryTrial(action) && action.status === 'completed');
   panel.append(element('section', { className: 'investigation-comparison' }, [
     element('h3', { text: 'Latest recorded primary comparison' }),
     latestTrial ? element('p', { className: 'identifier', text: `${latestTrial.id} / ${latestTrial.hypothesis?.title ?? 'Recorded hypothesis'}` }) : null,
@@ -175,6 +180,7 @@ export function investigationPanel(campaign, variant) {
     const logPaths = Array.isArray(tests?.logPaths) ? tests.logPaths : [];
     const details = disclosure(key, 'Hypothesis, result and logs', () => {
       const hypothesis = action.hypothesis;
+      const review = action.result?.diagnosticReview;
       const content = element('div', { className: 'investigation-action-detail' }, [
         element('p', { className: 'suggestion', text: 'Agent interpretation / unverified' }),
         ...[
@@ -191,7 +197,22 @@ export function investigationPanel(campaign, variant) {
         element('p', { className: 'identifier', text: `Started: ${action.startedAt ?? 'Unknown'} / Completed: ${action.completedAt ?? 'Not recorded'}` }),
         element('p', { className: 'identifier', text: `Patch: ${action.patchHash ?? 'Not recorded'}` }),
         action.error ? element('div', { className: 'error-panel' }, [element('h3', { text: 'Recorded action error' }), element('p', { className: 'investigation-prose', text: sanitizeDiagnosticValue(action.error) })]) : null,
-        action.kind === 'evaluate_primary' ? evaluationResult(action.result, campaign) : null,
+        action.kind === 'probe' ? element('div', {}, [
+          element('p', { text: actionOutcome(action) }),
+          element('p', { className: 'muted', text: 'Offline execution only: not full configured tests, primary evaluation, or promotion. Diagnostic review is required before primary screening; a passing probe is optional.' }),
+          element('p', { text: `Provider calls: ${knownNumber(action.result?.providerCalls)}` }),
+          element('p', { className: 'identifier', text: `Input hash: ${action.result?.inputHash ?? 'Not recorded'}` }),
+          element('p', { className: 'identifier', text: `Image: ${action.result?.imageId ?? 'Not recorded'}` }),
+          typeof action.result?.interpretation === 'string' ? element('p', { className: 'suggestion investigation-prose', text: `Unverified interpretation: ${sanitizeDiagnosticValue(action.result.interpretation)}` }) : null,
+        ]) : null,
+        review && (action.kind === 'probe' || action.kind === 'evaluate_primary') ? element('div', {}, [
+          element('h3', { className: 'suggestion', text: 'Diagnostic review / unverified model judgment' }),
+          element('p', { className: 'muted', text: 'Structural recording is not diagnostic truth and contributes no scores. Inspect the full qualification and citations through the archive links below.' }),
+          ...[
+            ['Review hash', review.reviewHash], ['Review artifact hash', review.artifactHash], ['Review artifact', review.artifactPath],
+          ].map(([label, value]) => element('p', { className: 'identifier', text: `${label}: ${value ?? 'Not recorded'}` })),
+        ]) : null,
+        isPrimaryTrial(action) ? evaluationResult(action.result, campaign) : null,
         action.kind === 'test' ? element('p', { text: `${actionOutcome(action)}. Passing tests do not establish planner correctness.` }) : null,
         action.kind === 'finalize' ? element('div', {}, [
           element('h3', { text: 'Finalization checks' }),
@@ -255,7 +276,7 @@ export function investigationPanel(campaign, variant) {
       ]),
       element('td', {}, [
         statusLabel(action.status), element('p', { text: actionOutcome(action) }),
-        action.kind === 'evaluate_primary' && action.status === 'completed' && action.result?.score ? element('p', {
+        isPrimaryTrial(action) && action.status === 'completed' && action.result?.score ? element('p', {
           className: 'investigation-score',
           text: `Verified: ${knownNumber(action.result.score.verified?.accuracy, formatPercent)} / Provisional: ${knownNumber(action.result.score.provisional?.accuracy, formatPercent)}${campaign.config.investigator?.enabled || action.result.score.metricMode === 'replicate_mean' ? ' (replicate mean)' : ''}`,
         }) : null,
@@ -263,7 +284,7 @@ export function investigationPanel(campaign, variant) {
       ]),
     ]));
   }
-  panel.append(element('p', { className: 'muted investigation-note', text: 'Action order is recorded order. Hypotheses and action rationales are unverified interpretations; tests measure execution only. Primary trials include failed attempts.' }),
+  panel.append(element('p', { className: 'muted investigation-note', text: 'Action order is recorded order. Hypotheses and action rationales are unverified interpretations; tests and probes measure execution only. Primary trials include admitted failed attempts and historical actions without admission metadata, but exclude requests that were not admitted.' }),
     investigation.actions?.length ? element('div', { className: 'table-scroll investigation-table-wrap', attributes: { 'data-live-key': `${variant.id}:timeline-scroll` } }, [
       element('table', { className: 'investigation-table' }, [
         element('caption', { text: 'Investigation action timeline' }),
