@@ -233,3 +233,38 @@ test('mergeExecutionSnapshot retains the last checkpoint while a successor is ad
     durationMs: 25,
   });
 });
+
+test('mergeExecutionSnapshot clears prior failure when case or run identity is unknown', () => {
+  const failed = executionSnapshotFromRun({
+    runtime: { status: 'failed', failureCode: 'model_timeout' },
+  }, { questions: [] });
+  const input = { benchmark: 'primary-pack', role: 'primary' as const, replicate: 1, replicateCount: 2 };
+  for (const [caseId, runId] of [
+    [null, null], ['case-a', null], [null, 'run-a'], ['', ''], ['case-a', ''], ['', 'run-a'],
+  ] as const) {
+    const snapshot = { ...failed, caseId, runId };
+    const state = mergeExecutionSnapshot(null, { ...input, snapshot });
+    assert.ok(state.executions[0]?.failure);
+    const next = mergeExecutionSnapshot(state, {
+      ...input, snapshot: { ...snapshot, status: 'starting', failure: null },
+    });
+    assert.equal(next.executions[0]?.failure, null, `identity ${JSON.stringify([caseId, runId])}`);
+  }
+});
+
+test('mergeExecutionSnapshot retains failure only for the same nonempty case and run identity', () => {
+  const snapshot = executionSnapshotFromRun({
+    run: { id: 'run-a', caseId: 'case-a', status: 'failed' },
+    runtime: { status: 'failed', failureCode: 'model_timeout' },
+  }, { questions: [] });
+  const input = { benchmark: 'primary-pack', role: 'primary' as const, replicate: 1, replicateCount: 2 };
+  const state = mergeExecutionSnapshot(null, { ...input, snapshot });
+  const next = mergeExecutionSnapshot(state, { ...input, snapshot: { ...snapshot, failure: null } });
+  assert.deepEqual(next.executions[0]?.failure, snapshot.failure);
+  for (const [caseId, runId] of [['other-case', 'run-a'], ['case-a', 'other-run']] as const) {
+    const successor = mergeExecutionSnapshot(state, {
+      ...input, snapshot: { ...snapshot, caseId, runId, status: 'starting', failure: null },
+    });
+    assert.equal(successor.executions[0]?.failure, null);
+  }
+});

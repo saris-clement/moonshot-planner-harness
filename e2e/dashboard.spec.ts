@@ -3,8 +3,9 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import type { Server } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { HarnessDatabase } from '../src/db.js';
+import { readVariantDiagnostics } from '../src/failures.js';
 import { computeReplicateMeanScore, computeScore, consensusRunFacts, extractRunFacts } from '../src/metrics.js';
 import { CampaignOrchestrator } from '../src/orchestrator.js';
 import type { InvestigationState } from '../src/investigator.js';
@@ -825,6 +826,342 @@ test.afterAll(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
+async function blockedBaselineFixture(page: Page, legacy = false) {
+  const details = await (await page.request.get(`${baseUrl}/api/campaigns/${campaignId}`)).json();
+  const variant = details.variants.find((item: { id: string }) => item.id === baselineId);
+  const target = details.targetExcludedEvaluations.find((item: { variantId: string }) => item.variantId === baselineId);
+  const failure = {
+    origin: 'planner', code: 'model_boundary_violation_candidate_outside_shortlist',
+    message: 'Unit 83 rejected. Authorization: Bearer fixture-secret-value; api_key=fixture-key-value',
+    occurredAt: '2026-09-06T05:00:10.000Z', failedRequirementUnitIds: ['unit-83'],
+    lastCheckpointStage: 'adjudicating', providerRetryBudgetAvailable: false, httpStatus: 429,
+    details: { kind: 'candidate_outside_shortlist', version: 1, requirementUnitId: 'unit-83', disposition: 'reuse',
+      selected: [{ index: 0, id: 'capability:outside', allowed: false, origin: 'discovered' }],
+      allowedIds: ['capability:allowed'], counts: { selected: 1, allowed: 1, shortlist: 1, discovered: 1, supporting: 0 }, truncated: false,
+      password: 'fixture-password-value', nested: { token: 'fixture-token-value' } },
+    provenance: { source: 'archive', artifactPath: 'target-excluded/excluded/primary-pack/replicate-2/events.json' },
+  };
+  Object.assign(details.campaign, { status: 'baseline_target_failed', currentParentVariantId: null });
+  Object.assign(variant, { status: 'review', error: null });
+  Object.assign(target, { status: 'failed', error: null, gate: null, comparisons: [], excludedFacts: null,
+    excludedReplicateFacts: [target.excludedReplicateFacts[0]],
+    executionState: { executions: [target.executionState.executions[0], {
+      ...target.executionState.executions[1], status: 'failed', stage: 'failed',
+      progress: { completedUnits: 83, totalUnits: 125 },
+      ...(legacy ? {} : { failure }),
+    }] },
+  });
+  const diagnostic = {
+    status: 'blocked', counts: { completed: 5, failed: 1, pending: 0, total: 6 }, standardAvailable: true,
+    failures: [{ scope: 'excluded', benchmark: 'primary-pack', replicate: 2,
+      caseId: 'case-primary-pack:excluded-2', runId: 'run-primary-pack:excluded-2',
+      progress: { completedUnits: 83, totalUnits: 125 }, failure }],
+    environment: { password: 'DO_NOT_COPY_UNKNOWN_FIELDS' },
+  };
+  await page.route(`${baseUrl}/api/campaigns/${campaignId}`, (route) => route.fulfill({ json: details }));
+  return { details, variant, target, diagnostic };
+}
+
+async function fixtureScreenshot(page: Page, name: string) {
+  const directory = path.resolve('.data/screenshots');
+  await mkdir(directory, { recursive: true });
+  await page.screenshot({ path: path.join(directory, `${name}.png`), animations: 'disabled' });
+}
+
+test('blocked baseline retains five completed results and lazy sanitized exact failure diagnostics', async ({ page }) => {
+  const { details, variant, diagnostic } = await blockedBaselineFixture(page);
+  let reads = 0;
+  const posts: string[] = [];
+  page.on('request', (request) => { if (request.method() === 'POST') posts.push(request.url()); });
+  await page.route(`**/variants/${baselineId}/diagnostics`, (route) => { reads++; return route.fulfill({ json: diagnostic }); });
+  await page.addInitScript(() => Object.defineProperty(navigator, 'clipboard', {
+    value: { writeText: async (value: string) => { (globalThis as unknown as { copied: string }).copied = value; } },
+  }));
+  for (const width of [1440, 390, 320]) {
+    await page.setViewportSize({ width, height: 1000 });
+    await page.goto(`${baseUrl}/campaigns/${campaignId}/overview`);
+    const banner = page.getByTestId(`failure-banner-${baselineId}`);
+    await expect(banner).toContainText('Baseline blocked');
+    await expect(banner).toContainText('Guard failed');
+    await expect(banner).toContainText('5 completed / 6 total');
+    const matrix = page.getByTestId(`active-variant-${baselineId}`);
+    await expect(matrix.locator('[data-replicate-state="completed"]')).toHaveCount(5);
+    const failed = matrix.getByTestId(`replicate-${baselineId}-primary-pack:excluded-2`);
+    await expect(failed).toContainText('83 / 125');
+    await expect(failed.getByRole('progressbar')).toHaveAttribute('value', '83');
+    await expect(failed).toContainText('Last accepted');
+    await expect(matrix.getByTestId(`replicate-${baselineId}-primary-pack:excluded-1`).getByRole('link', { name: 'Trace' })).toBeVisible();
+    const before = reads;
+    await banner.getByText('Failure diagnostics', { exact: true }).click();
+    await expect.poll(() => reads).toBe(before + 1);
+    await expect(banner).toContainText('model_boundary_violation_candidate_outside_shortlist');
+    await expect(banner).toContainText('unit-83');
+    await expect(banner).toContainText('excluded / primary-pack / replicate 2');
+    await expect(banner).toContainText('HTTP status: 429');
+    await expect(banner.getByRole('link', { name: 'Failed run trace' })).toHaveAttribute('href', /case-primary-pack/);
+    await banner.getByRole('button', { name: 'Copy diagnostics JSON' }).click();
+    const copied = await page.evaluate<string>('window.copied');
+    expect(JSON.parse(copied).failures[0].failure.failedRequirementUnitIds).toEqual(['unit-83']);
+    for (const secret of ['fixture-secret-value', 'fixture-key-value', 'fixture-password-value', 'fixture-token-value', 'DO_NOT_COPY_UNKNOWN_FIELDS']) {
+      expect(copied).not.toContain(secret);
+      await expect(banner).not.toContainText(secret);
+    }
+    const disclosure = banner.locator('details').first();
+    const node = await disclosure.elementHandle();
+    await banner.getByText('Exact details and provenance (sanitized)', { exact: true }).click();
+    const exact = banner.locator('.diagnostic-failure details');
+    const exactNode = await exact.elementHandle();
+    details.campaign.config.goal = `Refreshed at ${width}`;
+    variant.updatedAt = new Date(1_800_000_000_000 + width).toISOString();
+    const diagnosticRefresh = page.waitForResponse(`**/variants/${baselineId}/diagnostics`);
+    const refreshed = page.waitForResponse(`${baseUrl}/api/campaigns/${campaignId}`);
+    database.addEvent(campaignId, baselineId, 'variant.updated', {});
+    await refreshed;
+    await diagnosticRefresh;
+    await expect(disclosure).toHaveAttribute('open', '');
+    await expect(exact).toHaveAttribute('open', '');
+    expect(await node!.evaluate((node) => node.isConnected)).toBe(true);
+    expect(await exactNode!.evaluate((node) => node.isConnected)).toBe(true);
+    expect(await page.evaluate<number>('document.documentElement.scrollWidth')).toBe(width);
+    await banner.evaluate((node) => node.scrollIntoView({ block: 'start' }));
+    await fixtureScreenshot(page, `failure-banner-${width}`);
+    await exact.evaluate((node) => node.scrollIntoView({ block: 'center' }));
+    await fixtureScreenshot(page, `failure-details-${width}`);
+    await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${baselineId}?tab=target-excluded`);
+    await expect(page.locator('.counterfactual-strip')).toContainText('Not assessed');
+    await expect(page.locator('dt', { hasText: /^Leakage paths$/ }).locator('..')).toContainText('Not assessed');
+    await expect(page.getByRole('button', { name: 'Retry complete evaluation' })).toHaveCount(0);
+    await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${baselineId}`);
+    await expect(page.getByTestId(`failure-banner-${baselineId}`)).toContainText('Standard results remain available');
+    await page.goto(`${baseUrl}/campaigns/${campaignId}/lineage?view=list`);
+    await expect(page.locator(`[data-lineage-id="${baselineId}"]`)).toContainText('Baseline blocked');
+    await page.goto(`${baseUrl}/campaigns/${campaignId}/review/${baselineId}?benchmark=primary-pack&filter=all&unit=unit-a`);
+    await expect(page.getByTestId(`failure-banner-${baselineId}`)).toBeVisible();
+  }
+  expect(posts).toEqual([]);
+});
+
+test('legacy V1 control failure retains seven completed runs and its actual diagnostic scope', async ({ page }) => {
+  const details = await (await page.request.get(`${baseUrl}/api/campaigns/${campaignId}`)).json();
+  const variant = details.variants.find((item: { id: string }) => item.id === reviewId);
+  const target = details.targetExcludedEvaluations.find((item: { variantId: string }) => item.variantId === reviewId);
+  delete details.campaign.config.targetExcluded;
+  Object.assign(details.targetExcludedConfig, { protocol: 'dedicated-control-v1', replicates: 2 });
+  const control = { ...execution({ benchmark: 'primary-pack:target-excluded/control', role: 'primary', replicate: 1, status: 'failed', stage: 'failed', completedUnits: 83, totalUnits: 125 }),
+    failure: { origin: 'planner', code: 'model_timeout', message: 'The model provider request timed out.', occurredAt: '2026-09-08T10:00:00Z',
+      failedRequirementUnitIds: ['unit-83'], lastCheckpointStage: 'adjudicating', providerRetryBudgetAvailable: false, httpStatus: null } };
+  Object.assign(target, { status: 'failed', error: null, gate: null, normalArmBinding: null, executionState: { executions: [
+    control, execution({ benchmark: 'primary-pack:target-excluded/control', role: 'primary', replicate: 2 }),
+    execution({ benchmark: 'primary-pack:excluded', role: 'primary', replicate: 1 }), execution({ benchmark: 'primary-pack:excluded', role: 'primary', replicate: 2 }),
+  ] } });
+  Object.assign(variant, { error: null, status: 'review' });
+  const projection = await readVariantDiagnostics(paths, details.campaign, variant, target);
+  expect(projection.counts).toEqual({ completed: 7, failed: 1, pending: 0, total: 8 });
+  expect(projection.failures[0]?.scope).toBe('control');
+  await page.route(`${baseUrl}/api/campaigns/${campaignId}`, (route) => route.fulfill({ json: details }));
+  let archiveAvailable = false;
+  await page.route(`**/variants/${reviewId}/diagnostics`, (route) => route.fulfill(archiveAvailable
+    ? { json: projection } : { status: 503, json: { error: 'Unavailable' } }));
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/experiments/${reviewId}?tab=runs`);
+  const banner = page.getByTestId(`failure-banner-${reviewId}`);
+  await expect(banner).toContainText('7 completed / 8 total; 1 failed');
+  await expect(page.locator('[data-replicate-state="completed"]')).toHaveCount(7);
+  const failed = page.locator('[data-replicate-state="failed"]');
+  await expect(failed).toHaveCount(1);
+  await expect(failed).toContainText('target control');
+  await expect(failed).toContainText('83 / 125');
+  await banner.getByText('Failure diagnostics', { exact: true }).click();
+  await expect(banner).toContainText('control / primary-pack / replicate 1');
+  await expect(banner).not.toContainText('excluded / primary-pack / replicate 1');
+  archiveAvailable = true;
+  await banner.getByRole('button', { name: 'Reload diagnostics' }).click();
+  await expect(banner).toContainText('control / primary-pack / replicate 1');
+  await expect(banner).toContainText('model_timeout');
+  database.addEvent(campaignId, reviewId, 'variant.updated', {});
+  await expect(failed).toContainText('failed');
+  await expect(banner).toContainText('7 completed / 8 total; 1 failed');
+  await expect(page.getByRole('button', { name: 'Retry excluded baseline (2 runs)' })).toHaveCount(0);
+});
+
+test('legacy missing failure details stay unknown and excluded baseline retry is narrowly confirmed', async ({ page }) => {
+  const { details, diagnostic } = await blockedBaselineFixture(page, true);
+  const posts: string[] = [];
+  let archiveAvailable = false;
+  await page.route(`**/variants/${baselineId}/diagnostics`, (route) => route.fulfill(archiveAvailable
+    ? { json: { ...diagnostic, failures: diagnostic.failures.map((item) => ({ ...item, failure: { ...item.failure, details: null, provenance: null } })) } }
+    : { status: 404, json: { error: 'Unavailable Bearer do-not-render-this-secret' } }));
+  await page.route(`${baseUrl}/api/campaigns/${campaignId}/baseline`, (route) => {
+    posts.push(route.request().method());
+    return route.fulfill({ json: { admitted: true } });
+  });
+  await page.goto(`${baseUrl}/campaigns/${campaignId}/overview`);
+  const banner = page.getByTestId(`failure-banner-${baselineId}`);
+  await banner.getByText('Failure diagnostics', { exact: true }).click();
+  await expect(banner).toContainText('Exact failure details were not recorded');
+  await expect(banner).toContainText('Diagnostics unavailable');
+  await expect(banner).not.toContainText('do-not-render-this-secret');
+  await expect(banner).not.toContainText('model_boundary_violation_candidate_outside_shortlist');
+  archiveAvailable = true;
+  await banner.getByRole('button', { name: 'Reload diagnostics' }).click();
+  await expect(banner).toContainText('model_boundary_violation_candidate_outside_shortlist');
+  await expect(banner).toContainText('Exact details and provenance were not captured in this record.');
+  const retry = page.getByRole('button', { name: 'Retry excluded baseline (2 runs)', exact: true });
+  await expect(retry).toBeVisible();
+  page.once('dialog', async (dialog) => {
+    expect(dialog.message()).toContain('two excluded runs');
+    expect(dialog.message()).toContain('preserves completed standard');
+    await dialog.dismiss();
+  });
+  await retry.click();
+  expect(posts).toEqual([]);
+  page.once('dialog', (dialog) => dialog.accept());
+  await retry.click();
+  await expect.poll(() => posts).toEqual(['POST']);
+  for (const mismatch of ['target', 'baseline', 'status', 'running']) {
+    const original = structuredClone(details);
+    if (mismatch === 'target') details.targetExcludedConfig.targetImplementationWorkflow = 'other/workflow';
+    if (mismatch === 'baseline') details.targetExcludedConfig.baselineVariantId = reviewId;
+    if (mismatch === 'status') details.campaign.status = 'ready';
+    if (mismatch === 'running') details.targetExcludedEvaluations.find((item: { variantId: string }) => item.variantId === baselineId).executionState.executions[1].status = 'running';
+    await page.reload();
+    await expect(retry).toHaveCount(0);
+    Object.assign(details, original);
+  }
+});
+
+test('explores bounded observations, frozen-parent comparisons, units and evidence access without raw chat', async ({ page }) => {
+  const requests: { tool: string; query: Record<string, unknown> }[] = [];
+  let auditReads = 0;
+  const envelope = (items: unknown[], extra = {}) => ({ schemaVersion: 1, snapshotRef: 'snapshot_trial',
+    items, returnedCount: items.length, totalMatched: items.length, nextCursor: null, availability: 'available', omissions: [], ...extra });
+  await page.route(`**/variants/${investigatorId}/evidence?*`, (route) => {
+    const url = new URL(route.request().url());
+    const tool = url.searchParams.get('tool')!;
+    const query = JSON.parse(url.searchParams.get('query')!);
+    requests.push({ tool, query });
+    if (tool === 'list_observations') return route.fulfill({ json: envelope(query.cursor ? [
+      { kind: 'observation', actionId: 'action-003', snapshotRef: 'snapshot_second', benchmark: 'primary-pack', arm: 'standard', role: 'trial', replicateCount: 2, unitCount: 125, sourceAvailability: 'not_captured' },
+    ] : [{ kind: 'observation', actionId: 'primary-trial', snapshotRef: 'snapshot_trial', benchmark: 'primary-pack', arm: 'standard', role: 'trial', replicateCount: 2, unitCount: 125, sourceAvailability: 'available_on_request' },
+      { kind: 'evidence', evidenceKind: 'test_log', evidenceRef: 'ev_log', name: 'investigation/test.log', bytes: 250 }],
+    { nextCursor: query.cursor ? null : 'observations-page-2', totalMatched: 3 }) });
+    if (tool === 'compare_trial') return route.fulfill({ json: envelope(query.cursor ? [
+      { unitRef: 'unit_second', baselineUnitRef: 'unit_baseline_second', unitKey: 'unit-b', before: { build: 1 }, after: { reuse: 0.5, build: 0.5 }, changed: true, expectedDecision: null, labelStatus: null, baselineAgreement: null, trialAgreement: null },
+    ] : [{ unitRef: 'unit_first', baselineUnitRef: 'unit_baseline_first', unitKey: 'unit-a', before: { reuse: 0.5, build: 0.5 }, after: { build: 1 }, changed: true, expectedDecision: 'build', labelStatus: 'suggested', baselineAgreement: 0.5, trialAgreement: 1 }],
+    { nextCursor: query.cursor ? null : 'units-page-2', totalMatched: 2, baselineSnapshotRef: 'snapshot_parent',
+      summary: { unitCount: 2, changedUnitCount: 2, sameAggregateHistogram: true, baselineMeanAgreement: 0.5, trialMeanAgreement: 1 },
+      labelBasis: { source: 'investigator_reference', labelSetHash: 'frozen-labels', interpretation: 'Fixed-label agreement is diagnostic, not a new promotion score. Suggested labels are unverified judgments.' } }) });
+    if (tool === 'inspect_unit') return route.fulfill({ json: envelope([{ replicate: 1, decision: 'build', confidence: 'high', shortlistCandidateCount: 3, discoveredEvidenceCount: 0, selectedCandidateIds: [],
+      evidenceRef: 'ev_unit', rawAnalysis: { availability: 'not_captured', evidenceRef: null }, sourceRefs: [{ path: 'src/shared/account.ts', symbol: 'accountId', evidenceRef: 'ev_source', availability: 'available' }] },
+      { replicate: 2, availability: 'not_captured', evidenceRef: 'ev_missing' }], { unitRef: query.unitRef, unitKey: 'unit-b', availability: 'partial', omissions: [{ reason: 'unit_not_captured_in_replicate', count: 1 }] }) });
+    if (tool === 'read_evidence') return route.fulfill({ json: envelope([{ text: query.offset ? 'second evidence chunk' : 'first evidence chunk <img src=x onerror=alert(1)>' }],
+      { nextOffset: query.offset ? null : 20, totalMatched: 40, offsetUnit: 'utf8_bytes', omissions: [{ reason: 'continued_at_nextOffset' }] }) });
+    if (tool === 'search_source') return route.fulfill({ json: envelope([{ evidenceRef: 'ev_source', path: 'src/shared/account.ts', line: 2 }], { sourcePolicy: 'normal_frozen_source' }) });
+    return route.fulfill({ status: 400, json: { error: 'Unexpected tool' } });
+  });
+  await page.route(`**/variants/${investigatorId}/evidence-reads*`, (route) => {
+    auditReads++;
+    const second = new URL(route.request().url()).searchParams.has('cursor');
+    return route.fulfill({ json: { items: [{ id: second ? 'audit-2' : 'audit-1', tool: second ? 'read_evidence' : 'inspect_unit',
+      scope: { campaignId: investigatorCampaignId, variantId: investigatorId, turn: 2 }, createdAt: '2026-09-08T10:00:00Z', bytes: 1024, status: 'ok', requestRef: 'ev_request', responseRef: 'ev_response' }],
+    nextCursor: second ? null : 'audit-next', rawChat: 'RAW_CHAT_MUST_NOT_RENDER' } });
+  });
+  for (const width of [1440, 390, 320]) {
+    await page.setViewportSize({ width, height: 1000 });
+    const before = requests.length;
+    const auditBefore = auditReads;
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${investigatorId}?tab=investigation`);
+    expect(requests.length).toBe(before);
+    expect(auditReads).toBe(auditBefore);
+    const explorer = page.getByTestId('evidence-explorer');
+    await explorer.getByText('Explore evidence', { exact: true }).click();
+    await expect(explorer).toContainText('primary-trial');
+    await explorer.getByRole('button', { name: 'Next page', exact: true }).click();
+    await expect(explorer).toContainText('action-003');
+    await explorer.getByLabel('Evidence tool').selectOption('compare_trial');
+    await explorer.getByLabel('Observation').selectOption('snapshot_trial');
+    await explorer.getByRole('button', { name: 'Load evidence', exact: true }).click();
+    await expect(explorer).toContainText('unit-a');
+    expect(requests.at(-1)).toEqual({ tool: 'compare_trial', query: { snapshotRef: 'snapshot_trial' } });
+    await expect(explorer).toContainText('frozen parent');
+    await expect(explorer).toContainText('Reuse 50%');
+    await expect(explorer).toContainText('Build 100%');
+    await expect(explorer).toContainText('LLM suggestion / unverified');
+    await expect(explorer).toContainText('Fixed-label agreement');
+    await expect(explorer.locator('.evidence-item pre')).not.toBeVisible();
+    await explorer.evaluate((node) => node.scrollIntoView({ block: 'start' }));
+    await fixtureScreenshot(page, `evidence-comparison-${width}`);
+    await explorer.getByRole('button', { name: 'Next page', exact: true }).click();
+    await expect(explorer).toContainText('unit-b');
+    await explorer.getByRole('button', { name: 'Inspect unit', exact: true }).click();
+    await expect(explorer).toContainText('Shortlist candidates');
+    await expect(explorer).toContainText('Replicate 2');
+    await expect(explorer).toContainText('Not captured');
+    await expect(explorer.locator('dt', { hasText: /^Discovered evidence$/ }).first().locator('..')).toContainText('0');
+    expect(requests.at(-1)?.query).toEqual({ unitRef: 'unit_second' });
+    await explorer.evaluate((node) => node.scrollIntoView({ block: 'start' }));
+    await fixtureScreenshot(page, `evidence-unit-${width}`);
+    await explorer.getByRole('button', { name: 'Read evidence', exact: true }).first().click();
+    await expect(explorer).toContainText('first evidence chunk');
+    await expect(explorer.locator('img')).toHaveCount(0);
+    await expect(explorer).toContainText('continued at nextOffset');
+    await explorer.getByRole('button', { name: 'Next page', exact: true }).click();
+    await expect(explorer).toContainText('second evidence chunk');
+    expect(requests.at(-1)?.query).toEqual({ evidenceRef: 'ev_unit', offset: 20 });
+    await explorer.getByLabel('Evidence tool').selectOption('search_source');
+    await explorer.getByLabel('Source search').fill('accountId');
+    await explorer.getByRole('button', { name: 'Load evidence', exact: true }).click();
+    await expect(explorer).toContainText('normal_frozen_source');
+    await expect(explorer).toContainText('src/shared/account.ts');
+    const disclosureNode = await explorer.elementHandle();
+    const toolNode = await explorer.getByLabel('Evidence tool').elementHandle();
+    const audit = page.getByTestId('evidence-access');
+    await audit.getByText('Evidence access', { exact: true }).click();
+    await expect(audit).toContainText('audit-1');
+    await expect(audit).toContainText('1024');
+    await audit.getByRole('button', { name: 'Next page', exact: true }).click();
+    await expect(audit).toContainText('audit-2');
+    await expect(audit).toContainText('ev_request');
+    await expect(page.locator('body')).not.toContainText('RAW_CHAT_MUST_NOT_RENDER');
+    const refreshed = page.waitForResponse(`${baseUrl}/api/campaigns/${investigatorCampaignId}`);
+    database.addEvent(investigatorCampaignId, investigatorId, 'investigator.updated', {});
+    await refreshed;
+    await expect(explorer).toHaveAttribute('open', '');
+    await expect(audit).toHaveAttribute('open', '');
+    expect(await disclosureNode!.evaluate((node) => node.isConnected)).toBe(true);
+    expect(await toolNode!.evaluate((node) => node.isConnected)).toBe(true);
+    await expect(explorer.getByLabel('Source search')).toHaveValue('accountId');
+    expect(await page.evaluate<number>('document.documentElement.scrollWidth')).toBe(width);
+  }
+});
+
+test('evidence errors are explicit and retryable without replacing the recorded action summary', async ({ page }) => {
+  const details = await (await page.request.get(`${baseUrl}/api/campaigns/${investigatorCampaignId}`)).json();
+  const variant = details.variants.find((item: { id: string }) => item.id === investigatorId);
+  const trial = variant.investigation.actions.find((action: { id: string }) => action.id === 'primary-trial');
+  delete trial.result.facts;
+  delete trial.result.replicateFacts;
+  Object.assign(variant, { facts: null, score: null });
+  await page.route(`${baseUrl}/api/campaigns/${investigatorCampaignId}`, (route) => route.fulfill({ json: details }));
+  let reads = 0;
+  await page.route(`**/variants/${investigatorId}/evidence?*`, (route) => route.fulfill(++reads === 1
+    ? { status: 503, json: { error: 'raw secret should not display' } }
+    : { json: { schemaVersion: 1, snapshotRef: null, items: [], returnedCount: 0, totalMatched: 0, nextCursor: null, availability: 'not_captured', omissions: ['Historical receipt was not captured.'] } }));
+  await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${investigatorId}?tab=investigation`);
+  const explorer = page.getByTestId('evidence-explorer');
+  await explorer.getByText('Explore evidence', { exact: true }).click();
+  await expect(explorer).toContainText('Evidence unavailable');
+  await expect(explorer).not.toContainText('raw secret');
+  await explorer.getByRole('button', { name: 'Load evidence' }).click();
+  await expect(explorer).toContainText('not_captured');
+  await expect(explorer).toContainText('Historical receipt was not captured.');
+  await expect(page.getByTestId('investigation-action-primary-trial')).toContainText('Primary score recorded');
+  await expect(page.locator('.investigation-comparison')).toContainText('Trial 0.0% / Frozen reference 100.0%');
+  await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/lineage?view=list`);
+  const card = page.locator(`[data-lineage-id="${investigatorId}"]`);
+  await expect(card).toContainText('Latest screening: primary-trial');
+  await expect(card.locator('dt', { hasText: /^Agreement$/ }).locator('..')).toContainText('—');
+});
+
 test('serves valid HTML deep links and never falls back for APIs or extensions', async ({ request }) => {
   const deepLink = await request.get(`${baseUrl}/campaigns/${campaignId}/experiments/${baselineId}?tab=runs`);
   expect(deepLink.status()).toBe(200);
@@ -1018,15 +1355,14 @@ test('shows the immutable two-run target-excluded guard and separate review trut
   await expect(targetRuns.getByRole('columnheader')).toHaveCount(5);
   await expect(targetRuns.getByRole('rowheader')).toHaveCount(2);
   await expect(page.getByText('Disposition profile')).toBeVisible();
-  await expect(page.getByText('Valid', { exact: true })).toBeVisible();
+  await expect(page.locator('dt', { hasText: /^Pair validity$/ }).locator('..')).toContainText('Not assessed');
   for (const decision of ['Build', 'Reuse', 'Extend', 'Defer', 'Question']) {
     await expect(
       page.locator(`.counterfactual-decisions .decision-code-${decision.toLowerCase()}`).first(),
     ).toHaveText(decision);
   }
-  const retry = page.getByRole('button', { name: 'Retry complete evaluation' });
-  await expect(retry).toBeVisible();
-  await expect(retry).not.toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+  await expect(page.getByRole('button', { name: 'Retry complete evaluation' })).toHaveCount(0);
+  await expect(page.getByTestId(`failure-banner-${baselineId}`)).toContainText('Guard failed');
   database.updateTargetExcludedEvaluation(baselineId, { status: 'completed' });
 
   await page.getByRole('link', { name: 'Review excluded requirements' }).click();
@@ -1371,6 +1707,75 @@ test('retains a central dirty review draft across SSE and guards navigation befo
   await expect(page).toHaveURL(`${baseUrl}/campaigns/${campaignId}/overview`);
 });
 
+test('offline diagnostic probes show unverified receipts without primary credit or eager review reads', async ({ page }) => {
+  const details = await (await page.request.get(`${baseUrl}/api/campaigns/${investigatorCampaignId}`)).json();
+  const variant = details.variants.find((item: { id: string }) => item.id === investigatorId);
+  const historicalTrial = variant.investigation.actions.find((action: { id: string }) => action.id === 'primary-trial');
+  const diagnosticReview = {
+    reviewHash: `sha256:${'2'.repeat(64)}`, artifactHash: `sha256:${'3'.repeat(64)}`,
+    artifactPath: 'diagnostic-review.json', interpretationStatus: 'unverified_model_judgment',
+  };
+  historicalTrial.result.diagnosticReview = diagnosticReview;
+  const probe = { ...historicalTrial, id: 'probe', kind: 'probe', artifactDirectory: 'investigation/probe', result: {
+    kind: 'diagnostic_probe', executionPassed: true, providerCalls: 0,
+    imageId: `sha256:${'4'.repeat(64)}`, inputHash: `sha256:${'5'.repeat(64)}`,
+    testFiles: ['server/test/diagnostic.test.ts'], logPaths: ['investigation/probe/probe.log'],
+    interpretation: 'Offline fixtures do not establish planner correctness.', diagnosticReview,
+  } };
+  const blocked = { ...historicalTrial, id: 'not-admitted', admitted: false, status: 'failed', result: null, error: 'Not admitted: diagnostic review required' };
+  variant.investigation.actions = [historicalTrial,
+    { ...historicalTrial, id: 'admitted-failure', admitted: true, status: 'failed', result: null, error: 'Planner execution failed.' },
+    probe, blocked,
+    { ...blocked, id: 'not-admitted-no-error', status: 'completed', error: null },
+  ];
+  await page.route(`${baseUrl}/api/campaigns/${investigatorCampaignId}`, (route) => route.fulfill({ json: details }));
+  let archiveReads = 0;
+  const rawReads: string[] = [];
+  await page.route(`**/variants/${investigatorId}/artifacts*`, (route) => {
+    const artifactPath = new URL(route.request().url()).searchParams.get('path');
+    if (artifactPath) { rawReads.push(artifactPath); return route.fulfill({ json: { raw: 'FULL_REVIEW_MUST_NOT_AUTOLOAD' } }); }
+    archiveReads++;
+    return route.fulfill({ json: { files: [{ path: 'investigation/probe/diagnostic-review.json' }, { path: 'investigation/probe/probe.log' }] } });
+  });
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 1000 });
+    const before = archiveReads;
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${investigatorId}?tab=investigation`);
+    const status = page.getByTestId(`investigator-${investigatorId}`);
+    await expect(status).toContainText('2 primary trials / 0 tests; latest: Not admitted: diagnostic review required');
+    await expect(status.locator('dt', { hasText: /^Primary trials$/ }).locator('..')).toContainText('2 / 3');
+    await expect(page.locator('.investigation-comparison')).toContainText('primary-trial');
+    const row = page.getByTestId('investigation-action-probe');
+    await expect(row).toContainText('Offline diagnostic probe');
+    await expect(row).toContainText('Execution passed (diagnostic only)');
+    await expect(row).not.toContainText('Tests passed');
+    await expect(row.locator('.investigation-score')).toHaveCount(0);
+    for (const id of ['not-admitted', 'not-admitted-no-error']) {
+      const rejected = page.getByTestId(`investigation-action-${id}`);
+      await expect(rejected).toContainText('Not admitted: diagnostic review required');
+      await expect(rejected).not.toContainText('Primary evaluation failed');
+    }
+    await row.getByText('Hypothesis, result and logs', { exact: true }).click();
+    await expect(row).toContainText(`Input hash: ${probe.result.inputHash}`);
+    await expect(row).toContainText(`Image: ${probe.result.imageId}`);
+    await expect(row).toContainText('Provider calls: 0');
+    await expect(row).toContainText('not full configured tests, primary evaluation, or promotion');
+    for (const id of ['probe', 'primary-trial']) {
+      const action = page.getByTestId(`investigation-action-${id}`);
+      if (id !== 'probe') await action.getByText('Hypothesis, result and logs', { exact: true }).click();
+      await expect(action).toContainText(`Review hash: ${diagnosticReview.reviewHash}`);
+      await expect(action).toContainText(`Review artifact hash: ${diagnosticReview.artifactHash}`);
+      await expect(action).toContainText('Diagnostic review / unverified model judgment');
+      await expect(action).toContainText('diagnostic-review.json');
+    }
+    expect(archiveReads).toBe(before);
+    await row.getByText('Artifact paths and logs', { exact: true }).click();
+    await expect(row.getByRole('link', { name: 'investigation/probe/diagnostic-review.json' })).toHaveAttribute('href', /path=investigation%2Fprobe%2Fdiagnostic-review\.json$/);
+    expect(rawReads).toEqual([]);
+    expect(await page.evaluate<number>('document.documentElement.scrollWidth')).toBe(width);
+  }
+});
+
 test('keeps investigator budgets separate from planner usage and links compact trial summaries', async ({ page }) => {
   await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/overview`);
   const investigator = page.getByTestId(`investigator-${investigatorId}`);
@@ -1385,6 +1790,7 @@ test('keeps investigator budgets separate from planner usage and links compact t
   await expect(zero.locator('dt', { hasText: /^Agent tokens$/ }).locator('..')).toContainText('0 / 2,000,000');
   await expect(zero.locator('dt', { hasText: /^Agent cost$/ }).locator('..')).toContainText('$0.00');
   await expect(zero.locator('dt', { hasText: /^Session$/ }).locator('..')).toContainText('Not assigned');
+  await expect(page.getByText('Operator budget extensions', { exact: true })).toHaveCount(0);
 
   await page.getByRole('link', { name: 'Experiments', exact: true }).click();
   const row = page.getByTestId(`experiment-row-${investigatorId}`);
@@ -1396,6 +1802,90 @@ test('keeps investigator budgets separate from planner usage and links compact t
   await expect(page.getByLabel('Truthful score dimensions')).toContainText('Verified (replicate mean)');
   await expect(page.getByLabel('Truthful score dimensions')).toContainText('Consensus agreement');
   await expect(page.getByRole('link', { name: /1 primary trial/ })).toBeVisible();
+});
+
+test('shows operator budget extensions without resetting usage, frozen limits or live disclosures', async ({ page }) => {
+  const original = database.getVariant(investigatorId);
+  const config = database.getCampaign(investigatorCampaignId).config;
+  const labels = database.listLabels(investigatorCampaignId, 'primary-pack');
+  const investigation: InvestigationState = {
+    ...original.investigation!, status: 'budget_exhausted', agentTokens: 4_092_956,
+    startedAt: '2026-09-08T09:00:00.000Z', updatedAt: '2026-09-08T10:00:00.000Z',
+    tokenGrants: [{
+      id: 'operator-extension-1', grantedAt: '2026-09-08T10:00:00.000Z', additionalTokens: 4_000_000,
+      tokensAtGrant: 4_092_956, previousLimit: 2_000_000, effectiveLimit: 8_092_956,
+      reason: 'Continue the same investigation. Authorization: Bearer grant-secret-value; api_key=grant-key-value; <img src=x onerror="window.__grantExecuted=true">',
+    }],
+  };
+  const posts: string[] = [];
+  page.on('request', (request) => { if (request.method() === 'POST') posts.push(request.url()); });
+  try {
+    database.updateVariant(investigatorId, { investigation });
+    for (const width of [1440, 390, 320]) {
+      await page.setViewportSize({ width, height: 1000 });
+      for (const route of ['overview', `experiments/${investigatorId}?tab=investigation`]) {
+        await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/${route}`);
+        const status = page.getByTestId(`investigator-${investigatorId}`);
+        await expect(status.locator('dt', { hasText: /^Agent tokens$/ }).locator('..').locator('dd')).toHaveText('4,092,956 / 8,092,956');
+        await expect(status.locator('dt', { hasText: /^Primary screening$/ }).locator('..')).toContainText('2 recorded / trial');
+        await expect(status.locator('dt', { hasText: /^Baseline and final$/ }).locator('..')).toContainText('2 / benchmark');
+        await expect(status.locator('dt', { hasText: /^Wall time/ }).locator('..')).toContainText('60m 0s / 240m 0s');
+        const extensions = status.locator('details').filter({ has: page.locator('summary', { hasText: /^Operator budget extensions$/ }) });
+        await expect(extensions).not.toHaveAttribute('open');
+        await extensions.locator('summary').click();
+        await expect(extensions).toContainText('Frozen base cap: 2,000,000 tokens');
+        await expect(extensions).toContainText('Budget authorization only, not human-verified planner truth');
+        await expect(extensions).toContainText('Cumulative usage is retained; the session clock is unchanged');
+        await expect(extensions.locator('time')).toHaveAttribute('datetime', '2026-09-08T10:00:00.000Z');
+        await expect(extensions.locator('time')).toContainText('Sep 8, 2026');
+        await expect(extensions).toContainText('+4,000,000 tokens / New cap: 8,092,956');
+        await expect(extensions).toContainText('Used at grant: 4,092,956 / Previous cap: 2,000,000');
+        await expect(extensions).toContainText('Reason: Continue the same investigation.');
+        await expect(extensions).toContainText('[redacted]');
+        await expect(extensions).not.toContainText('grant-secret-value');
+        await expect(extensions).not.toContainText('grant-key-value');
+        await expect(extensions.locator('img')).toHaveCount(0);
+        expect(await page.evaluate('window.__grantExecuted')).toBeUndefined();
+        expect(await page.evaluate<number>('document.documentElement.scrollWidth')).toBe(width);
+        if (route === 'overview') {
+          const zero = page.getByTestId(`investigator-${zeroInvestigatorId}`);
+          const unknown = page.getByTestId(`investigator-${unknownInvestigatorId}`);
+          await expect(zero.locator('dt', { hasText: /^Agent tokens$/ }).locator('..').locator('dd')).toHaveText('0 / 2,000,000');
+          await expect(unknown.locator('dt', { hasText: /^Agent tokens$/ }).locator('..').locator('dd')).toHaveText('Unknown / 2,000,000');
+          await expect(page.getByText('Operator budget extensions', { exact: true })).toHaveCount(1);
+        }
+      }
+    }
+    const status = page.getByTestId(`investigator-${investigatorId}`);
+    const extensions = status.locator('details').filter({ has: page.locator('summary', { hasText: /^Operator budget extensions$/ }) });
+    const mounted = await extensions.elementHandle();
+    await extensions.locator('summary').focus();
+    const scrollY = await page.evaluate<number>('window.scrollY');
+    const refreshed = page.waitForResponse(`${baseUrl}/api/campaigns/${investigatorCampaignId}`);
+    database.updateVariant(investigatorId, { investigation: {
+      ...investigation, agentTokens: 8_192_956,
+      tokenGrants: [...investigation.tokenGrants!, {
+        id: 'operator-extension-2', grantedAt: '2026-09-08T10:01:00.000Z', additionalTokens: 1_000_000,
+        tokensAtGrant: 8_192_956, previousLimit: 8_092_956, effectiveLimit: 9_192_956,
+        reason: 'Explicit second extension.',
+      }],
+    } });
+    database.addEvent(investigatorCampaignId, investigatorId, 'investigator.updated', {});
+    await refreshed;
+    await expect(status.locator('dt', { hasText: /^Agent tokens$/ }).locator('..').locator('dd')).toHaveText('8,192,956 / 9,192,956');
+    await expect(extensions).toContainText('Explicit second extension.');
+    await expect(extensions.locator('time')).toHaveCount(2);
+    await expect(extensions).toHaveAttribute('open', '');
+    await expect(extensions.locator('summary')).toBeFocused();
+    expect(await mounted!.evaluate((node) => node.isConnected)).toBe(true);
+    expect(await page.evaluate<number>('window.scrollY')).toBe(scrollY);
+    expect(database.getCampaign(investigatorCampaignId).config).toEqual(config);
+    expect(config.investigator!.maxAgentTokens).toBe(2_000_000);
+    expect(database.listLabels(investigatorCampaignId, 'primary-pack')).toEqual(labels);
+    expect(posts).toEqual([]);
+  } finally {
+    database.updateVariant(investigatorId, { investigation: original.investigation ?? null });
+  }
 });
 
 test('uses one full-primary screening slot and restores repeated final cohorts without stale trial runs', async ({ page }) => {
@@ -2366,4 +2856,80 @@ test('target separator remains subordinate to timing help table headers', async 
   await expect(group.locator('.status')).toHaveText('running');
   await expect(group.locator('.replicate-group-note')).toContainText('excluded from standard totals');
   if (process.env.HARNESS_UI_SCREENSHOTS) await page.getByTestId(`active-variant-${liveId}`).screenshot({ path: test.info().outputPath('run-timing.png') });
+});
+
+test('renders real EvidenceStore responses through the local dashboard API', async ({ page }) => {
+  const id = `${investigatorCampaignId}-evidence-contract`;
+  const original = database.getVariant(investigatorId);
+  const hypothesis = { ...original.hypothesis, title: 'Archived source eligibility trial' };
+  const parentFacts = runFacts(primaryUsage(), 'build');
+  const trialFacts = runFacts(primaryUsage(), 'reuse');
+  trialFacts.units[0]!.sourceRefs = [{ path: 'src/shared/account.ts', symbol: 'accountId' }];
+  const labels = [{ campaignId: investigatorCampaignId, benchmark: 'primary-pack', unitKey: trialFacts.units[0]!.key,
+    expectedDecision: 'build', status: 'suggested', classification: 'real_gap', rationale: 'Synthetic reference interpretation.' }];
+  const score = computeScore(trialFacts, [], null);
+  const action = { ...original.investigation!.actions[2]!, id: 'action-099', hypothesis,
+    artifactDirectory: 'investigation/action-099', result: { score, baselineScore: original.score, facts: trialFacts,
+      replicateFacts: [trialFacts, trialFacts], labelSetHash: 'fixture-labels' } };
+  database.createVariant({ id, campaignId: investigatorCampaignId, parentVariantId: investigatorId, round: 2, ordinal: 4, hypothesis });
+  database.updateVariant(id, { status: 'review', investigation: { ...original.investigation!, status: 'abandoned', actions: [action] } });
+  const current = path.join(paths.artifacts, investigatorCampaignId, id);
+  const receiptDirectory = path.join(current, 'investigation/action-099');
+  await mkdir(receiptDirectory, { recursive: true });
+  await writeFile(path.join(current, 'investigator-reference.json'), JSON.stringify({ labels, labelSetHash: 'fixture-labels',
+    baseline: { id: investigatorId, facts: parentFacts, replicateFacts: [parentFacts, parentFacts] } }));
+  await writeFile(path.join(receiptDirectory, 'receipt.json'), JSON.stringify(action));
+  const sourceDirectory = path.join(paths.worktrees, investigatorCampaignId, 'frozen-workflows/src/shared');
+  await mkdir(sourceDirectory, { recursive: true });
+  await writeFile(path.join(sourceDirectory, 'account.ts'), 'export const accountId = "canonical-identifier";\n');
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 1000 });
+    await page.goto(`${baseUrl}/campaigns/${investigatorCampaignId}/experiments/${id}?tab=investigation`);
+    const explorer = page.getByTestId('evidence-explorer');
+    const listed = page.waitForResponse((response) => response.url().includes(`/variants/${id}/evidence?tool=list_observations`));
+    await explorer.getByText('Explore evidence', { exact: true }).click();
+    const listing = await (await listed).json();
+    const observation = listing.items.find((item: { actionId?: string }) => item.actionId === 'action-099');
+    expect(observation.snapshotRef).toMatch(/^snapshot_[a-f0-9]{64}$/);
+    await expect(explorer.getByRole('heading', { name: 'action-099', exact: true })).toBeVisible();
+    await explorer.getByLabel('Evidence tool').selectOption('compare_trial');
+    await explorer.getByLabel('Observation').selectOption(observation.snapshotRef);
+    const compared = page.waitForResponse((response) => response.url().includes(`/variants/${id}/evidence?tool=compare_trial`));
+    await explorer.getByRole('button', { name: 'Load evidence' }).click();
+    const comparison = await (await compared).json();
+    expect(comparison.items[0].before).toEqual({ build: 1 });
+    expect(comparison.items[0].after).toEqual({ reuse: 1 });
+    await expect(explorer).toContainText('Build 100%');
+    await expect(explorer).toContainText('Reuse 100%');
+    await expect(explorer).toContainText('LLM suggestion / unverified');
+    await expect(explorer.getByRole('button', { name: 'Inspect parent unit' })).toBeVisible();
+    await explorer.evaluate((node) => node.scrollIntoView({ block: 'start' }));
+    await fixtureScreenshot(page, `evidence-comparison-actual-${width}`);
+    await explorer.getByRole('button', { name: 'Inspect unit', exact: true }).click();
+    await expect(explorer.getByRole('heading', { name: 'Replicate 1', exact: true })).toBeVisible();
+    await expect(explorer.getByRole('heading', { name: 'Replicate 2', exact: true })).toBeVisible();
+    await expect(explorer).toContainText('Shortlist candidates');
+    await expect(explorer).toContainText('src/shared/account.ts / accountId');
+    await expect(explorer.locator('.evidence-item pre').first()).not.toBeVisible();
+    const metadata = explorer.locator('.evidence-item .evidence-metadata').first();
+    await metadata.locator('summary').click();
+    await expect(metadata).toContainText('rawAnalysis');
+    const node = await metadata.elementHandle();
+    const refreshed = page.waitForResponse(`${baseUrl}/api/campaigns/${investigatorCampaignId}`);
+    database.addEvent(investigatorCampaignId, id, 'investigator.updated', {});
+    await refreshed;
+    await expect(metadata).toHaveAttribute('open', '');
+    expect(await node!.evaluate((node) => node.isConnected)).toBe(true);
+    await metadata.locator('summary').click();
+    await explorer.evaluate((node) => node.scrollIntoView({ block: 'start' }));
+    await fixtureScreenshot(page, `evidence-unit-actual-${width}`);
+    await explorer.getByRole('button', { name: 'Read source', exact: true }).first().click();
+    await expect(explorer.getByLabel('Evidence excerpt')).toContainText('canonical-identifier');
+    await expect(explorer).toContainText('UTF-8 bytes');
+    const access = page.getByTestId('evidence-access');
+    await access.getByText('Evidence access', { exact: true }).click();
+    await expect(access.getByRole('heading', { name: 'inspect_unit / ok', exact: true }).first()).toBeVisible();
+    await expect(access).toContainText(id);
+    expect(await page.evaluate<number>('document.documentElement.scrollWidth')).toBe(width);
+  }
 });

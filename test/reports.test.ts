@@ -80,6 +80,10 @@ test('investigator reports distinguish session states, trial evidence, budgets, 
       startedAt: '2026-09-07T10:00:00.000Z', completedAt: '2026-09-07T10:01:00.000Z',
       patchHash: `sha256:${'d'.repeat(64)}`, artifactDirectory: 'investigation/action-001', error: null,
     };
+    const diagnosticReview = {
+      reviewHash: `sha256:${'1'.repeat(64)}`, artifactHash: `sha256:${'2'.repeat(64)}`,
+      artifactPath: 'diagnostic-review.json', interpretationStatus: 'unverified_model_judgment',
+    };
     const investigation: InvestigationState = {
       schemaVersion: 1, sessionId: 'session-report', status: 'running', startedAt: action.startedAt,
       updatedAt: '2026-09-07T10:02:00.000Z', turnCount: 4, agentTokens: null, agentCostUsd: null,
@@ -88,9 +92,18 @@ test('investigator reports distinguish session states, trial evidence, budgets, 
       actions: [
         { ...action, status: 'failed', patchHash: null, artifactDirectory: null, result: null, error: 'Test failed.\nArtifacts: investigation/action-001' },
         { ...action, id: 'action-002', status: 'completed', result: { passed: true, testFiles: ['server/test/source.test.ts'], logPaths: ['/local/investigation/action-002/tests.log'] } },
-        { ...action, id: 'action-003', kind: 'evaluate_primary', status: 'completed', result: { score, baselineScore: score, facts: runFacts, replicateFacts: [runFacts, runFacts], labelSetHash: `sha256:${'f'.repeat(64)}`, comparisonNotes: ['Runtime answers are not globally frozen.'], transitions: [{ rawMarker: 'DO_NOT_COPY_RAW_MODEL_OUTPUT' }] } },
+        { ...action, id: 'action-003', kind: 'evaluate_primary', status: 'completed', result: { score, baselineScore: score, facts: runFacts, replicateFacts: [runFacts, runFacts], labelSetHash: `sha256:${'f'.repeat(64)}`, diagnosticReview, comparisonNotes: ['Runtime answers are not globally frozen.'], transitions: [{ rawMarker: 'DO_NOT_COPY_RAW_MODEL_OUTPUT' }] } },
         { ...action, id: 'action-004', kind: 'finalize', status: 'completed', result: { passed: true, tests: { passed: true, testFiles: [], logPaths: [] }, compliance: { status: 'passed' } } },
         { ...action, id: 'action-005', kind: 'evaluate_primary', status: 'completed', result: { unknown: 'DO_NOT_COPY_UNKNOWN_RESULT', passed: true } },
+        { ...action, id: 'action-006', kind: 'probe', status: 'completed', artifactDirectory: 'investigation/action-006', result: {
+          kind: 'diagnostic_probe', executionPassed: true, providerCalls: 0,
+          inputHash: `sha256:${'3'.repeat(64)}`, imageId: `sha256:${'4'.repeat(64)}`,
+          testFiles: ['server/test/diagnostic.test.ts'], logPaths: ['investigation/action-006/probe.log'],
+          interpretation: 'DO_NOT_COPY_RAW_PROBE_INTERPRETATION', diagnosticReview,
+        } },
+        { ...action, admitted: false, id: 'action-007', kind: 'evaluate_primary', status: 'failed', result: null, error: 'Not admitted: diagnostic review required' },
+        { ...action, admitted: true, id: 'action-008', kind: 'evaluate_primary', status: 'failed', result: null, error: 'Admitted planner execution failed.' },
+        { ...action, admitted: false, id: 'action-009', kind: 'evaluate_primary', status: 'completed', result: null },
       ],
     };
     for (const status of ['running', 'stopped', 'finalized', 'abandoned', 'budget_exhausted', 'failed'] as const) {
@@ -104,7 +117,7 @@ test('investigator reports distinguish session states, trial evidence, budgets, 
       assert.match(report, /\| Agent tokens \| unknown \| 2000000 \|/);
       assert.match(report, /\| Agent cost USD \| unknown \|/);
       assert.match(report, /\| Turns \| 4 \| 12 \|/);
-      assert.match(report, /\| Primary evaluation attempts \| 2 \| 3 \|/);
+      assert.match(report, /\| Primary evaluation attempts \| 3 \| 3 \|/);
       assert.match(report, /\| Wall elapsed at last update ms \| 120000 \| 7200000 \|/);
       assert.match(report, /### Action Timeline/);
       assert.match(report, /action-001.*failed/);
@@ -112,6 +125,23 @@ test('investigator reports distinguish session states, trial evidence, budgets, 
       assert.match(report, /Finalization passed; full tests passed; compliance passed \(unverified\)/);
       assert.match(report, /Trial verified: unknown; provisional: 0\.0%/);
       assert.match(report, /Primary result unknown/);
+      const probeRow = report.split('\n').find((line) => line.startsWith('| action-006 |'))!;
+      assert.match(probeRow, /Offline diagnostic probe.*Execution passed \(diagnostic only\)/);
+      assert.match(probeRow, /Provider calls: 0/);
+      assert.ok(probeRow.includes(`Input hash: sha256:${'3'.repeat(64)}`));
+      assert.ok(probeRow.includes(`Image: sha256:${'4'.repeat(64)}`));
+      assert.doesNotMatch(probeRow, /Tests passed|Trial verified|score|Finalization passed/);
+      for (const id of ['action-003', 'action-006']) {
+        const row = report.split('\n').find((line) => line.startsWith(`| ${id} |`))!;
+        assert.ok(row.includes(`Review hash: ${diagnosticReview.reviewHash}`));
+        assert.ok(row.includes(`Review artifact hash: ${diagnosticReview.artifactHash}`));
+        assert.match(row, /diagnostic-review\.json.*unverified_model_judgment/);
+      }
+      for (const id of ['action-007', 'action-009']) {
+        assert.match(report.split('\n').find((line) => line.startsWith(`| ${id} |`))!, /Not admitted: diagnostic review required/);
+      }
+      assert.match(report, /Admitted planner execution failed/);
+      assert.match(report, /not full configured tests, primary evaluation, or promotion/i);
       assert.match(report, /## Score Basis/);
       assert.match(report, /raw-replicate mean/);
       assert.match(report, /Runtime answers are not globally frozen/);
@@ -134,6 +164,7 @@ test('investigator reports distinguish session states, trial evidence, budgets, 
     assert.match(index, /## Investigator Sessions/);
     assert.match(index, /session-report/);
     assert.match(index, /finalized/);
+    assert.match(index, /\| report-investigator-v001 \| session-report \| finalized \| 4 \| 3 \| 0 \|/);
   } finally {
     database.close();
     await rm(root, { recursive: true, force: true });

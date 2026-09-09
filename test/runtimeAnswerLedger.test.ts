@@ -116,10 +116,14 @@ test('question and option meaning changes do not collide; incidental IDs do not 
     options: question.options!.map((option) => ({ ...option, id: `other-${option.id}` })) }));
   for (const changed of [question, { ...question, prompt: 'Which validation applies on import?' },
     { ...question, coverageIds: ['unit-b'] },
+    { ...question, rationale: 'Different behavior needs clarification.' },
+    { ...question, requirementRefs: [{ entity: 'solution/main', anchor: 'fields/another_value' }] },
+    { ...question, sourceContext: { workflow: 'another/workflow' } },
     { ...question, options: [{ ...question.options![0]!, consequences: 'Block all submissions' }, question.options![1]!] },
     { ...question, options: [{ ...question.options![0]!, description: 'Validate on export' }, question.options![1]!] },
   ]) await answerWithRuntimeLedger({ ...f.input, question: changed });
-  assert.equal((await f.entries()).length, 5);
+  assert.equal((await f.entries()).length, 8);
+  assert.equal(runtimeQuestionCacheKey(question), runtimeQuestionCacheKey({ ...question, context: { inputSetHash: 'other-run-context', decisionSetVersion: 9 } }));
 });
 
 test('separates resolved pack, benchmark, workflows, model, model variant and target policy contexts but shares V2 arms', async (t) => {

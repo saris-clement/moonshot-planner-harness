@@ -1,6 +1,7 @@
 import { createServer } from 'node:net';
 import { createHash, randomUUID } from 'node:crypto';
-import { copyFile, lstat, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { copyFile, lstat, mkdir, open, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { GetObjectCommand, ListObjectsV2Command, S3Client } from '@aws-sdk/client-s3';
@@ -9,6 +10,7 @@ import type { HarnessPaths } from './paths.js';
 import { variantArtifactDirectory, variantWorktreePath } from './paths.js';
 import { readEnvironmentFile, sha256File } from './config.js';
 import { runCommand } from './process.js';
+import { redactResearchText } from './researchSandboxSnapshot.js';
 
 export interface DiffGateResult {
   changedFiles: string[];
@@ -422,6 +424,30 @@ export async function captureAndGateDiff(
   return { patchPath, result };
 }
 
+interface DiagnosticFixture {
+  path: string;
+  inputHash: string;
+  validate: () => Promise<void>;
+}
+
+async function runDiagnosticCommand(
+  args: string[],
+  timeoutMs: number,
+  logPath: string,
+  environment: NodeJS.ProcessEnv,
+  fixture: DiagnosticFixture,
+): Promise<Awaited<ReturnType<typeof runCommand>>> {
+  await fixture.validate();
+  // Reserve each log exclusively before runCommand appends; never append to a previous action's evidence.
+  const log = await open(logPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  try {
+    return await runCommand('docker', args, { timeoutMs, logPath, env: environment });
+  } finally {
+    try { await log.chmod(0o400); } finally { await log.close(); }
+    await fixture.validate();
+  }
+}
+
 async function runDockerGate(
   testImageTag: string,
   command: string,
@@ -429,8 +455,9 @@ async function runDockerGate(
   timeoutMs: number,
   logPath: string,
   environment: NodeJS.ProcessEnv,
+  fixture?: DiagnosticFixture,
 ): Promise<void> {
-  await runCommand('docker', [
+  const dockerArgs = [
     'run',
     '--rm',
     '--network',
@@ -456,15 +483,34 @@ async function runDockerGate(
     '/app/server/node_modules/.vite-temp:rw,noexec,nosuid,size=256m',
     '--env',
     'CI=1',
+    ...(fixture ? [
+      '--pull=never',
+      '--mount', `type=bind,source=${fixture.path},target=/harness/diagnostic-input.json,readonly`,
+      '--env', 'HARNESS_DIAGNOSTIC_INPUT=/harness/diagnostic-input.json',
+    ] : []),
     '--entrypoint',
-    command,
+    fixture ? 'node' : command,
     testImageTag,
-    ...args,
-  ], {
-    timeoutMs,
-    logPath,
-    env: environment,
-  });
+    ...(fixture ? ['--input-type=commonjs', '-e', `
+const { lstatSync, readFileSync } = require('node:fs');
+const { createHash } = require('node:crypto');
+const { spawnSync } = require('node:child_process');
+const [expectedHash, timeoutMs, command, ...args] = process.argv.slice(1);
+const file = '/harness/diagnostic-input.json';
+const details = lstatSync(file);
+if (!details.isFile() || details.nlink !== 1 || details.size > 2097152 || (details.mode & 0o222)) {
+  throw new Error('diagnostic fixture must be an immutable bounded regular file');
+}
+const hash = 'sha256:' + createHash('sha256').update(readFileSync(file)).digest('hex');
+if (hash !== expectedHash) throw new Error('diagnostic fixture hash changed at mount');
+// The in-container timeout also bounds execution if the host Docker client is interrupted.
+const result = spawnSync(command, args, { stdio: 'inherit', timeout: Number(timeoutMs), killSignal: 'SIGKILL' });
+if (result.error) throw result.error;
+process.exit(result.status ?? 1);
+`, '--', fixture.inputHash, String(timeoutMs), command, ...args] : args),
+  ];
+  if (fixture) await runDiagnosticCommand(dockerArgs, timeoutMs, logPath, environment, fixture);
+  else await runCommand('docker', dockerArgs, { timeoutMs, logPath, env: environment });
 }
 
 export async function runVariantGates(
@@ -511,6 +557,10 @@ export async function runInvestigatorTests(
       logPaths: campaign.config.gates.commands.map((_, index) => path.join(artifactDirectory, `gate-${index + 1}.log`)),
     };
   }
+  return await runSelectedInvestigatorTests(testImageTag, artifactDirectory, environment, selectedInvestigatorTestFiles(testFiles));
+}
+
+function selectedInvestigatorTestFiles(testFiles: unknown): string[] {
   if (!Array.isArray(testFiles) || testFiles.length < 1 || testFiles.length > 30 || new Set(testFiles).size !== testFiles.length) {
     throw new Error('testFiles must contain between 1 and 30 unique test files');
   }
@@ -523,7 +573,16 @@ export async function runInvestigatorTests(
       throw new Error(`unsafe test file: ${JSON.stringify(file)}`);
     }
   }
-  const selectedFiles = [...testFiles];
+  return [...testFiles];
+}
+
+async function runSelectedInvestigatorTests(
+  testImageTag: string,
+  artifactDirectory: string,
+  environment: NodeJS.ProcessEnv,
+  selectedFiles: string[],
+  fixture?: DiagnosticFixture,
+): Promise<{ passed: true; testFiles: string[]; logPaths: string[] }> {
   const validationLog = path.join(artifactDirectory, 'test-files.log');
   const typecheckLog = path.join(artifactDirectory, 'typecheck.log');
   const testsLog = path.join(artifactDirectory, 'tests.log');
@@ -543,13 +602,119 @@ for (const file of process.argv.slice(1)) {
     if (current === file && !details.isFile()) throw new Error('test file must be a regular file: ' + file);
   }
 }
-`, '--', ...selectedFiles], 30_000, validationLog, environment);
-  await runDockerGate(testImageTag, 'npm', ['run', 'typecheck'], 1_800_000, typecheckLog, environment);
+`, '--', ...selectedFiles], 30_000, validationLog, environment, fixture);
+  if (!fixture) await runDockerGate(testImageTag, 'npm', ['run', 'typecheck'], 1_800_000, typecheckLog, environment);
   await runDockerGate(testImageTag, 'npm', [
     'exec', '--workspace', '@ainative-planner/server', '--', 'vitest', 'run',
     ...selectedFiles.map((file) => file.slice('server/'.length)),
-  ], 1_800_000, testsLog, environment);
-  return { passed: true, testFiles: selectedFiles, logPaths: [validationLog, typecheckLog, testsLog] };
+  ], fixture ? 300_000 : 1_800_000, testsLog, environment, fixture);
+  return { passed: true, testFiles: selectedFiles, logPaths: [validationLog, ...(!fixture ? [typecheckLog] : []), testsLog] };
+}
+
+/** Executes coordinator-curated JSON only; it never exports source roots or runs the primary evaluation. */
+export async function runInvestigatorProbe(
+  _campaign: CampaignRecord,
+  testImageTag: string,
+  artifactDirectory: string,
+  environment: NodeJS.ProcessEnv,
+  testFiles: string[],
+  input: unknown,
+): Promise<{
+  kind: 'diagnostic_probe'; executionPassed: true; providerCalls: 0; imageId: string;
+  inputHash: string; testFiles: string[]; logPaths: string[]; interpretation: string;
+}> {
+  const selectedFiles = selectedInvestigatorTestFiles(testFiles);
+  if (typeof testImageTag !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_./:@-]*$/.test(testImageTag)) {
+    throw new Error('diagnostic probe requires a safe built image reference');
+  }
+  const serialized = JSON.stringify(input);
+  if (serialized === undefined) throw new Error('diagnostic input must be serializable JSON');
+  if (Buffer.byteLength(serialized) > 2 * 1_024 * 1_024) throw new Error('diagnostic input exceeds 2 MiB');
+  // Redact string values, not serialized text, so measured numeric token/call counts remain numbers.
+  const bytes = Buffer.from(JSON.stringify(JSON.parse(serialized, (key: string, value: unknown) => {
+    if (typeof value !== 'string') return value;
+    if (/api[_-]?key|secret|password|credential|authorization|cookie|token$|(?:access|refresh|auth)[_-]?tokens$|^tokens$/i.test(key)) {
+      return '[REDACTED]';
+    }
+    return redactResearchText(value);
+  })));
+  if (bytes.length > 2 * 1_024 * 1_024) throw new Error('redacted diagnostic input exceeds 2 MiB');
+  if (typeof artifactDirectory !== 'string' || !path.isAbsolute(artifactDirectory) ||
+    /[\x00-\x1f\x7f,"\\]/.test(artifactDirectory) || path.resolve(artifactDirectory) !== artifactDirectory ||
+    !artifactDirectory.split(path.sep).includes('.data')) {
+    throw new Error('diagnostic artifacts require a canonical safe absolute path under ignored .data');
+  }
+  // macOS exposes its system temporary root through /var. Canonicalize that trusted root only;
+  // every caller-supplied component beneath it must be a real directory, never a symlink.
+  const temporaryRoot = path.resolve(os.tmpdir());
+  const base = artifactDirectory.startsWith(`${temporaryRoot}${path.sep}`) ? temporaryRoot : path.parse(artifactDirectory).root;
+  let directory = await realpath(base);
+  let underData = false;
+  for (const part of path.relative(base, artifactDirectory).split(path.sep)) {
+    underData ||= part === '.data';
+    directory = path.join(directory, part);
+    if (underData) {
+      await mkdir(directory, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'EEXIST') throw error;
+      });
+    }
+    if (!(await lstat(directory)).isDirectory() || await realpath(directory) !== directory) {
+      throw new Error('diagnostic artifact path must be canonical without symbolic links');
+    }
+  }
+  if (/[\x00-\x1f\x7f,"\\]/.test(directory)) throw new Error('unsafe canonical diagnostic mount path');
+  const directoryHandle = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    await directoryHandle.chmod(0o700);
+    const directoryDetails = await directoryHandle.stat();
+    const fixturePath = path.join(directory, 'diagnostic-input.json');
+    const handle = await open(fixturePath, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try {
+      await handle.writeFile(bytes);
+      await handle.sync();
+      await handle.chmod(0o400);
+      const initial = await handle.stat();
+      const inputHash = `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+      const fixture: DiagnosticFixture = {
+        path: fixturePath,
+        inputHash,
+        validate: async () => {
+          const parent = await lstat(directory);
+          const current = await lstat(fixturePath);
+          const details = await handle.stat();
+          if (!parent.isDirectory() || parent.dev !== directoryDetails.dev || parent.ino !== directoryDetails.ino ||
+            (parent.mode & 0o777) !== 0o700 || await realpath(fixturePath) !== fixturePath ||
+            !current.isFile() || current.dev !== initial.dev || current.ino !== initial.ino ||
+            current.nlink !== 1 || details.nlink !== 1 || details.size !== bytes.length ||
+            details.mtimeMs !== initial.mtimeMs || details.ctimeMs !== initial.ctimeMs || (details.mode & 0o777) !== 0o400) {
+            throw new Error('immutable diagnostic fixture or canonical parent changed');
+          }
+          const buffer = Buffer.alloc(bytes.length + 1);
+          const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+          if (bytesRead !== bytes.length || !buffer.subarray(0, bytesRead).equals(bytes)) {
+            throw new Error('immutable diagnostic fixture bytes changed');
+          }
+        },
+      };
+      // Runtime provider credentials and execution hooks are never inherited by the Docker client or container.
+      const dockerEnvironment = Object.fromEntries(
+        ['PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG', 'XDG_CONFIG_HOME', 'TMPDIR']
+          .flatMap((key) => environment[key] === undefined ? [] : [[key, environment[key]]]),
+      );
+      const imageLog = path.join(directory, 'image-inspect.log');
+      const inspection = await runDiagnosticCommand(
+        ['image', 'inspect', '--format={{.Id}}', '--', testImageTag], 30_000, imageLog, dockerEnvironment, fixture,
+      );
+      const imageId = inspection.stdout.trim();
+      if (!/^sha256:[a-f0-9]{64}$/.test(imageId)) throw new Error('diagnostic test image must resolve to one immutable image ID');
+      const result = await runSelectedInvestigatorTests(imageId, directory, dockerEnvironment, selectedFiles, fixture);
+      return {
+        kind: 'diagnostic_probe', executionPassed: true, providerCalls: 0, imageId, inputHash,
+        testFiles: result.testFiles, logPaths: [imageLog, ...result.logPaths],
+        interpretation: 'Offline fixture-backed execution of selected trusted tests only; does not establish diagnosis correctness or a full primary score, or satisfy test/full validation gates.',
+      };
+    } finally { await handle.close(); }
+  } finally { await directoryHandle.close(); }
 }
 
 export async function buildVariantImage(

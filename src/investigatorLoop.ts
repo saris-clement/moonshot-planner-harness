@@ -1,4 +1,4 @@
-import type { InvestigationActionRecord, InvestigationState, InvestigatorAction, InvestigatorTurnResult } from './investigator.js';
+import { InvestigatorOutputParseError, type InvestigationActionRecord, type InvestigationState, type InvestigatorAction, type InvestigatorTurnResult } from './investigator.js';
 
 export async function runInvestigatorLoop(
   initial: InvestigationState,
@@ -71,14 +71,22 @@ export async function runInvestigatorLoop(
       response = await dependencies.turn(previous, feedback, (id) => { state.sessionId = id; save(); });
       dependencies.assertActive?.();
       state.sessionId = response.sessionId;
+      state.latestHypothesis = response.action.hypothesis;
       state.agentTokens = state.agentTokens !== null && response.usage.tokens !== null ? state.agentTokens + response.usage.tokens : null;
       state.agentCostUsd = state.agentCostUsd !== null && response.usage.costUsd !== null ? state.agentCostUsd + response.usage.costUsd : null;
     } catch (error) {
       // Lease/fence failures are coordinator failures, not model feedback to retry.
       dependencies.assertActive?.();
-      state.reason = `Agent turn failed: ${error instanceof Error ? error.message : String(error)}`;
-      // Failed turns can have unreported consumption; never report a partial sum as complete.
-      state.agentTokens = null; state.agentCostUsd = null;
+      if (error instanceof InvestigatorOutputParseError) {
+        state.sessionId = error.sessionId;
+        state.agentTokens = state.agentTokens !== null && error.usage.tokens !== null ? state.agentTokens + error.usage.tokens : null;
+        state.agentCostUsd = state.agentCostUsd !== null && error.usage.costUsd !== null ? state.agentCostUsd + error.usage.costUsd : null;
+        state.reason = `Agent output validation failed: ${error.message}`;
+      } else {
+        state.reason = `Agent turn failed: ${error instanceof Error ? error.message : String(error)}`;
+        // Failed streams can have unreported consumption; never report a partial sum as complete.
+        state.agentTokens = null; state.agentCostUsd = null;
+      }
       feedback = { error: state.reason, instruction: 'Inspect the previous turn. Return one valid coordinator request.' };
       save();
       continue;
@@ -89,7 +97,7 @@ export async function runInvestigatorLoop(
     const afterTurnBudget = budgetReason(false);
     if (afterTurnBudget) { exhaust(afterTurnBudget); break; }
     const action = response.action;
-    if (action.action === 'evaluate_primary' && state.actions.filter((item) => item.kind === 'evaluate_primary').length >= limits.maxPrimaryEvaluations) {
+    if (action.action === 'evaluate_primary' && state.actions.filter((item) => item.kind === 'evaluate_primary' && item.admitted !== false).length >= limits.maxPrimaryEvaluations) {
       state.reason = 'Primary evaluation budget exhausted. Finalize an already evaluated unchanged patch, or abandon.';
       feedback = { error: state.reason };
       save();

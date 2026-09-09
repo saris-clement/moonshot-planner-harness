@@ -1,5 +1,7 @@
 import { element, formatNumber, formatPercent, statusLabel } from '../dom.js';
 import { routeLink, sectionHeading } from '../ui.js';
+import { langfuseUrlForCase } from '../models.js';
+import { sanitizeDiagnosticValue } from '../diagnostics.js';
 
 function decisionRows(facts) {
   if (!facts) return element('p', { className: 'muted', text: 'No excluded facts are available.' });
@@ -174,8 +176,8 @@ function runTable(evaluation) {
           attributes: { scope: 'row' },
         }),
         element('td', { text: `${execution.replicate}/${execution.replicateCount}` }),
-        element('td', {}, [statusLabel(execution.status)]),
-        element('td', { text: execution.progress ? `${execution.progress.completedUnits}/${execution.progress.totalUnits}` : '—' }),
+        element('td', {}, [statusLabel(execution.status), execution.caseId ? element('a', { className: 'target-run-trace', text: 'Trace', attributes: { href: langfuseUrlForCase(execution.caseId), target: '_blank', rel: 'noreferrer' } }) : null]),
+        element('td', { text: execution.progress ? `${execution.progress.completedUnits}/${execution.progress.totalUnits}${execution.status === 'failed' ? ' (last accepted)' : ''}` : '—' }),
         element('td', { text: formatNumber(execution.decisions?.build) }),
       ]))),
     ]),
@@ -215,10 +217,10 @@ export function targetExcludedPanel(context, campaign, variant) {
       }),
     ]);
   }
-  const gate = evaluation.gate;
+  const gate = evaluation.status === 'completed' ? evaluation.gate : null;
   const comparisons = evaluation.comparisons ?? [];
   const pendingQuestions = questionPanel(context, campaign, variant, evaluation);
-  const retry = evaluation.status === 'failed'
+  const retry = evaluation.status === 'failed' && !(usesStandardPrimary && variant.round === 0)
       ? element('button', {
         className: 'button button-secondary counterfactual-retry',
         text: 'Retry complete evaluation',
@@ -238,7 +240,7 @@ export function targetExcludedPanel(context, campaign, variant) {
         }),
       ]),
       element('div', {}, [element('span', { text: 'Lifecycle' }), statusLabel(evaluation.status)]),
-      element('div', {}, [element('span', { text: 'Promotion gate' }), statusLabel(gate?.status ?? 'pending')]),
+      element('div', {}, [element('span', { text: 'Promotion gate' }), gate ? statusLabel(gate.status) : element('strong', { text: 'Not assessed' })]),
     ]),
     element('p', {
       className: 'counterfactual-protocol-note muted',
@@ -250,7 +252,7 @@ export function targetExcludedPanel(context, campaign, variant) {
     evaluation.error
       ? element('section', { className: 'error-panel' }, [
           element('h2', { text: 'Recorded target-arm failure' }),
-          element('p', { text: evaluation.error }),
+          element('p', { text: sanitizeDiagnosticValue(evaluation.error) }),
         ])
       : null,
     pendingQuestions,
@@ -269,8 +271,8 @@ export function targetExcludedPanel(context, campaign, variant) {
         element('div', {}, [element('dt', { text: 'Baseline build rate' }), element('dd', { text: formatPercent(gate?.baselineMeanBuildRate) })]),
         element('div', {}, [element('dt', { text: 'Candidate build rate' }), element('dd', { text: formatPercent(gate?.candidateMeanBuildRate) })]),
         element('div', {}, [element('dt', { text: 'Relative drop' }), element('dd', { text: formatPercent(gate?.buildDropRatio) })]),
-        element('div', {}, [element('dt', { text: 'Pair validity' }), element('dd', { text: comparisons.length === config.replicates && comparisons.every((item) => item.valid) ? 'Valid' : 'Pending or invalid' })]),
-        element('div', {}, [element('dt', { text: 'Leakage paths' }), element('dd', { text: formatNumber(comparisons.reduce((sum, item) => sum + item.leakagePaths.length, 0)) })]),
+        element('div', {}, [element('dt', { text: 'Pair validity' }), element('dd', { text: evaluation.status === 'completed' && comparisons.length === config.replicates ? comparisons.every((item) => item.valid) ? 'Valid' : 'Invalid' : 'Not assessed' })]),
+        element('div', {}, [element('dt', { text: 'Leakage paths' }), element('dd', { text: evaluation.status === 'completed' && comparisons.length === config.replicates ? formatNumber(comparisons.reduce((sum, item) => sum + item.leakagePaths.length, 0)) : 'Not assessed' })]),
       ]),
       gate?.reasons?.length ? element('ul', { className: 'counterfactual-reasons' }, gate.reasons.map((reason) => element('li', { text: reason }))) : null,
       comparisons.some((comparison) => comparison.mismatches.length)

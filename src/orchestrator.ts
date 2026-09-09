@@ -12,8 +12,14 @@ import {
 } from './config.js';
 import { HarnessDatabase } from './db.js';
 import { AgentRunner, type SourceQuestionAnswer } from './agents.js';
+import { normalizeExecutionFailure } from './failures.js';
 import { runInvestigatorLoop } from './investigatorLoop.js';
 import type { InvestigationState } from './investigator.js';
+import { EvidenceStore } from './evidence.js';
+import { evidenceScopeFromContext } from './evidenceAccess.js';
+import type { PreparedDiagnosticReview } from './investigatorDiagnostics.js';
+import { effectiveInvestigatorLimits, InvestigatorTokenGrantInputSchema, verifyInvestigatorTokenGrantReceipts,
+  type InvestigatorTokenGrant } from './investigatorBudget.js';
 import {
   canonicalHash,
   compareCohort,
@@ -68,6 +74,7 @@ import {
   reattachVariantStack,
   runVariantGates,
   runInvestigatorTests,
+  runInvestigatorProbe,
   startVariantStack,
   stageMutationBaseline,
   stopVariantStack,
@@ -138,6 +145,16 @@ export function matchQuestionConsultations(
       coversRequirement
     );
   });
+}
+
+export function withRuntimeSourceContext(question: PlannerQuestionRecord, consultations: readonly unknown[]): PlannerQuestionRecord {
+  const workflows = new Set(matchQuestionConsultations(consultations, question).flatMap((consultation) => {
+    const intent = isRecord(consultation.intent) ? consultation.intent : {};
+    const request = isRecord(intent.request) ? intent.request : {};
+    return typeof request.workflow === 'string' && request.workflow.length > 0 && request.workflow.length <= 512
+      ? [request.workflow] : [];
+  }));
+  return { ...question, sourceContext: workflows.size === 1 ? { workflow: [...workflows][0]! } : {} };
 }
 
 export function selectedOptionIdForAnswer(
@@ -2208,6 +2225,120 @@ export class CampaignOrchestrator {
     return campaign;
   }
 
+  async extendInvestigatorTokens(
+    campaignId: string,
+    variantId: string,
+    input: { requestId: string; additionalTokens: number; reason: string },
+  ): Promise<{ variant: VariantRecord; grant: InvestigatorTokenGrant }> {
+    return await this.withCampaignLock(campaignId, async () => {
+      const request = InvestigatorTokenGrantInputSchema.parse(input);
+      const campaign = this.database.getCampaign(campaignId);
+      const variant = this.database.getVariant(variantId);
+      const owner = this.database.database.prepare('SELECT lease_owner FROM campaigns WHERE id = ?').get(campaignId)?.lease_owner;
+      if (!campaign.config.investigator?.enabled) throw new Error('Campaign investigator is not enabled');
+      if (variant.campaignId !== campaignId) throw new Error('Variant belongs to another campaign');
+      const state = variant.investigation;
+      if (!state) throw new Error('Variant has no existing investigator session');
+      const oldLimits = effectiveInvestigatorLimits(campaign.config.investigator, state);
+      const artifacts = variantArtifactDirectory(this.paths, campaignId, variantId);
+      await verifyInvestigatorTokenGrantReceipts(this.database, campaign, variant, artifacts);
+      const existing = state.tokenGrants?.find((grant) => grant.id === request.requestId);
+      if (existing) {
+        if (existing.additionalTokens !== request.additionalTokens || existing.reason !== request.reason) {
+          throw new Error('Investigator token grant request ID was already used with different arguments');
+        }
+        return { variant: this.database.getVariant(variantId), grant: existing };
+      }
+      if (!variant.parentVariantId || variant.parentVariantId !== campaign.currentParentVariantId) {
+        throw new Error('Investigator variant parent is no longer the current campaign parent');
+      }
+      if (state.status !== 'budget_exhausted' || state.agentTokens === null ||
+          !Number.isSafeInteger(state.agentTokens) || state.agentTokens < oldLimits.maxAgentTokens) {
+        throw new Error('Token grant requires budget_exhausted with known usage at or above the previous token limit');
+      }
+      const started = Date.parse(state.startedAt);
+      const assertRemainingBudgets = () => {
+        if (!Number.isFinite(started) || started > Date.now() || Date.now() - started >= oldLimits.maxWallTimeMs) {
+          throw new Error('Investigator wall-time budget is exhausted or unknown; token grants cannot extend it');
+        }
+        if (!Number.isSafeInteger(state.turnCount) || state.turnCount < 0 || state.turnCount >= oldLimits.maxTurns) {
+          throw new Error('Investigator turn budget is exhausted or unknown');
+        }
+        if (state.actions.filter((action) => action.kind === 'evaluate_primary' && action.admitted !== false).length >= oldLimits.maxPrimaryEvaluations) {
+          throw new Error('Investigator primary evaluation budget is exhausted');
+        }
+      };
+      assertRemainingBudgets();
+      const variants = this.database.listVariants(campaignId);
+      if (variants.some((candidate) =>
+        (candidate.id !== variantId && ['queued', 'mutating', 'gating', 'building', 'starting', 'running', 'judging'].includes(candidate.status)) ||
+        candidate.investigation?.status === 'running' ||
+        candidate.investigation?.actions.some((action) => ['running', 'interrupted'].includes(action.status))) ||
+        !['rejected', 'stopped'].includes(variant.status) || variant.hypothesisComplianceAttempts.length > 0 ||
+        state.actions.some((action) => action.kind === 'evaluate_primary' && action.status === 'failed' && variant.composeProject)) {
+        throw new Error('Reconcile active or interrupted actions before granting investigator tokens');
+      }
+      const baseline = state.harnessPins?.mutationBaselineTree;
+      if (!state.sessionId?.trim() || !variant.worktreePath ||
+          !(await stat(variant.worktreePath).catch(() => null))?.isDirectory() ||
+          typeof baseline !== 'string' || !baseline) {
+        throw new Error('Token grant requires the known session, retained worktree, and mutation baseline');
+      }
+      if (!variant.patchPath || !variant.patchHash || await sha256File(variant.patchPath) !== variant.patchHash) {
+        throw new Error('Retained investigator patch is missing or changed');
+      }
+      for (const [file, pin] of [['investigator-context.json', 'contextHash'], ['investigator-reference.json', 'referenceHash']] as const) {
+        if (await sha256File(path.join(artifacts, file)) !== state.harnessPins?.[pin]) {
+          throw new Error(`Investigator ${pin} is missing or changed`);
+        }
+      }
+      const grant: InvestigatorTokenGrant = {
+        id: request.requestId, grantedAt: new Date().toISOString(), additionalTokens: request.additionalTokens,
+        tokensAtGrant: state.agentTokens, previousLimit: oldLimits.maxAgentTokens,
+        effectiveLimit: state.agentTokens + request.additionalTokens, reason: request.reason,
+      };
+      const next: InvestigationState = { ...state, tokenGrants: [...(state.tokenGrants ?? []), grant],
+        status: 'stopped', updatedAt: grant.grantedAt, reason: `Operator token extension: ${request.reason}` };
+      const newLimits = effectiveInvestigatorLimits(campaign.config.investigator, next);
+      const directory = path.join(artifacts, 'investigation', 'budget-grants');
+      const receiptPath = path.join(directory, `${grant.id}.json`);
+      if (await stat(receiptPath).catch(() => null)) throw new Error('Orphan investigator token grant receipt exists; reconcile it first');
+      await mkdir(directory, { recursive: true });
+      const snapshot = path.join(directory, grant.id);
+      await mkdir(snapshot); // An orphan snapshot also fails closed; never overwrite an earlier attempt.
+      await captureMutationDiff(campaign, variant, variant.worktreePath, snapshot, baseline);
+      const captured = await captureAndGateDiff(campaign, variant, variant.worktreePath, snapshot);
+      if (await sha256File(captured.patchPath) !== variant.patchHash) throw new Error('Retained investigator worktree patch changed');
+      await writeFile(receiptPath, `${JSON.stringify({
+        kind: 'investigator_token_grant', campaignId, variantId, grant,
+        priorState: state, priorStateHash: canonicalHash(state), oldLimits, newLimits, patchHash: variant.patchHash,
+      }, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+      const receiptHash = await sha256File(receiptPath);
+      // Files first, then a synchronous transaction including events. A failed commit leaves a closed orphan.
+      this.database.database.exec('BEGIN IMMEDIATE');
+      try {
+        if (!owner || !this.database.database.prepare(
+          'SELECT id FROM campaigns WHERE id = ? AND lease_owner = ? AND lease_expires_at > ?',
+        ).get(campaignId, String(owner), Date.now()) ||
+            !isDeepStrictEqual(this.database.getCampaign(campaignId), campaign) ||
+            !isDeepStrictEqual(this.database.getVariant(variantId), variant)) {
+          throw new Error('Investigator campaign lease or state changed while archiving the grant');
+        }
+        assertRemainingBudgets();
+        const updated = this.database.updateVariant(variantId, { investigation: next, status: 'mutating', error: null });
+        this.database.updateCampaign(campaignId, { status: 'ready' });
+        this.database.addEvent(campaignId, variantId, 'investigator.tokens_extended', {
+          grant, receiptHash, receiptPath: path.relative(artifacts, receiptPath),
+        });
+        this.database.database.exec('COMMIT');
+        return { variant: updated, grant };
+      } catch (error) {
+        this.database.database.exec('ROLLBACK');
+        throw error;
+      }
+    });
+  }
+
   resume(campaignId: string): CampaignRecord {
     if (this.isActive(campaignId)) throw new Error('campaign is still active');
     const leased = this.database.database.prepare(
@@ -2510,7 +2641,8 @@ export class CampaignOrchestrator {
     artifactDirectory: string,
     mutationBaselineTree: string,
   ): Promise<VariantRecord> {
-    const limits = campaign.config.investigator!;
+    const limits = effectiveInvestigatorLimits(campaign.config.investigator!, initialVariant.investigation);
+    await verifyInvestigatorTokenGrantReceipts(this.database, campaign, initialVariant, artifactDirectory);
     const parent = this.database.getVariant(initialVariant.parentVariantId!);
     const primary = primaryBenchmark(campaign);
     const trustedPlanner = await this.ensureFrozenPlannerSource(campaign);
@@ -2579,7 +2711,7 @@ export class CampaignOrchestrator {
         status: next.status, turnCount: next.turnCount, actionId: next.actions.at(-1)?.id,
       });
     };
-    const runner = new AgentRunner(campaign);
+    const runner = new AgentRunner({ ...campaign, config: { ...campaign.config, investigator: limits } });
     const completed = await runInvestigatorLoop(state, limits, {
       save,
       assertActive,
@@ -2609,7 +2741,7 @@ export class CampaignOrchestrator {
           record.artifactDirectory = relativeDirectory;
           save({ ...current, actions: current.actions.map((item) => item.id === record.id ? { ...record } : item) });
           this.database.updateVariant(variant.id, { patchPath: candidate.patchPath, patchHash: candidateHash });
-          if (action.action !== 'abandon' && treatment.result.changedFiles.length === 0) throw new Error('No treatment beyond inherited parent. Make a bounded change or abandon.');
+          if (action.action !== 'abandon' && action.action !== 'probe' && treatment.result.changedFiles.length === 0) throw new Error('No treatment beyond inherited parent. Make a bounded change or abandon.');
           if (action.action === 'abandon') {
             const receipt = { patchHash: candidateHash, artifactDirectory: relativeDirectory, result: { reason: action.rationale } };
             await writeFile(path.join(directory, 'receipt.json'), `${JSON.stringify(receipt, null, 2)}\n`, { flag: 'wx' });
@@ -2623,11 +2755,45 @@ export class CampaignOrchestrator {
           if (action.action === 'finalize' && !evaluatedTrial) {
             throw new Error('Finalize requires a completed primary evaluation of this exact patch and preregistered hypothesis. Test/evaluate revised patches first.');
           }
+          let diagnosticReview: PreparedDiagnosticReview | undefined;
+          let diagnosticReceipt: { reviewHash: string; artifactHash: string; artifactPath: string; interpretationStatus: 'unverified_model_judgment' } | undefined;
+          if (action.action === 'probe' || action.action === 'evaluate_primary') {
+            try {
+              if (!action.review) throw new Error('Provide model-selected examples, their qualification, and bound evidence citations.');
+              const context = JSON.parse(await readFile(contextPath, 'utf8'));
+              const store = new EvidenceStore(evidenceScopeFromContext(campaign, variant, worktree, artifactDirectory, context));
+              diagnosticReview = await store.prepareDiagnosticReview(action.review, { parentVariantId: parent.id, benchmark: primary.name });
+            } catch (error) {
+              record.admitted = false;
+              throw new Error(`Diagnostic review required before execution: ${errorMessage(error)}`);
+            }
+            const reviewPath = path.join(directory, 'diagnostic-review.json');
+            await writeFile(reviewPath, `${JSON.stringify(diagnosticReview, null, 2)}\n`, { flag: 'wx' });
+            diagnosticReceipt = { reviewHash: diagnosticReview.reviewHash, artifactHash: await sha256File(reviewPath),
+              artifactPath: 'diagnostic-review.json', interpretationStatus: 'unverified_model_judgment' };
+          }
+          // New trial reviews are immutable preregistration inputs. Historical trials are not backfilled.
+          const trialReview = (evaluatedTrial?.result as { diagnosticReview?: typeof diagnosticReceipt } | undefined)?.diagnosticReview;
+          if (action.action === 'finalize' && trialReview) {
+            if (trialReview.artifactPath !== 'diagnostic-review.json' || !/^investigation\/action-\d+$/.test(evaluatedTrial!.artifactDirectory ?? '')) {
+              throw new Error('Invalid diagnostic review archive binding');
+            }
+            const reviewPath = path.join(artifactDirectory, evaluatedTrial!.artifactDirectory!, trialReview.artifactPath);
+            if (await sha256File(reviewPath) !== trialReview.artifactHash) throw new Error('Preregistered diagnostic review was modified');
+            diagnosticReview = JSON.parse(await readFile(reviewPath, 'utf8')) as PreparedDiagnosticReview;
+            if (diagnosticReview.reviewHash !== trialReview.reviewHash || diagnosticReview.binding.variantId !== parent.id) {
+              throw new Error('Preregistered diagnostic review binding disagrees with the completed trial');
+            }
+          }
           this.database.updateVariant(variant.id, { status: 'building' });
           const built = await buildVariantImage(campaign, variant, worktree, directory, trustedPlanner);
           const imageId = (await runCommand('docker', ['image', 'inspect', '--format', '{{.Id}}', built.imageTag])).stdout.trim();
-          await writeFile(path.join(directory, 'pins.json'), `${JSON.stringify({ hypothesis: action.hypothesis, candidateHash, treatmentHash: await sha256File(treatment.patchPath), contextHash, imageId, harness: { ...state.harnessPins, ...executionHarnessPins } }, null, 2)}\n`, { flag: 'wx' });
+          await writeFile(path.join(directory, 'pins.json'), `${JSON.stringify({ hypothesis: action.hypothesis, candidateHash, treatmentHash: await sha256File(treatment.patchPath), contextHash, imageId, diagnosticReview: diagnosticReceipt ?? trialReview, harness: { ...state.harnessPins, ...executionHarnessPins } }, null, 2)}\n`, { flag: 'wx' });
           let result: unknown;
+          if (action.action === 'probe') {
+            this.database.updateVariant(variant.id, { status: 'gating' });
+            result = await runInvestigatorProbe(campaign, built.testImageTag, directory, built.environment, action.testFiles, diagnosticReview);
+          }
           if (action.action === 'test' || action.action === 'finalize') {
             this.database.updateVariant(variant.id, { status: 'gating' });
             result = await runInvestigatorTests(campaign, built.testImageTag, directory, built.environment,
@@ -2676,6 +2842,7 @@ export class CampaignOrchestrator {
               hypothesis: action.hypothesis,
               trustedTestResult: result,
               evaluatedTrial,
+              ...(diagnosticReview ? { diagnosticReview } : {}),
             }, null, 2)}\n`);
             const rootTreatment = await captureMutationDiff(campaign, variant, worktree, artifactDirectory, mutationBaselineTree);
             const rootCandidate = await captureAndGateDiff(campaign, variant, worktree, artifactDirectory);
@@ -2684,6 +2851,7 @@ export class CampaignOrchestrator {
             this.database.updateVariant(variant.id, { patchPath: rootCandidate.patchPath, patchHash: await sha256File(rootCandidate.patchPath) });
             result = { passed: true, tests: result, compliance: this.database.getVariant(variant.id).hypothesisCompliance };
           }
+          if (diagnosticReceipt) result = { ...(result as Record<string, unknown>), diagnosticReview: diagnosticReceipt };
           const returned = { patchHash: candidateHash, artifactDirectory: relativeDirectory, result };
           await writeFile(path.join(directory, 'receipt.json'), `${JSON.stringify(returned, null, 2)}\n`, { flag: 'wx' });
           return returned;
@@ -2695,11 +2863,44 @@ export class CampaignOrchestrator {
         }
       },
     });
+    if (completed.status !== 'finalized') {
+      assertActive();
+      try {
+        const current = this.database.getVariant(initialVariant.id);
+        const hypothesis = completed.latestHypothesis ?? current.hypothesis;
+        const snapshot = await this.archiveInvestigatorTerminal(campaign, { ...current, hypothesis }, worktree, artifactDirectory, mutationBaselineTree, completed);
+        this.database.updateVariant(initialVariant.id, { ...snapshot, hypothesis });
+      } catch (error) {
+        completed.status = 'failed';
+        completed.reason = `${completed.reason ?? 'Investigation stopped.'} Terminal patch archival failed: ${errorMessage(error)}`;
+      }
+    }
     return this.database.updateVariant(initialVariant.id, {
       investigation: completed,
-      status: completed.status === 'finalized' ? 'gating' : completed.status === 'stopped' ? 'mutating' : 'rejected',
+      status: completed.status === 'finalized' ? 'gating' : completed.status === 'stopped' ? 'mutating' : completed.status === 'failed' ? 'failed' : 'rejected',
       error: completed.reason,
     });
+  }
+
+  private async archiveInvestigatorTerminal(
+    campaign: CampaignRecord, variant: VariantRecord, worktree: string, artifactDirectory: string,
+    mutationBaselineTree: string, state: InvestigationState,
+  ): Promise<{ patchPath: string; patchHash: string }> {
+    const directory = path.join(artifactDirectory, 'investigation', `terminal-${state.turnCount}-${randomUUID()}`);
+    await mkdir(directory, { recursive: true });
+    const mutation = await captureMutationDiff(campaign, variant, worktree, directory, mutationBaselineTree);
+    const candidate = await captureAndGateDiff(campaign, variant, worktree, directory);
+    const patchHash = await sha256File(candidate.patchPath);
+    await writeFile(path.join(directory, 'receipt.json'), `${JSON.stringify({
+      kind: 'investigator_terminal_snapshot', capturedAt: new Date().toISOString(),
+      variantId: variant.id, sessionId: state.sessionId, turnCount: state.turnCount, status: state.status,
+      hypothesis: variant.hypothesis, patchHash, mutationHash: await sha256File(mutation.patchPath),
+      interpretation: 'Terminal preservation only. This snapshot does not establish test or evaluation results; consult hash-bound action receipts.',
+    }, null, 2)}\n`, { flag: 'wx' });
+    this.database.addEvent(campaign.id, variant.id, 'investigator.terminal_archived', {
+      patchHash, artifactDirectory: path.relative(artifactDirectory, directory), status: state.status,
+    });
+    return { patchPath: candidate.patchPath, patchHash };
   }
 
   private async runVariant(
@@ -2710,14 +2911,15 @@ export class CampaignOrchestrator {
     if (initialVariant.hypothesisComplianceAttempts.length > 0) {
       throw new Error('cannot restart an existing hypothesis compliance attempt loop');
     }
-    const variantStartedAtMs = Date.now();
+    const previousStart = initialVariant.investigation && initialVariant.startedAt ? Date.parse(initialVariant.startedAt) : NaN;
+    const variantStartedAtMs = Number.isFinite(previousStart) ? previousStart : Date.now();
     let variant = this.database.updateVariant(initialVariant.id, {
       startedAt: new Date(variantStartedAtMs).toISOString(),
       completedAt: null,
       elapsedMs: null,
-      phase2StartedAt: null,
-      phase2CompletedAt: null,
-      phase2ElapsedMs: null,
+      phase2StartedAt: initialVariant.investigation ? initialVariant.phase2StartedAt : null,
+      phase2CompletedAt: initialVariant.investigation ? initialVariant.phase2CompletedAt : null,
+      phase2ElapsedMs: initialVariant.investigation ? initialVariant.phase2ElapsedMs : null,
     });
     let stack: StackHandle | null = null;
     let artifactDirectory = '';
@@ -4105,17 +4307,18 @@ export class CampaignOrchestrator {
         `${variant.id}-${benchmark.name}${options.scope ? `-${options.scope}` : ''}-r${replicate}`,
         campaign.config.limits.phase2TimeoutMs,
         benchmark.sha256,
-        async ({ question, consultations }) =>
-          await answerWithRuntimeLedger({
+        async ({ question, consultations }) => {
+          const sourceQuestion = withRuntimeSourceContext(question, consultations);
+          return await answerWithRuntimeLedger({
             campaign, benchmark, database: this.database,
             campaignDirectory: campaignDirectory(this.paths, campaign.id),
             artifactDirectory: directory, variantId: variant.id, executionBenchmark, replicate,
-            question, requirementsAgentRequests: matchQuestionConsultations(consultations, question).length,
+            question: sourceQuestion, requirementsAgentRequests: matchQuestionConsultations(consultations, question).length,
             targetWorkflow: options.answerSourceTargetWorkflow,
             selectOption: selectedOptionIdForAnswer,
             resolve: () => this.answerRuntimeQuestion(
               campaign,
-              question,
+              sourceQuestion,
               consultations,
               workflowsSource,
               path.join(directory, 'questions'),
@@ -4130,7 +4333,8 @@ export class CampaignOrchestrator {
                   }
                 : undefined,
             ),
-          }),
+          });
+        },
         async (snapshot) => {
           const updatedAtMs = Date.now();
           latestSnapshot = {
@@ -4148,7 +4352,11 @@ export class CampaignOrchestrator {
       await writeFile(path.join(directory, 'result.json'), `${JSON.stringify(result, null, 2)}\n`);
       return result;
     } catch (error) {
-      latestSnapshot = { ...latestSnapshot, status: 'failed' };
+      latestSnapshot = { ...latestSnapshot, status: 'failed', failure: latestSnapshot.failure ?? normalizeExecutionFailure(error, {
+        status: 'failed',
+        ...(isRecord(error) && isRecord(error.failure) ? {} : { origin: isRecord(error) && typeof error.status === 'number' ? 'http' as const : 'harness' as const }),
+        ...(isRecord(error) && typeof error.status === 'number' ? { httpStatus: error.status } : {}),
+      }) };
       throw error;
     } finally {
       const completedAtMs = Date.now();
@@ -4463,6 +4671,12 @@ export class CampaignOrchestrator {
       {
         id: question.id,
         question: question.prompt,
+        rationale: question.rationale,
+        coverageIds: question.coverageIds,
+        requirementRefs: question.requirementRefs,
+        entity: question.requirementRefs?.[0]?.entity,
+        anchor: question.requirementRefs?.[0]?.anchor,
+        context: question.sourceContext ?? {},
         type: question.responseKind,
         options: (question.options ?? []).map((option) => ({
           id: option.id,

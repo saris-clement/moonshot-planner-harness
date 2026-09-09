@@ -56,11 +56,13 @@ Initialization copies the environment file, ZIPs, and optional absolute `researc
 
 Optional diagnosis-time Langfuse reads use `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, and `LANGFUSE_SECRET_KEY` from that frozen campaign environment. Reads are case/run filtered and capped; credentials and authorization headers are never persisted. Missing or failed Langfuse telemetry is recorded as incomplete optional evidence and does not invalidate durable run facts.
 
-All campaign operations after the server starts are available in the UI: create, baseline, retry failed baseline, run a supervised or automatic round, stop, resume, review labels, inspect planner questions and their answers, inspect artifacts, open Langfuse traces, read safely rendered experiment Markdown with a heading-derived section navigator, and promote a candidate. A V2 baseline automatically calibrates its target-excluded guard; later V2 retries rerun only the excluded cohort and reuse archived standard artifacts.
+Routine campaign operations after the server starts are available in the UI: create, baseline, retry failed baseline, run a supervised or automatic round, stop, resume, review labels, inspect planner questions and their answers, inspect artifacts, open Langfuse traces, read safely rendered experiment Markdown with a heading-derived section navigator, and promote a candidate. Explicit investigator token extensions use the CLI/API, not a dashboard grant button. A V2 baseline automatically calibrates its target-excluded guard; later V2 retries rerun only the excluded cohort and reuse archived standard artifacts.
 
 The overview separates live execution from durable experiment results. Each active experiment matrix synthesizes every configured benchmark and replicate slot, then joins persisted execution state and final replicate facts. Completed, current, and pending rows remain visible together; pending measurements use dashes rather than zero. V2 target sections show only excluded executions and identify the standard primary rows as the comparison control. Live decisions are the latest accepted checkpoint and can change after a planner question or successor run.
 
 Polling and server events update mounted views in place, preserving scroll, focus, disclosures, and unsaved inputs. Structural changes around an open native select wait until it closes; other data continues refreshing. Markdown and artifacts retain their last-good content while updates load. To verify native menu behavior in a real browser window (macOS headless Chrome dismisses native menus itself), run `npm run test:e2e -- --grep 'live target questions' --headed`.
+
+Failure status is separate from standard-result review: an excluded failure can block the evaluation while completed primary/holdout results remain reviewable. Expand **Failure diagnostics** for normalized evidence, provenance, trace links, and sanitized JSON copying. Legacy diagnostics can recover captured codes and checkpoint data from matching archives without rewriting records; missing code or details stay unknown. A validator rejection is observed execution evidence, not a verified semantic cause. Evidence and diagnostic disclosures preserve the PR7 live UI behaviors above.
 
 The experiment ledger supports URL-synchronized lifecycle, round, lineage, result, search, and sort controls. The lineage view uses the same lexicographic score ordering as promotion and keeps verified accuracy, provisional accuracy, agreement, holdout state, cohort drift, latency, and planner tokens separate rather than manufacturing a composite score.
 
@@ -95,15 +97,47 @@ Generated tests run in a networkless, read-only, resource-bounded Docker builder
 
 CLI/API campaigns opt in with `investigator.enabled: true`; omission or `false` preserves default strategist/mutator search. `campaign.example.json` explicitly opts in. New UI campaigns enable the investigator by default, with an opt-out checkbox and advanced budgets. This is independent of `mode: supervised|automatic` and does not enable unattended OpenCode permissions.
 
-Each candidate keeps one investigator session and a revision/action ledger. The agent may challenge the parent diagnosis, revise its hypothesis, request trusted targeted tests, request primary development evaluations, finalize, or abandon. A primary evaluation requires passing tests on the exact patch. Finalization requires an evaluated unchanged patch and matching preregistered hypothesis, then full configured tests and semantic compliance review. Final primary, holdout, and configured target-excluded cohorts run afterward; a finalized session alone is not a completed experiment or promotion.
+Each candidate keeps one investigator session and a revision/action ledger. The agent may challenge the parent diagnosis, revise its hypothesis, request an optional offline diagnostic probe, request trusted targeted tests, request primary development evaluations, finalize, or abandon. New primary evaluations require evidence-backed diagnostic qualification and passing trusted tests on the exact patch, not a passing probe. Finalization requires an evaluated unchanged patch and matching preregistered hypothesis, then full configured tests and semantic compliance review. Final primary, holdout, and configured target-excluded cohorts run afterward; a finalized session alone is not a completed experiment or promotion.
 
 `investigator.primaryReplicates` controls **full-primary** screening: integer 1 through 3, default 2 for new campaigns, running in parallel. This controls repetitions, not requirement coverage. Baseline and final evaluation still use `evaluation.replicates`, unchanged at 2 for V2. The advanced UI control is independent of those final repetitions. Provisional labels are acceptable for screening and finalization; human-reviewed labels are not a prerequisite for either. Semantic compliance review is an unverified model check, not a human-review gate. Do not present provisional scores as verified correctness.
 
-Defaults per investigator are 12 turns, 3 primary evaluation attempts, 14,400,000 ms (4 hours) wall time, and 2,000,000 agent tokens. Wall time covers the whole investigate/edit/test/screen/revise loop, not a single planner run; baseline and final validation are outside that budget. Failed primary attempts count toward the trial budget. New-campaign initialization freezes the two-replica default; existing explicit limits and historical omitted screening values retain their previous behavior. Stop/resume preserves the session and action history; interrupted actions are marked rather than silently replayed. Unknown usage remains unknown, not zero.
+Defaults per investigator are 12 turns, 3 primary evaluation attempts, 14,400,000 ms (4 hours) wall time, and 2,000,000 agent tokens. Wall time covers the whole investigate/edit/test/screen/revise loop, not a single planner run; baseline and final validation are outside that budget. Admitted failed primary attempts count toward the trial budget; requests blocked by diagnostic admission record `admitted: false` and do not count. Historical actions with omitted admission metadata still count. New-campaign initialization freezes the two-replica default; existing explicit limits and historical omitted screening values retain their previous behavior. Stop/resume preserves the session and action history; interrupted actions are marked rather than silently replayed. Unknown usage remains unknown, not zero.
+
+An operator may explicitly authorize more tokens for a token-stopped investigation on the **same campaign, variant, and session**, without creating a new paid campaign or rerunning its baseline. Use the existing campaign's data root and single coordinator; do not run a mutating CLI alongside its dashboard process:
+
+```bash
+npm run cli -- extend-tokens <campaign> <variant> --tokens 4000000 --reason "Continue the same investigation within the remaining non-token budgets." --request-id <id>
+```
+
+The request ID is an idempotency key: retry the same authorization with the same ID rather than granting it twice. Each grant records its ID, date, additional tokens, cumulative usage at grant, previous limit, effective limit, and reason. The effective limit is `max(previousLimit, tokensAtGrant) + additionalTokens`, so a 4,000,000-token grant at 4,092,956 used against the frozen 2,000,000 base yields **4,092,956 / 8,092,956**, not a reset counter or a 6,000,000 cap. Later displays use the last grant's effective limit directly, never add grants to it again. The frozen `campaign.config.investigator.maxAgentTokens` stays unchanged; session history, prior spending, Phase 2 clocks, investigation wall-time budget, turn/trial limits, and baseline/final replicate counts are not reset or extended. Other exhausted budgets can still prevent continuation.
+
+Overview and Investigation show cumulative agent tokens against the effective cap. The compact **Operator budget extensions** disclosure lists the frozen base and each dated grant, amount, new cap, usage at grant, previous cap, and sanitized reason. It is a record of budget authorization, not a human-reviewed label or verified planner truth. Historical sessions without grants retain their base cap; measured zero remains zero and missing usage remains **Unknown**. The disclosure preserves open state, focus, and scroll during live updates. This command example documents an operator action; it does not authorize a live run or claim that an extension improved any result.
 
 Runs shows primary-only screening slots before finalization and the full configured cohorts afterward. Archived trial results determine their recorded replicate count; live snapshots determine observed counts before configuration is used as a fallback. A historical two-replicate trial is never reinterpreted as one because the new field was absent. For one replicate, agreement is not measured, even if the stored consensus helper yields 100%; a single observation cannot establish repeatability.
 
 Overview shows session state and budgets; the Investigation tab shows hypothesis revisions, action outcomes, trial scores, and lazy artifact/log links. Markdown records the same operational evidence without copying session chat or raw trial output. Agent interpretations, passing tests, provisional labels, and human-reviewed truth remain distinct. The runtime answer ledger freezes repeated semantic answers within a pinned context, not every decision context or complete decision set; matching pack/source pins alone do not establish strict replay.
+
+### Diagnostic Qualification And Probes
+
+Before full-primary screening, the model chooses **1..20 recorded examples**, with 20 a safety cap, not a quota. This is not a fixed sample of ten or a sample assumed to contain known errors. It qualifies each example as `useful`, `uncertain`, or `not_useful`; at least one must be useful or uncertain. A `build` decision can be correct even when an existing workflow is present. Uncertainty is valid and may use `expectedDecision: null`. No human labels are required, and neither these assessments nor expected decisions become scoring labels.
+
+The structured `review` records the observation reference and selection rationale. For each example it records the unit reference, why it matters, requirement understanding, source/code knowledge (`codeAssessment`), citations, limitations, and a discriminating check. Only then does it state the proposed plan's mechanism and falsification criterion. The coordinator binds the selected recorded examples and citations to available evidence; structural validation is not an LLM truth grade or a fixed decision table.
+
+`probe` is an optional cheap diagnostic action. Its request supplies `testFiles` and `review` alongside the usual `rationale` and `hypothesis`; the investigator prompt includes the typed JSON action/review schema. The author-selected Vitest test reads `process.env.HARNESS_DIAGNOSTIC_INPUT`, pointing to `/harness/diagnostic-input.json`. That file contains selected, bound recorded examples and cited bounded/redacted source or artifact text. Tests may import candidate code from the actual image's server paths and use its installed dependencies. These are offline fixtures, not full recorded-provider replay and not live selected-unit adjudication, which is not implemented.
+
+Probe execution uses the exact test-image digest with no network and no LLM providers, no full workflows-source or repository directory mounts, and a maximum 300-second execution time. The JSON input is capped at 2 MiB; each citation is capped at 16 KiB with explicit completeness/truncation flags. A successful result records `kind: 'diagnostic_probe'`, `executionPassed: true`, `providerCalls: 0`, `imageId`, `inputHash`, `testFiles`, `logPaths`, `interpretation`, and a `diagnosticReview` receipt. Probe success is execution evidence only: it earns no trusted-test, full-primary, score, or promotion credit.
+
+The full qualified review, bound examples, and citations are archived in the action directory as `diagnostic-review.json`, with `structuralStatus: 'recorded'` and `interpretationStatus: 'unverified_model_judgment'`, never a diagnosis-true verdict. Both probe and `evaluate_primary` results expose `diagnosticReview: { reviewHash, artifactHash, artifactPath: 'diagnostic-review.json', interpretationStatus: 'unverified_model_judgment' }`. The UI labels the action **Offline diagnostic probe**, shows input/image and review hashes in simple details, and links the archive without automatically fetching the potentially large full review. Markdown records receipt metadata, not raw review/source text. Missing diagnostic admission is shown as **Not admitted: diagnostic review required** or the recorded action error, not a planner execution failure. Required review qualification is separate from optional probe success; exact-patch primary prerequisites, full configured tests, and all final gates remain unchanged.
+
+### Evidence On Demand
+
+Each turn attaches one compact JSON briefing: at most 16 KiB initially and 8 KiB for resumed-session deltas. It carries the objective, hypothesis, bounded measurements, latest feedback, action headers, budgets, and omission/reference metadata, not repeated full trial results. Durable trial receipts, facts, patches, and label references remain unchanged and available on demand. Compaction is deterministic, not an LLM judgment.
+
+The `harness_evidence` MCP server exposes eight tools in the investigator's session: `list_observations`, `compare_trial`, `inspect_unit`, `read_evidence`, `search_source`, `research_shell`, `research_http`, and `research_output`. The optional read-only subagent is not required to fetch evidence. **Explore evidence** and **Evidence access** expose bounded queries and access receipts in the UI, not session chat.
+
+Research scope includes all available, coordinator-registered primary, regression (holdout), and target-excluded observations, including registered prior experiments and legacy control arms. This is not an unseen-holdout protocol. Benchmark, arm, replica, label basis, and frozen-source provenance stay explicit; excluded research uses its filtered source, never a silent fallback to normal source. Use returned opaque references and pagination; agents cannot supply host paths or expand scope, and only the coordinator selects evaluation cohorts.
+
+`research_shell` permits arbitrary commands and pipelines inside isolated Docker, not a command whitelist or host shell. `/candidate`, scoped `/sources`, and sanitized `/artifacts/data.json` are read-only; `/scratch` is temporary writable space for scripts. No host credentials or Docker socket enter the worker. `curl` GET/HEAD and `research_http` use a broker restricted to approved public HTTPS documentation hosts. Local coordinator APIs are not proxied: local run data is exposed through typed evidence tools and the sanitized bundle instead. Build the trusted `Dockerfile.research` image explicitly before using shell or HTTP research; there is no automatic build/pull or host fallback. See the commands below and the [sandbox contract](src/researchSandbox.md).
 
 ## Scoring Semantics
 
@@ -142,7 +176,11 @@ Planner runtime questions remain separate. For investigator campaigns, `runtimeA
     mutation.patch               current treatment relative to the inherited parent
     investigator-context.json    hash-bound advisory context and score-reference locator
     investigator-reference.json  hash-bound parent facts/replicates and trial labels
+    investigator-turn-*-feedback.json  compact briefing; the turn's only attachment
+    evidence-access/             scoped invocation manifests, access receipts, bundles, and research output
     investigation/action-NNN/    trial requests, pins, patches, receipts/failures, logs, and collected run artifacts
+      diagnostic-review.json     qualified review, bound examples/citations; unverified model judgment
+      diagnostic-input.json      bounded/redacted offline probe fixture when requested
     hypothesis-compliance/       immutable prompts, logs, and patch-bound verdict
     diagnosis/                   immutable bounded inputs, manifests, optional telemetry, prompts, logs, and results
 docs/experiments/<id>/           trackable Markdown facts and conclusions
@@ -161,6 +199,17 @@ npm run build
 
 The test suite covers persistence, scoring precedence, cohort drift, command argument safety, and the complete planner HTTP sequence through Phase 2 without touching Phase 3.
 
+### Research Sandbox Check
+
+Before research use, the operator builds the trusted image and runs the opt-in real Docker smoke test from the harness root:
+
+```bash
+docker build -f Dockerfile.research -t ainative-planner-research:local .
+RESEARCH_DOCKER_SMOKE=1 node --import tsx --test test/researchSandbox*.test.ts
+```
+
+Without `RESEARCH_DOCKER_SMOKE=1`, ordinary tests skip the real-container check. It exercises scripts, brokered public GET/HEAD, isolation, output bounds, and cleanup without starting a planner campaign or dashboard. See [script verification notes](scripts/README.md).
+
 ### Opt-In Live Check
 
 Ordinary `npm run check` uses isolated fixtures and mocked live-runner tests; it does not start a live evaluation. For a **new, explicitly authorized** live run on an unused port:
@@ -173,7 +222,9 @@ npm run test:live -- --live --source-config /absolute/path/to/campaign.json --id
 
 ## Current Operational Limits
 
-The [PR47 live investigation summary](docs/experiments/pr47-autonomous-1/investigation-summary.md) records an approximately 82-minute, sequential two-replicate primary trial with provisional accuracy falling from 35.2% to 33.2%. The revised patch passed 103 targeted tests but was not evaluated; the agent abandoned at turn 7 with about 25 minutes left. No improvement or final candidate outcome was established. The initial follow-up used single-replica screening; current new-campaign defaults instead provide two parallel replicas and a four-hour investigation budget. The archived campaign's configuration and measurements remain unchanged.
+The [PR47 live investigation summary](docs/experiments/pr47-autonomous-1/investigation-summary.md) records an approximately 82-minute, sequential two-replicate primary trial with provisional accuracy falling from 35.2% to 33.2%. The revised patch passed targeted tests but was not evaluated; the agent abandoned at turn 7 with about 25 minutes left. No improvement or final candidate outcome was established. The initial follow-up used single-replica screening; current new-campaign defaults instead provide two parallel replicas and a four-hour investigation budget. The archived campaign's configuration and measurements remain unchanged. No full new campaign has been run to establish improvement from compact briefing, evidence access, or failure diagnostics.
+
+Planner-side structured `run.failed` event details are a separate future planner commit/PR, not part of PR47. The harness accepts the optional versioned details into `failure.details` without echoing raw model output; unknown candidate selections use fingerprints rather than raw text. Exact selections absent from old archives are unrecoverable; a code alone does not establish a semantic cause.
 
 - A stop request prevents the next iteration and automatic promotion, but does not terminate a model call already in flight.
 - New full-primary investigator screening defaults to two parallel replicas. Baseline/final repetitions remain separately configured; V2 requires two. An explicit single-replica override cannot measure agreement.
@@ -182,4 +233,4 @@ The [PR47 live investigation summary](docs/experiments/pr47-autonomous-1/investi
 - Campaign execution is single-coordinator. Do not run dashboard and mutating CLI commands against the same campaign simultaneously.
 - Hypothesis compliance is a conservative same-model semantic review. It reduces obviously unfaithful experiments but may reject a valid mutation and is not independent correctness evidence.
 - Node currently labels built-in SQLite as experimental; all state is also represented by raw artifacts and generated Markdown.
-- Live execution projections must be persisted in SQLite. The server does not hydrate missing execution state from archived artifacts.
+- Live execution projections must be persisted in SQLite. Read-only diagnostic recovery may supplement existing failed slots from matching archives, but never hydrates missing execution state or rewrites historical records.

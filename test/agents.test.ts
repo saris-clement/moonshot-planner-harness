@@ -11,7 +11,7 @@ import {
   type CampaignRecord,
   type VariantRecord,
 } from '../src/types.js';
-import type { CommandResult } from '../src/process.js';
+import { runCommand, type CommandResult } from '../src/process.js';
 
 const config = CampaignConfigSchema.parse({
   id: 'agent-repair',
@@ -41,7 +41,10 @@ const campaign: CampaignRecord = {
   updatedAt: '2026-09-06T00:00:00.000Z',
 };
 
-test('source-answer agent retries progress-only output with a JSON repair request', async () => {
+test('source-answer agent retries progress-only output with a JSON repair request', async (t) => {
+  const source = await mkdtemp(path.join(os.tmpdir(), 'source-answer-source-'));
+  const artifacts = await mkdtemp(path.join(os.tmpdir(), 'source-answer-artifacts-'));
+  t.after(async () => { await rm(source, { recursive: true, force: true }); await rm(artifacts, { recursive: true, force: true }); });
   const calls: string[][] = [];
   const environments: Array<NodeJS.ProcessEnv | undefined> = [];
   const outputs = [
@@ -49,6 +52,9 @@ test('source-answer agent retries progress-only output with a JSON repair reques
     '{"resolution":"answered","answer":"Use the shared format.","evidence":["src/shared.ts:1"]}',
   ];
   const runner = new AgentRunner(campaign, async (command, args, options): Promise<CommandResult> => {
+    if (command === 'git') return await runCommand(command, args, options);
+    if (args.includes('debug')) return { command, args: [...args], exitCode: 0, stderr: '', durationMs: 1,
+      stdout: args.includes('config') ? '{}' : `data       ${os.homedir()}/.local/share/opencode\n` };
     calls.push([...args]);
     environments.push(options?.env);
     return {
@@ -63,13 +69,13 @@ test('source-answer agent retries progress-only output with a JSON repair reques
 
   const answer = await runner.answerUpstreamQuestion(
     { id: 'question-a', question: 'Which format?', type: 'free_text', options: [] },
-    '/tmp/target-safe-source',
-    '/tmp',
+    source,
+    artifacts,
   );
 
   assert.equal(calls.length, 2);
-  assert.equal(environments[0]?.GIT_CEILING_DIRECTORIES, '/tmp');
-  assert.equal(environments[1]?.GIT_CEILING_DIRECTORIES, '/tmp');
+  assert.ok(environments[0]?.GIT_CEILING_DIRECTORIES?.split(path.delimiter).includes(path.dirname(source)));
+  assert.ok(environments[1]?.GIT_CEILING_DIRECTORIES?.split(path.delimiter).includes(path.dirname(source)));
   assert.match(calls[0]!.join(' '), /current working directory as a hard source boundary/i);
   assert.match(calls[0]!.join(' '), /Do not inspect parent, sibling, or external paths/i);
   assert.match(calls[0]!.join(' '), /Use only behavior and deployment facts proven by source/);
@@ -81,9 +87,15 @@ test('source-answer agent retries progress-only output with a JSON repair reques
   assert.equal(answer.resolution, 'answered');
 });
 
-test('pm-simulation source-answer prompt keeps implementation private and evidence harness-only', async () => {
+test('pm-simulation source-answer prompt keeps implementation private and evidence harness-only', async (t) => {
+  const source = await mkdtemp(path.join(os.tmpdir(), 'source-answer-pm-source-'));
+  const artifacts = await mkdtemp(path.join(os.tmpdir(), 'source-answer-pm-artifacts-'));
+  t.after(async () => { await rm(source, { recursive: true, force: true }); await rm(artifacts, { recursive: true, force: true }); });
   const calls: string[][] = [];
-  const runner = new AgentRunner(campaign, async (command, args): Promise<CommandResult> => {
+  const runner = new AgentRunner(campaign, async (command, args, options): Promise<CommandResult> => {
+    if (command === 'git') return await runCommand(command, args, options);
+    if (args.includes('debug')) return { command, args: [...args], exitCode: 0, stderr: '', durationMs: 1,
+      stdout: args.includes('config') ? '{}' : `data       ${os.homedir()}/.local/share/opencode\n` };
     calls.push([...args]);
     return {
       command,
@@ -101,8 +113,8 @@ test('pm-simulation source-answer prompt keeps implementation private and eviden
 
   const answer = await runner.answerUpstreamQuestion(
     { id: 'question-pm', question: 'Which operating model?', type: 'free_text', options: [] },
-    '/tmp',
-    '/tmp',
+    source,
+    artifacts,
     { mode: 'pm-simulation' },
   );
 
@@ -125,6 +137,10 @@ test('pm-simulation source-answer prompt keeps implementation private and eviden
   assert.match(prompt, /exact source paths/i);
   assert.match(prompt, /harness-only audit/i);
   assert.match(prompt, /evidence.*never planner-visible/i);
+  assert.match(prompt, /current working directory as a hard source boundary/i);
+  assert.match(prompt, /Do not inspect parent, sibling, or external paths/i);
+  assert.match(prompt, /only native read.*directory listings and files/i);
+  assert.match(prompt, /Do not.*edit.*network/i);
   assert.match(prompt, /"resolution":"answered"/);
   assert.match(prompt, /"resolution":"unresolved"/);
 });

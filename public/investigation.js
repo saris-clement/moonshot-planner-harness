@@ -5,6 +5,8 @@ import { primaryScreening } from './models.js';
 import { routeLink, sectionHeading } from './ui.js';
 import { experimentHelpButton } from './experimentHelp.js';
 import { helpButton } from './help.js';
+import { evidenceExplorer } from './evidence.js';
+import { sanitizeDiagnosticValue } from './diagnostics.js';
 
 export const investigatorDefaults = {
   primaryReplicates: 2,
@@ -14,12 +16,17 @@ export const investigatorDefaults = {
   maxAgentTokens: 2_000_000,
 };
 
-const actionNames = { test: 'Test', evaluate_primary: 'Primary evaluation', finalize: 'Finalize', abandon: 'Abandon' };
+const actionNames = { test: 'Test', probe: 'Offline diagnostic probe', evaluate_primary: 'Primary evaluation', finalize: 'Finalize', abandon: 'Abandon' };
 const knownNumber = (value, format = formatNumber) => Number.isFinite(value) ? format(value) : 'Unknown';
+const isPrimaryTrial = (action) => action.kind === 'evaluate_primary' && action.admitted !== false;
 
 function actionOutcome(action) {
   if (!action) return 'No actions recorded';
+  if (action.kind === 'evaluate_primary' && action.admitted === false) return sanitizeDiagnosticValue(action.error) || 'Not admitted: diagnostic review required';
   if (action.status !== 'completed') return `${actionNames[action.kind] ?? 'Action'} ${action.status ?? 'status unknown'}`;
+  if (action.kind === 'probe') {
+    return action.result?.executionPassed === true ? 'Execution passed (diagnostic only)' : action.result?.executionPassed === false ? 'Execution failed (diagnostic only)' : 'Diagnostic execution result unknown';
+  }
   if (action.kind === 'test') {
     return action.result?.passed === true ? 'Tests passed (not correctness)' : action.result?.passed === false ? 'Tests failed' : 'Test result unknown';
   }
@@ -32,7 +39,7 @@ function actionOutcome(action) {
 export function investigationSummary(investigation) {
   if (!investigation) return 'No investigation recorded';
   const actions = investigation.actions ?? [];
-  const trials = actions.filter((action) => action.kind === 'evaluate_primary').length;
+  const trials = actions.filter(isPrimaryTrial).length;
   const tests = actions.filter((action) => action.kind === 'test').length;
   return `${trials} primary trial${trials === 1 ? '' : 's'} / ${tests} test${tests === 1 ? '' : 's'}; latest: ${actionOutcome(actions.at(-1))}`;
 }
@@ -61,6 +68,8 @@ export function investigationStatus(campaign, variant) {
   const actions = investigation.actions ?? [];
   const current = actions.findLast((action) => action.status === 'running');
   const limits = { ...investigatorDefaults, ...campaign.config.investigator };
+  const grants = investigation.tokenGrants ?? [];
+  const tokenLimit = grants.at(-1)?.effectiveLimit ?? limits.maxAgentTokens;
   const screening = primaryScreening(campaign, variant);
   const start = Date.parse(investigation.startedAt);
   const end = investigation.status === 'running' ? Date.now() : Date.parse(investigation.updatedAt);
@@ -69,11 +78,11 @@ export function investigationStatus(campaign, variant) {
     ['Session', investigation.sessionId ?? 'Not assigned'],
     ['Current action', current ? `${current.id} / ${actionNames[current.kind] ?? current.kind}` : 'None running'],
     ['Turns', `${knownNumber(investigation.turnCount)} / ${formatNumber(limits.maxTurns)}`],
-    ['Primary trials', `${actions.filter((action) => action.kind === 'evaluate_primary').length} / ${formatNumber(limits.maxPrimaryEvaluations)}`],
+    ['Primary trials', `${actions.filter(isPrimaryTrial).length} / ${formatNumber(limits.maxPrimaryEvaluations)}`],
     ['Primary screening', `${formatNumber(screening.replicateCount)} ${screening.countSource} / trial`],
     ['Baseline and final', `${formatNumber(campaign.config.evaluation.replicates)} / benchmark`],
     ['Wall time', `${knownNumber(Number.isFinite(start) && Number.isFinite(end) ? Math.max(0, end - start) : null, formatDuration)} / ${formatDuration(limits.maxWallTimeMs)}`],
-    ['Agent tokens', `${knownNumber(investigation.agentTokens)} / ${formatNumber(limits.maxAgentTokens)}`],
+    ['Agent tokens', `${knownNumber(investigation.agentTokens)} / ${knownNumber(tokenLimit)}`],
     ['Agent cost', knownNumber(investigation.agentCostUsd, formatMoney)],
   ];
   return element('div', { className: 'investigation-status', attributes: { 'data-testid': `investigator-${variant.id}` } }, [
@@ -84,6 +93,21 @@ export function investigationStatus(campaign, variant) {
     element('dl', { className: 'investigation-metrics', attributes: { 'aria-label': 'Investigator session and budgets' } }, values.map(([label, value]) =>
       element('div', {}, [element('dt', { text: label }, label === 'Wall time' ? [helpButton(label)] : []), element('dd', { text: value })]),
     )),
+    grants.length ? disclosure(`${variant.id}:token-grants`, 'Operator budget extensions', () =>
+      element('div', {}, [
+        element('p', { className: 'muted investigation-prose', text: 'Budget authorization only, not human-verified planner truth. Cumulative usage is retained; the session clock is unchanged.' }),
+        element('p', { className: 'investigation-prose', text: `Frozen base cap: ${formatNumber(limits.maxAgentTokens)} tokens.` }),
+        ...grants.map((grant) => element('div', { className: 'investigation-action-detail', attributes: { 'data-live-key': `${variant.id}:token-grant:${grant.id}` } }, [
+          element('p', { className: 'identifier' }, [element('time', {
+            text: `${new Date(grant.grantedAt).toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'UTC' })} UTC`,
+            attributes: { datetime: grant.grantedAt },
+          })]),
+          element('p', { className: 'investigation-prose', text: `+${knownNumber(grant.additionalTokens)} tokens / New cap: ${knownNumber(grant.effectiveLimit)}` }),
+          element('p', { className: 'muted investigation-prose', text: `Used at grant: ${knownNumber(grant.tokensAtGrant)} / Previous cap: ${knownNumber(grant.previousLimit)}` }),
+          element('p', { className: 'investigation-prose', text: `Reason: ${sanitizeDiagnosticValue(grant.reason) ?? 'Not recorded'}` }),
+        ])),
+      ]), JSON.stringify([limits.maxAgentTokens, grants]),
+    ) : null,
     investigation.reason ? disclosure(`${variant.id}:reason`, 'Recorded reason (unverified interpretation)', () =>
       element('p', { className: 'investigation-prose', text: investigation.reason }),
       investigation.reason,
@@ -102,7 +126,7 @@ function evaluationResult(result, campaign) {
   ];
   return element('div', { className: 'investigation-evaluation' }, [
     element('p', { text: mean ? 'Score basis: replicate mean. Consensus decisions are separate.' : 'Score basis: consensus decisions.' }),
-    element('p', { className: 'muted', text: 'Recorded scores, not a promotion decision. Unknown values are not zero.' }),
+    element('p', { className: 'muted', text: 'Recorded scores against the frozen comparison reference, not a promotion decision. Unknown values are not zero.' }),
     element('div', { className: 'table-scroll' }, [
       element('table', {}, [
         element('caption', { text: 'Primary trial score comparison' }),
@@ -134,6 +158,20 @@ export function investigationPanel(campaign, variant) {
     investigationStatus(campaign, variant),
   ]);
   if (!investigation) return panel;
+  const latestTrial = investigation.actions?.findLast((action) => isPrimaryTrial(action) && action.status === 'completed');
+  panel.append(element('section', { className: 'investigation-comparison' }, [
+    element('h3', { text: 'Latest recorded primary comparison' }),
+    latestTrial ? element('p', { className: 'identifier', text: `${latestTrial.id} / ${latestTrial.hypothesis?.title ?? 'Recorded hypothesis'}` }) : null,
+    latestTrial ? element('div', {}, [
+      element('p', { className: 'muted', text: 'Recorded action summary, not the latest unevaluated revision or a promotion decision. Open its timeline entry for score basis and comparison notes.' }),
+      element('dl', { className: 'investigation-metrics' }, [
+        ['Verified accuracy', 'verified'], ['Provisional accuracy (LLM suggestion)', 'provisional'],
+      ].map(([label, dimension]) => element('div', {}, [
+        element('dt', { text: label }), element('dd', { text: `Trial ${knownNumber(latestTrial.result?.score?.[dimension]?.accuracy, formatPercent)} / Frozen reference ${knownNumber(latestTrial.result?.baselineScore?.[dimension]?.accuracy, formatPercent)}` }),
+      ]))),
+    ]) : element('p', { className: 'muted', text: 'No completed primary trial is recorded. Tests and proposed revisions are not measured improvements.' }),
+    evidenceExplorer(campaign, variant), evidenceExplorer(campaign, variant, true),
+  ]));
   const root = `/api/campaigns/${encodeURIComponent(campaign.id)}/variants/${encodeURIComponent(variant.id)}/artifacts`;
   const body = element('tbody');
   for (const [index, action] of (investigation.actions ?? []).entries()) {
@@ -142,6 +180,7 @@ export function investigationPanel(campaign, variant) {
     const logPaths = Array.isArray(tests?.logPaths) ? tests.logPaths : [];
     const details = disclosure(key, 'Hypothesis, result and logs', () => {
       const hypothesis = action.hypothesis;
+      const review = action.result?.diagnosticReview;
       const content = element('div', { className: 'investigation-action-detail' }, [
         element('p', { className: 'suggestion', text: 'Agent interpretation / unverified' }),
         ...[
@@ -157,8 +196,23 @@ export function investigationPanel(campaign, variant) {
         ])),
         element('p', { className: 'identifier', text: `Started: ${action.startedAt ?? 'Unknown'} / Completed: ${action.completedAt ?? 'Not recorded'}` }),
         element('p', { className: 'identifier', text: `Patch: ${action.patchHash ?? 'Not recorded'}` }),
-        action.error ? element('div', { className: 'error-panel' }, [element('h3', { text: 'Recorded action error' }), element('p', { className: 'investigation-prose', text: action.error })]) : null,
-        action.kind === 'evaluate_primary' ? evaluationResult(action.result, campaign) : null,
+        action.error ? element('div', { className: 'error-panel' }, [element('h3', { text: 'Recorded action error' }), element('p', { className: 'investigation-prose', text: sanitizeDiagnosticValue(action.error) })]) : null,
+        action.kind === 'probe' ? element('div', {}, [
+          element('p', { text: actionOutcome(action) }),
+          element('p', { className: 'muted', text: 'Offline execution only: not full configured tests, primary evaluation, or promotion. Diagnostic review is required before primary screening; a passing probe is optional.' }),
+          element('p', { text: `Provider calls: ${knownNumber(action.result?.providerCalls)}` }),
+          element('p', { className: 'identifier', text: `Input hash: ${action.result?.inputHash ?? 'Not recorded'}` }),
+          element('p', { className: 'identifier', text: `Image: ${action.result?.imageId ?? 'Not recorded'}` }),
+          typeof action.result?.interpretation === 'string' ? element('p', { className: 'suggestion investigation-prose', text: `Unverified interpretation: ${sanitizeDiagnosticValue(action.result.interpretation)}` }) : null,
+        ]) : null,
+        review && (action.kind === 'probe' || action.kind === 'evaluate_primary') ? element('div', {}, [
+          element('h3', { className: 'suggestion', text: 'Diagnostic review / unverified model judgment' }),
+          element('p', { className: 'muted', text: 'Structural recording is not diagnostic truth and contributes no scores. Inspect the full qualification and citations through the archive links below.' }),
+          ...[
+            ['Review hash', review.reviewHash], ['Review artifact hash', review.artifactHash], ['Review artifact', review.artifactPath],
+          ].map(([label, value]) => element('p', { className: 'identifier', text: `${label}: ${value ?? 'Not recorded'}` })),
+        ]) : null,
+        isPrimaryTrial(action) ? evaluationResult(action.result, campaign) : null,
         action.kind === 'test' ? element('p', { text: `${actionOutcome(action)}. Passing tests do not establish planner correctness.` }) : null,
         action.kind === 'finalize' ? element('div', {}, [
           element('h3', { text: 'Finalization checks' }),
@@ -222,7 +276,7 @@ export function investigationPanel(campaign, variant) {
       ]),
       element('td', {}, [
         statusLabel(action.status), element('p', { text: actionOutcome(action) }),
-        action.kind === 'evaluate_primary' && action.status === 'completed' && action.result?.score ? element('p', {
+        isPrimaryTrial(action) && action.status === 'completed' && action.result?.score ? element('p', {
           className: 'investigation-score',
           text: `Verified: ${knownNumber(action.result.score.verified?.accuracy, formatPercent)} / Provisional: ${knownNumber(action.result.score.provisional?.accuracy, formatPercent)}${campaign.config.investigator?.enabled || action.result.score.metricMode === 'replicate_mean' ? ' (replicate mean)' : ''}`,
         }) : null,
@@ -230,7 +284,7 @@ export function investigationPanel(campaign, variant) {
       ]),
     ]));
   }
-  panel.append(element('p', { className: 'muted investigation-note', text: 'Action order is recorded order. Hypotheses and action rationales are unverified interpretations; tests measure execution only. Primary trials include failed attempts.' }),
+  panel.append(element('p', { className: 'muted investigation-note', text: 'Action order is recorded order. Hypotheses and action rationales are unverified interpretations; tests and probes measure execution only. Primary trials include admitted failed attempts and historical actions without admission metadata, but exclude requests that were not admitted.' }),
     investigation.actions?.length ? element('div', { className: 'table-scroll investigation-table-wrap', attributes: { 'data-live-key': `${variant.id}:timeline-scroll` } }, [
       element('table', { className: 'investigation-table' }, [
         element('caption', { text: 'Investigation action timeline' }),

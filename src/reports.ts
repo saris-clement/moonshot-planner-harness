@@ -50,11 +50,15 @@ function renderInvestigation(campaign: CampaignRecord, variant: VariantRecord): 
   const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
   const number = (value: unknown): string => typeof value === 'number' && Number.isFinite(value) ? String(value) : 'unknown';
   const accuracy = (value: unknown): string => typeof value === 'number' && Number.isFinite(value) ? percentage(value) : 'unknown';
+  const text = (value: unknown): string => typeof value === 'string' ? value : 'not recorded';
   const rows = state.actions.map((action) => {
     const result = record(action.result);
     let outcome = action.status === 'completed' ? 'Result unknown' : action.error ?? 'No completed result';
-    if (action.status === 'completed') {
+    if (action.kind === 'evaluate_primary' && action.admitted === false) {
+      outcome = action.error || 'Not admitted: diagnostic review required';
+    } else if (action.status === 'completed') {
       if (action.kind === 'test') outcome = result.passed === true ? 'Tests passed (execution only)' : result.passed === false ? 'Tests failed' : 'Test result unknown';
+      if (action.kind === 'probe') outcome = result.executionPassed === true ? 'Execution passed (diagnostic only)' : result.executionPassed === false ? 'Execution failed (diagnostic only)' : 'Diagnostic execution result unknown';
       if (action.kind === 'evaluate_primary') {
         const score = record(result.score);
         const baseline = record(result.baselineScore);
@@ -69,8 +73,13 @@ function renderInvestigation(campaign: CampaignRecord, variant: VariantRecord): 
       }
       if (action.kind === 'abandon') outcome = 'Abandoned; no improvement asserted';
     }
+    if (action.kind === 'probe') outcome += `. Provider calls: ${number(result.providerCalls)}. Input hash: ${text(result.inputHash)}. Image: ${text(result.imageId)}`;
+    const review = record(result.diagnosticReview);
+    if ((action.kind === 'probe' || action.kind === 'evaluate_primary') && Object.keys(review).length) {
+      outcome += `. Review hash: ${text(review.reviewHash)}. Review artifact hash: ${text(review.artifactHash)}. Review artifact: ${text(review.artifactPath)} (unverified_model_judgment; structural recording is not diagnostic truth)`;
+    }
     const archive = action.artifactDirectory ?? (/^action-\d+$/.test(action.id) ? `investigation/${action.id} (expected path; inspect archive)` : 'not recorded');
-    return `| ${[action.id, action.kind, action.status, action.hypothesis?.title ?? 'not recorded', action.patchHash ?? 'not recorded', outcome, archive].map(markdown).join(' | ')} |`;
+    return `| ${[action.id, action.kind === 'probe' ? 'Offline diagnostic probe' : action.kind, action.status, action.hypothesis?.title ?? 'not recorded', action.patchHash ?? 'not recorded', outcome, archive].map(markdown).join(' | ')} |`;
   });
   const elapsed = Date.parse(state.updatedAt) - Date.parse(state.startedAt);
   const pins = Object.entries(state.harnessPins ?? {})
@@ -94,12 +103,12 @@ ${state.reason ? quote(state.reason) : 'None recorded.'}
 
 ### Budgets
 
-These are per-investigator budgets, separate from planner usage. Primary evaluation attempts include failed actions. Wall time is the elapsed session span at the last persisted update, not model duration.
+These are per-investigator budgets, separate from planner usage. Primary evaluation attempts include admitted failed actions and historical actions without admission metadata, but exclude requests that were not admitted. Wall time is the elapsed session span at the last persisted update, not model duration.
 
 | Budget | Used | Limit |
 | --- | ---: | ---: |
 | Turns | ${number(state.turnCount)} | ${number(limits?.maxTurns)} |
-| Primary evaluation attempts | ${state.actions.filter(({ kind }) => kind === 'evaluate_primary').length} | ${number(limits?.maxPrimaryEvaluations)} |
+| Primary evaluation attempts | ${state.actions.filter(({ kind, admitted }) => kind === 'evaluate_primary' && admitted !== false).length} | ${number(limits?.maxPrimaryEvaluations)} |
 | Wall elapsed at last update ms | ${number(Number.isFinite(elapsed) ? Math.max(0, elapsed) : null)} | ${number(limits?.maxWallTimeMs)} |
 | Agent tokens | ${number(state.agentTokens)} | ${number(limits?.maxAgentTokens)} |
 
@@ -109,7 +118,7 @@ These are per-investigator budgets, separate from planner usage. Primary evaluat
 | --- | --- | --- | --- | --- | --- | --- |
 ${rows.join('\n') || '| - | - | - | No actions recorded | - | No results | - |'}
 
-Targeted trusted tests precede primary development trials. Finalization requires full configured tests and semantic review before final primary, holdout, and configured excluded cohorts. A finalized session is not a completed experiment or a promotion decision. Trial facts remain separate from final facts below.
+Evidence-backed diagnostic qualification and exact-patch trusted tests precede new primary development trials. Optional probes are offline diagnostic execution, not full configured tests, primary evaluation, or promotion. Diagnostic reviews are unverified model judgments and contribute no scores; a passing probe is not required. Finalization requires full configured tests and semantic review before final primary, holdout, and configured excluded cohorts. A finalized session is not a completed experiment or a promotion decision. Trial facts remain separate from final facts below.
 
 Action directories are relative to this variant's ignored artifact root. Requests, pins, patches, receipts or failure records, logs, runtime question audits, transitions, and raw results remain there; they are not copied into this summary.`;
 }
@@ -939,7 +948,7 @@ Investigator budgets and primary development attempts are separate from final pl
 | --- | --- | --- | ---: | ---: | ---: |
 ${variants.filter(({ investigation }) => investigation).map((variant) => {
   const session = variant.investigation!;
-  return `| ${markdown(variant.id)} | ${markdown(session.sessionId ?? 'not assigned')} | ${session.status} | ${session.turnCount} | ${session.actions.filter(({ kind }) => kind === 'evaluate_primary').length} | ${session.agentTokens ?? 'unknown'} |`;
+  return `| ${markdown(variant.id)} | ${markdown(session.sessionId ?? 'not assigned')} | ${session.status} | ${session.turnCount} | ${session.actions.filter(({ kind, admitted }) => kind === 'evaluate_primary' && admitted !== false).length} | ${session.agentTokens ?? 'unknown'} |`;
 }).join('\n') || '| - | - | No sessions recorded | - | - | - |'}
 
 Score basis: raw-replicate mean; consensus decisions remain separate. Runtime answers are not globally frozen. See each experiment report for budgets, action outcomes, and artifact locators.

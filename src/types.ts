@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { InvestigationState } from './investigator.js';
+import type { ExecutionFailure } from './failures.js';
 
 const AbsolutePathSchema = z.string().min(1).refine((value) => value.startsWith('/'), {
   message: 'expected an absolute path',
@@ -981,6 +982,7 @@ export interface Phase2RunSnapshot {
   completedAt?: string | null;
   elapsedMs?: number | null;
   usage?: PlannerUsage | null;
+  failure?: ExecutionFailure | null;
   updatedAt: string;
 }
 

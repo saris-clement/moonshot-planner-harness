@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -8,10 +8,12 @@ import { HarnessDatabase } from '../src/db.js';
 import {
   InvestigatorActionSchema,
   InvestigatorEventParser,
+  InvestigatorOutputParseError,
   parseInvestigatorResponse,
   type InvestigationState,
 } from '../src/investigator.js';
 import { CampaignConfigSchema, HypothesisSchema } from '../src/types.js';
+import { DiagnosticReviewSchema } from '../src/investigatorDiagnostics.js';
 
 const hypothesis = HypothesisSchema.parse({
   title: 'Retain qualified evidence',
@@ -68,6 +70,44 @@ test('event parser ignores progress and tool text, selecting the final assistant
   });
 });
 
+test('probe and evaluation envelopes defer review validation to coordinator admission but keep other fields strict', () => {
+  const review = {
+    schemaVersion: 1, observationRef: `snapshot_${'a'.repeat(64)}`, selectionRationale: 'Check a legitimate build boundary.',
+    examples: [{ unitRef: `unit_${'b'.repeat(64)}`, assessment: 'uncertain', whyThisExample: 'Existing workflow does not prove this behavior exists.',
+      requirementUnderstanding: 'A new behavior is required.', expectedDecision: 'build', codeAssessment: 'The relevant implementation may be absent.',
+      citations: [{ evidenceRef: `evidence_${'c'.repeat(64)}` }], limitations: 'Absence from a search is not proof of absence.',
+      discriminatingCheck: 'Compare the source contract with the requested behavior.' }],
+    mechanism: 'Irrelevant evidence must not force reuse.', falsificationCriterion: 'The required implementation is already present.',
+  };
+  const probe = { ...action, action: 'probe', review, testFiles: ['server/test/evidence.test.ts'] };
+  assert.deepEqual(InvestigatorActionSchema.parse(probe), probe);
+  const evaluated = InvestigatorActionSchema.parse({ ...action, action: 'evaluate_primary', review });
+  assert.equal(evaluated.action, 'evaluate_primary');
+  assert.deepEqual(evaluated.review, review);
+  for (const kind of ['probe', 'evaluate_primary']) {
+    for (const invalidReview of [
+      undefined, null, 'not a review', { ...review, examples: [] },
+      { ...review, mechanism: 'x'.repeat(2_001) },
+      { ...review, command: 'curl remote' },
+      { ...review, examples: [{ ...review.examples[0], command: 'curl remote' }] },
+    ]) {
+      const request = { ...action, action: kind, review: invalidReview,
+        ...(kind === 'probe' ? { testFiles: probe.testFiles } : {}) };
+      assert.equal(InvestigatorActionSchema.safeParse(request).success, true, 'admit the envelope for coordinator feedback');
+      assert.deepEqual(parseInvestigatorResponse(`${text(request)}\n${finish()}`), {
+        sessionId: 'ses_investigation', action: JSON.parse(JSON.stringify(request)), usage: { tokens: 165, costUsd: 0.25 },
+      });
+      assert.equal(DiagnosticReviewSchema.safeParse(invalidReview).success, false, 'the coordinator still rejects the raw review');
+    }
+  }
+  for (const invalid of [
+    { ...probe, testFiles: undefined }, { ...probe, testFiles: [] }, { ...probe, testFiles: [42] },
+    { ...probe, command: 'curl remote' }, { ...action, action: 'evaluate_primary', command: 'curl remote' },
+    { ...action, action: 'evaluate_primary', testFiles: probe.testFiles },
+    ...['test', 'finalize', 'abandon'].map((kind) => ({ ...action, action: kind, review })),
+  ]) assert.equal(InvestigatorActionSchema.safeParse(invalid).success, false);
+});
+
 test('event parser handles split chunks, UTF-8, fences, and missing final newline', () => {
   const parser = new InvestigatorEventParser();
   const expected = { ...action, rationale: 'Investigate \u00e9vidence.' };
@@ -117,16 +157,51 @@ test('event parser uses reported token totals and preserves unknown or partial u
   assert.deepEqual(parseInvestigatorResponse(partial).usage, { tokens: null, costUsd: null });
 });
 
+test('invalid structured final output retains the session and reported usage from the complete event stream', () => {
+  for (const body of [
+    JSON.stringify({ ...action, action: 'shell' }),
+    JSON.stringify({ ...action, action: 'probe' }),
+    JSON.stringify({ ...action, testFiles: [42] }),
+    JSON.stringify({ ...action, hypothesis: {} }),
+    JSON.stringify({ ...action, command: 'curl remote' }),
+    '{"action":',
+    '',
+  ]) {
+    const output = [text(action), finish('tool-calls'), event('step_start', {}),
+      event('text', { text: body }), finish()].join('\n');
+    assert.throws(() => parseInvestigatorResponse(output), InvestigatorOutputParseError);
+    assert.throws(() => parseInvestigatorResponse(output), {
+      name: 'InvestigatorOutputParseError', message: 'investigator returned invalid structured final output',
+      sessionId: 'ses_investigation', usage: { tokens: 330, costUsd: 0.5 },
+    });
+  }
+});
+
+test('invalid final output preserves unknown usage fields and does not count unreported final consumption', () => {
+  const invalidText = event('text', { text: 'not JSON' });
+  for (const [output, usage] of [
+    [invalidText, { tokens: null, costUsd: null }],
+    [[text(action), finish('tool-calls'), invalidText].join('\n'), { tokens: null, costUsd: null }],
+    [[invalidText, event('step_finish', { reason: 'stop', tokens: { total: 99 } })].join('\n'), { tokens: 99, costUsd: null }],
+    [[invalidText, event('step_finish', { reason: 'stop', cost: 0.25 })].join('\n'), { tokens: null, costUsd: 0.25 }],
+    [[text(action), event('step_finish', { reason: 'tool-calls' }), invalidText, finish()].join('\n'), { tokens: null, costUsd: null }],
+  ] as const) {
+    assert.throws(() => parseInvestigatorResponse(output), {
+      name: 'InvestigatorOutputParseError', sessionId: 'ses_investigation', usage,
+    });
+  }
+});
+
 test('investigator runner resumes the explicit session, attaches feedback, and streams beyond capture', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'planner-investigator-'));
-  const worktree = path.join(root, 'worktree');
-  const artifacts = path.join(root, '.data');
-  await mkdir(worktree);
-  await mkdir(artifacts);
-  const workflowsSource = path.join(root, 'frozen-workflows');
+  const worktree = path.join(root, '.data', 'worktrees', 'investigation', 'investigation-v001');
+  const artifacts = path.join(root, '.data', 'artifacts', 'investigation', 'investigation-v001');
+  await mkdir(worktree, { recursive: true });
+  await mkdir(artifacts, { recursive: true });
+  const workflowsSource = path.join(path.dirname(worktree), 'frozen-workflows');
   await mkdir(workflowsSource);
-  const contextPath = path.join(artifacts, 'context.json');
-  await writeFile(contextPath, JSON.stringify({ primaryRawArtifactIndex: ['primary/raw/analysis.json'],
+  const contextPath = path.join(artifacts, 'investigator-context.json');
+  await writeFile(contextPath, JSON.stringify({ goal: 'Investigate failures without promising improvements.', primaryRawArtifactIndex: ['primary/raw/analysis.json'],
     artifacts: { current: artifacts, workflowsSource, priorExperiments: [] } }));
   const database = new HarnessDatabase(':memory:');
   try {
@@ -151,8 +226,20 @@ test('investigator runner resumes the explicit session, attaches feedback, and s
       calls.push([...args]);
       const attachments = args.flatMap((arg, index) => arg === '--file' ? [args[index + 1]!] : []);
       const contents = await Promise.all(attachments.map((file) => readFile(file, 'utf8')));
-      assert.ok(contents.some((content) => content.includes('primary/raw/analysis.json')));
-      assert.ok(contents.some((content) => content.includes('Boundary regression failed.')));
+      assert.equal(attachments.length, 1, 'only the compact briefing is attached');
+      const briefing = JSON.parse(contents[0]!);
+      assert.match(briefing.referenceHandles.context, /^evidence_[a-f0-9]{64}$/);
+      assert.equal(briefing.referenceHandles.currentHypothesis, briefing.referenceHandles.context);
+      assert.deepEqual(briefing.currentHypothesis, hypothesis);
+      assert.equal(briefing.failureSummary, 'Boundary regression failed.');
+      assert.equal(briefing.byteLength, Buffer.byteLength(contents[0]!));
+      assert.ok(briefing.byteLength <= (calls.length === 1 ? 16_384 : 8_192));
+      assert.doesNotMatch(contents[0]!, /primary\/raw\/analysis\.json|replicateFacts/);
+      assert.equal(briefing.state, undefined);
+      assert.equal(briefing.feedback, undefined);
+      const mcp = JSON.parse(options!.env!.OPENCODE_CONFIG_CONTENT!).mcp.harness_evidence;
+      const manifest = JSON.parse(await readFile(mcp.command[mcp.command.indexOf('--manifest') + 1], 'utf8'));
+      assert.equal(manifest.scope.parentArtifactDirectory, await realpath(artifacts), 'a parentless variant uses its own scoped archive');
       const prompt = args.find((arg) => arg.includes('Campaign goal:'))!;
       assert.match(prompt, /challenge.*diagnosis/i);
       assert.match(prompt, /revise.*hypothesis/i);
@@ -191,6 +278,7 @@ test('investigator runner resumes the explicit session, attaches feedback, and s
     assert.equal(calls[1]![calls[1]!.indexOf('--session') + 1], first.sessionId);
     assert.equal(calls[1]!.includes('--continue'), false);
     assert.deepEqual(await readdir(worktree), []);
+    assert.match(await readFile(contextPath, 'utf8'), /primary\/raw\/analysis\.json/, 'full original context remains archived, not attached');
     assert.equal(current.turnCount, 1, 'the coordinator owns state transitions');
     assert.deepEqual(JSON.parse(await readFile(path.join(artifacts, 'investigator-turn-001-result.json'), 'utf8')), first);
     await assert.rejects(runner.investigate(variant, worktree, artifacts, contextPath,

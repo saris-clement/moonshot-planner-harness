@@ -412,3 +412,96 @@ test('PlannerClient creates and validates an explicit target-excluded case', asy
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('PlannerClient emits a terminal failure before collection and returns it when collection fails', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'planner-client-failure-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const zipPath = path.join(directory, 'pack.zip');
+  await writeFile(zipPath, 'fixed-pack');
+  const snapshots: Phase2RunSnapshot[] = [];
+  const requests: string[] = [];
+  const code = 'model_boundary_violation_candidate_outside_shortlist';
+  const unownedId = 'sk-SECRET-model-output';
+  const details = {
+    version: 1, kind: 'candidate_outside_shortlist', requirementUnitId: 'unit-failed', disposition: 'reuse',
+    selected: [
+      { index: 0, id: 'candidate:a', allowed: true, origin: 'shortlist' },
+      { index: 1, id: 'candidate:b', allowed: true, origin: 'discovered' },
+      { index: 2, id: 'candidate:c', allowed: false, origin: 'supporting' },
+      { index: 3, sha256: `sha256:${createHash('sha256').update(unownedId).digest('hex')}`,
+        utf8Bytes: Buffer.byteLength(unownedId), allowed: false, origin: 'unknown' },
+    ],
+    allowedIds: ['candidate:a', 'candidate:b'],
+    counts: { selected: 4, allowed: 2, shortlist: 1, discovered: 1, supporting: 1 },
+    truncated: false,
+  };
+  let emittedBeforeCollection = false;
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request) { /* Consume the request body. */ }
+    requests.push(request.url!);
+    response.setHeader('Content-Type', 'application/json');
+    if (request.url === '/api/requirements-packs') response.end('{"metadata":{"artifactSha256":"fixed-sha"}}');
+    else if (request.url === '/api/planning-cases') response.end('{"case":{"id":"case-failed"}}');
+    else if (request.url?.endsWith('/analysis-readiness')) response.end('{"ready":true}');
+    else if (request.url?.endsWith('/runs') && request.method === 'POST') response.end(JSON.stringify({
+      run: { id: 'run-failed', caseId: 'case-failed', status: 'failed' },
+      runtime: { status: 'failed', failureCode: code, failureMessage: 'SECRET model response', providerRetryBudgetAvailable: false },
+      checkpoint: { failedRequirementUnitIds: ['unit-failed'] },
+    }));
+    else {
+      emittedBeforeCollection ||= snapshots.some((snapshot) => snapshot.failure?.code === code);
+      if (request.url?.endsWith('/events')) response.end(JSON.stringify({ events: [{
+        schemaVersion: 1, eventId: 'event-failed', sequence: 8, actor: null,
+        caseId: 'case-failed', name: 'run.failed', occurredAt: '2026-09-08T10:00:00.000Z',
+        payload: { runId: 'run-failed', code, message: 'SECRET raw model response', details },
+      }] }));
+      else { response.statusCode = 503; response.end('{"error":"SECRET","message":"SECRET body"}'); }
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('test server did not bind');
+  const result = await new PlannerClient(`http://127.0.0.1:${address.port}`, directory).runPhase2(
+    zipPath, 'failure-test', 10_000, undefined, undefined, (snapshot) => { snapshots.push(snapshot); },
+  );
+  assert.equal(emittedBeforeCollection, true);
+  assert.equal(result.status, 'failed');
+  assert.equal(result.facts, null);
+  assert.equal(result.failure?.code, code);
+  assert.deepEqual(result.failure?.details, details);
+  assert.equal(snapshots.at(-1)?.failure?.code, code);
+  assert.deepEqual(snapshots.at(-1)?.failure?.details, details);
+  assert.equal(JSON.stringify(snapshots).includes('SECRET'), false);
+  assert.equal(JSON.stringify(result).includes('SECRET'), false);
+  assert.equal(requests.some((url) => url.includes('retry-provider-failure')), false);
+});
+
+test('PlannerClient withholds HTTP error bodies including invalid JSON', async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'planner-client-http-failure-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const zipPath = path.join(directory, 'pack.zip');
+  await writeFile(zipPath, 'fixed-pack');
+  let body = '{"error":"SECRET","message":"SECRET body"}';
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request) { /* Consume the request body. */ }
+    response.statusCode = 500;
+    response.end(body);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('test server did not bind');
+  const client = new PlannerClient(`http://127.0.0.1:${address.port}`, directory);
+  for (const responseBody of [body, 'SECRET raw invalid JSON']) {
+    body = responseBody;
+    await assert.rejects(client.runPhase2(zipPath, 'http-test', 10_000), (error: Error) => {
+      assert.equal(error.message.includes('SECRET'), false);
+      assert.match(error.message, /unavailable/);
+      const failure = (error as Error & { failure: { origin: string; httpStatus: number } }).failure;
+      assert.equal(failure.origin, 'http');
+      assert.equal(failure.httpStatus, 500);
+      return true;
+    });
+  }
+});

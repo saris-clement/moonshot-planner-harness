@@ -8,9 +8,10 @@ import { canonicalHash } from './metrics.js';
 import type { Phase2QuestionAnswer, PlannerQuestionRecord } from './plannerClient.js';
 import { containsTargetIdentityLeak } from './targetExcludedSource.js';
 import type { Benchmark, CampaignRecord } from './types.js';
+import { SOURCE_ANSWER_POLICY_VERSION } from './sourceAnswer.js';
 
 // Bump when the runtime answer prompt, resolution order, or source-answer policy changes.
-const ANSWER_POLICY_VERSION = 'requirements-agent-then-pm-simulation-v1';
+export const ANSWER_POLICY_VERSION = 'requirements-agent-then-scoped-pm-v2';
 const COMMIT_EVENT = 'runtime_answer_ledger.committed';
 const hashSchema = z.string().regex(/^sha256:[a-f0-9]{64}$/);
 const answerSchema = z.object({
@@ -44,6 +45,10 @@ export function runtimeQuestionCacheKey(question: PlannerQuestionRecord): string
   return JSON.stringify({
     responseKind: question.responseKind,
     prompt: question.prompt,
+    rationale: question.rationale,
+    requirementRefs: (question.requirementRefs ?? []).map(({ entity, anchor }) => ({ entity, anchor }))
+      .sort((left, right) => left.entity.localeCompare(right.entity) || left.anchor.localeCompare(right.anchor)),
+    sourceContext: question.sourceContext ?? {},
     type: question.type,
     ownerRole: question.ownerRole,
     coverageIds: question.coverageIds,
@@ -84,6 +89,7 @@ export async function answerWithRuntimeLedger(options: {
     model: campaign.config.agent.model,
     modelVariant: campaign.config.agent.variant ?? null,
     policyVersion: ANSWER_POLICY_VERSION,
+    sourceAnswerPolicyVersion: SOURCE_ANSWER_POLICY_VERSION,
     answerSourcePolicy: 'full-workflows-product-answers',
     targetWorkflow: targetWorkflow ?? null,
     questionKey: runtimeQuestionCacheKey(question),
